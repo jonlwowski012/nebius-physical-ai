@@ -1,5 +1,7 @@
 # Nebius Physical AI
 
+[![codecov](https://codecov.io/gh/nebius/nebius-physical-ai/branch/main/graph/badge.svg)](https://codecov.io/gh/nebius/nebius-physical-ai)
+
 Nebius Physical AI is a multi-solution platform for physical AI workloads on
 Nebius infrastructure. The repository provides a shared `npa` command model,
 platform architecture guidance, and solution-specific implementations for

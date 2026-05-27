@@ -66,7 +66,20 @@ jobs:
           PY
 
       - name: Run pytest with coverage
-        run: cd npa && python -m pytest tests/ -v --tb=short --cov=npa --cov-report=term-missing
+        run: |
+          cd npa && python -m pytest tests/ -v --tb=short \
+            --cov=npa \
+            --cov-report=term-missing \
+            --cov-report=xml:coverage.xml
+
+      - name: Upload coverage to Codecov
+        if: always()
+        uses: codecov/codecov-action@v4
+        with:
+          files: npa/coverage.xml
+          flags: unittests
+          fail_ci_if_error: false
+          token: ${{ secrets.CODECOV_TOKEN }}
 
       - name: Run CLI install test
         run: cd npa && bash tests/integration/test_cli_install.sh
