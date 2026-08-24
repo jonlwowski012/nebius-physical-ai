@@ -22,6 +22,9 @@ with the SaaS seam in `client.py`). The CLI
 PyPI package is an optional extra (`npa[encord]`), lazy-imported; workflow
 stages on the default image install it via `TOOL_REF_PIP_EXTRAS`.
 
+Operator walkthrough (account setup through troubleshooting):
+`docs/workbench/encord.md`.
+
 ## One-time Encord-side setup (operator)
 
 1. In the Encord app create an **S3-compatible cloud integration** (the
