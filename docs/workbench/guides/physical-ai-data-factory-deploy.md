@@ -145,7 +145,7 @@ The sequence has five fail-fast gates:
 | Credentials | S3 and Token Factory checks pass |
 | Model terms | Cosmos Transfer reports `HF access ok` |
 | Cluster | one CPU node fits the controller plus a PAIDF CPU stage; one GPU node fits Transfer |
-| Images | every manifest is pullable; private Nebius credentials refresh `npa-nebius-registry` |
+| Images | every public manifest is anonymously pullable; customer BYOF images use an explicitly configured registry credential |
 | Submit secrets | Token Factory, S3, and `HF_TOKEN` are forwarded without entering YAML |
 
 Stop at the first nonzero command; it prints the remedy. Detailed recovery is
@@ -671,9 +671,12 @@ printf '%s' "$(nebius iam get-access-token)" \
   | docker login "${REGISTRY%%/*}" -u iam --password-stdin
 
 docker buildx create --name npa-cosmos-oss --driver docker-container   # scoped cache
-for tool in cosmos-evaluator cosmos-curate; do
-  # Tag must match npa/src/npa/deploy/images.py; submit pulls exactly that tag.
-  tag="0.1.2-skypilot-v1-20260813T164700Z"
+for tool_tag in \
+  cosmos-evaluator:0.1.2-skypilot-v1-20260813T164700Z-r2 \
+  cosmos-curate:0.1.2-skypilot-v1-20260813T164700Z; do
+  # Tags must match npa/src/npa/deploy/images.py; submit pulls them exactly.
+  tool="${tool_tag%%:*}"
+  tag="${tool_tag#*:}"
   docker buildx build --builder npa-cosmos-oss --push \
     -f "npa/docker/workbench/$tool/Dockerfile" \
     -t "$REGISTRY/npa-$tool:$tag" npa
@@ -697,7 +700,7 @@ bootstrap attestation before spending GPU time:
 
 ```bash
 for ref in npa-cosmos2-transfer:2.5.1-sam2-multigpu-20260817-r2 \
-           npa-cosmos-evaluator:0.1.2-skypilot-v1-20260813T164700Z \
+           npa-cosmos-evaluator:0.1.2-skypilot-v1-20260813T164700Z-r2 \
            npa-cosmos-curate:0.1.2-skypilot-v1-20260813T164700Z; do
   docker manifest inspect "$REGISTRY/$ref" >/dev/null && echo "OK   $ref" || echo "MISS $ref"
 done

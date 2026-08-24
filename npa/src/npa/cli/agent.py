@@ -1061,10 +1061,8 @@ server {{
         os.environ.get("NPA_AGENT_LICHTBLICK_IMAGE", "").strip()
         or "npa-lichtblick:1.26.0"
     )
-    # Region-agnostic image acquisition: the Lichtblick image is mirrored to both
-    # the eu-north1 and us-central1 registries, so a fresh VM in any region pulls
-    # from whichever registry is reachable instead of depending on a locally-built
-    # image. Candidates = primary + mirror registry (see deploy.images).
+    # Region-agnostic image acquisition uses the anonymous public release. An
+    # explicit customer registry override remains available through deploy.images.
     lichtblick_pull_candidates = " ".join(
         shlex.quote(ref)
         for ref in container_image_candidates("lichtblick", preferred_region=region)
@@ -3053,10 +3051,10 @@ def _agent_system_prompt() -> str:
             "Before Sim2Real submit, confirm scene/robot/camera selection.",
             "Always use real registry-qualified images: supported defaults resolve from",
             "public GHCR, while `NPA_REGISTRY` or a legacy `container_registry` value selects",
-            "custom/private images. Never keep `<your-registry-id>` placeholders in runnable workflows.",
+            "custom/private images. Never keep registry placeholders in runnable workflows.",
             "For BYOF solution onboarding, use `npa workbench byof run`",
             "(or `npa/scripts/run_byof_repo.py`) to containerize an OSS repo,",
-            "push to an explicitly selected Nebius registry, then launch a real Isaac-Lab run",
+            "push to an explicitly selected customer registry, then launch a real Isaac-Lab run",
             "with `--image` override on RT-core GPUs (L40S / RTX PRO 6000).",
             "See docs/architecture/oss-onboarding-ladder.md for Tier 0→2 promotion.",
             "For live infra runs, verify GPU compatibility first (`sky check`, `sky gpus list`)",
@@ -8996,16 +8994,11 @@ sudo systemctl reset-failed npa-agent-backend npa-rerun nginx || true
 sudo systemctl enable --now npa-agent-backend npa-rerun nginx
 sudo systemctl restart npa-rerun nginx
 sudo systemctl restart npa-agent-backend
-# Region-agnostic Lichtblick image acquisition: pull from whichever mirror
-# registry (eu-north1 or us-central1) is reachable and retag to the sidecar's
-# image, so a fresh VM in any region works without a locally-built image. Falls
-# back to any local image. Best-effort — never blocks the deploy.
+# Region-agnostic Lichtblick image acquisition: anonymously pull the public
+# release (or an explicitly configured customer override) and retag it to the
+# sidecar image. Best-effort — never blocks the deploy.
 for lb_cand in {lichtblick_pull_candidates}; do
   lb_host="${{lb_cand%%/*}}"
-  if command -v nebius >/dev/null 2>&1; then
-    lb_tok="$(nebius iam get-access-token 2>/dev/null || true)"
-    [ -n "$lb_tok" ] && printf '%s' "$lb_tok" | sudo docker login "$lb_host" -u iam --password-stdin >/dev/null 2>&1 || true
-  fi
   if sudo docker pull "$lb_cand" >/dev/null 2>&1; then
     sudo docker tag "$lb_cand" {lichtblick_image} >/dev/null 2>&1 || true
     echo "npa-lichtblick image acquired from $lb_host"
@@ -9182,6 +9175,25 @@ def _health(
     except httpx.HTTPError:
         return False, 0
     return response.status_code == 200, response.status_code
+
+
+def _basic_auth_protects_endpoint(
+    url: str,
+    *,
+    timeout: float = 5.0,
+    verify: bool = True,
+) -> tuple[bool, int]:
+    """Prove that an unauthenticated request cannot reach the agent UI."""
+    try:
+        response = httpx.get(
+            url,
+            timeout=timeout,
+            verify=verify,
+            follow_redirects=False,
+        )
+    except httpx.HTTPError:
+        return False, 0
+    return response.status_code == 401, response.status_code
 
 
 _artifact_only_http_probe = agent_resources.artifact_only_http_probe
@@ -10804,22 +10816,32 @@ def status_cmd(
     ui_ok, ui_code = _health(
         agent_url, user=auth_user, password=auth_password, verify=tls_verify
     )
+    basic_auth_enforced, unauthenticated_ui_code = _basic_auth_protects_endpoint(
+        agent_url,
+        verify=tls_verify,
+    )
     rerun_ok, rerun_code = _health(
         sim_viz_url, user=auth_user, password=auth_password, verify=tls_verify
     )
+    endpoint_disclosure_allowed = bool(ui_ok and basic_auth_enforced)
     payload = {
         "project": project,
         "name": name,
-        "public_ip": record.get("public_ip", ""),
-        "public_url": public_url,
+        "public_ip": record.get("public_ip", "") if endpoint_disclosure_allowed else "",
+        "public_url": public_url if endpoint_disclosure_allowed else "",
         "public_https": _record_public_https(record),
-        "direct_url": record.get("direct_url", ""),
-        "ui_url": agent_url,
-        "rerun_url": rerun_url,
-        "sim_viz_url": sim_viz_url,
-        "sim_assets_url": sim_assets_url,
-        "cameras_api_url": cameras_api_url,
-        "health": bool(ui_ok and rerun_ok),
+        # The direct service URL is not covered by the public HTTPS Basic Auth
+        # proof and is intentionally never part of status handoffs.
+        "direct_url": "",
+        "ui_url": agent_url if endpoint_disclosure_allowed else "",
+        "rerun_url": rerun_url if endpoint_disclosure_allowed else "",
+        "sim_viz_url": sim_viz_url if endpoint_disclosure_allowed else "",
+        "sim_assets_url": sim_assets_url if endpoint_disclosure_allowed else "",
+        "cameras_api_url": cameras_api_url if endpoint_disclosure_allowed else "",
+        "health": bool(ui_ok and rerun_ok and basic_auth_enforced),
+        "basic_auth_enforced": basic_auth_enforced,
+        "unauthenticated_ui_status_code": unauthenticated_ui_code,
+        "endpoint_disclosure_allowed": endpoint_disclosure_allowed,
         "ui_status_code": ui_code,
         "rerun_status_code": rerun_code,
         "llm": record.get("llm", {}),

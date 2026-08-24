@@ -65,80 +65,6 @@ def _fail(msg: str, code: int = 1) -> None:
     raise typer.Exit(code)
 
 
-# ``docker:cr.<region>.nebius.cloud/<registry-id>/<image>:<tag>`` in a rendered plan.
-_NEBIUS_IMAGE_RE = re.compile(
-    r"image_id:\s*docker:(cr\.[a-z0-9-]+\.nebius\.cloud)/", re.IGNORECASE
-)
-
-
-def nebius_registry_hosts(rendered_yaml: str) -> list[str]:
-    """Distinct Nebius registry hosts a rendered plan pulls images from."""
-
-    return sorted(
-        {match.group(1).lower() for match in _NEBIUS_IMAGE_RE.finditer(rendered_yaml)}
-    )
-
-
-def _refresh_kubernetes_pull_secrets(
-    rendered_path: Path, *, k8s_context: str = "", kubeconfig: str = ""
-) -> None:
-    """Refresh the cluster's Nebius registry pull secret before launching.
-
-    Kubernetes pulls private images with an ``imagePullSecret``, and the Nebius
-    registry only accepts short-lived IAM tokens — so a cluster whose secret was
-    written days ago fails every pull with ``401 Unauthorized`` even though
-    ``docker login`` on the operator box works, and SkyPilot reports it as
-    ``ErrImagePull`` / resources-unavailable rather than an auth problem. Minting a
-    fresh token here keeps a pinned-image submit from failing for a reason that has
-    nothing to do with the workflow.
-
-    A private-image submit is blocked if this refresh fails: preflight and the
-    credentials Kubernetes actually uses must agree, rather than accepting a job
-    that is guaranteed to sit in ``ImagePullBackOff``.
-    """
-
-    try:
-        rendered = rendered_path.read_text(encoding="utf-8")
-    except OSError:
-        return
-    hosts = nebius_registry_hosts(rendered)
-    if not hosts:
-        return
-
-    from npa.workflows.sim2real.registry_auth import (
-        ensure_nebius_registry_pull_secret,
-        mint_nebius_registry_token,
-    )
-
-    joined = ", ".join(hosts)
-    # One call with every host: the secret holds a single dockerconfigjson and each
-    # apply replaces it, so refreshing host by host would leave only the last one.
-    # Do not consult SKYPILOT_DOCKER_PASSWORD/NPA_REGISTRY_PASSWORD here. Those are
-    # valid render/preflight overrides, but can be the short-lived token installed at
-    # the start of a long runtime loop. "Refresh" must mint a genuinely new,
-    # profile-scoped Nebius credential; callers with an independently managed secret
-    # explicitly select --no-refresh-registry-secret.
-    try:
-        username = "iam"
-        password = mint_nebius_registry_token()
-        if not password:
-            raise RuntimeError("no registry credential could be resolved")
-        ensure_nebius_registry_pull_secret(
-            registry_servers=hosts,
-            username=username,
-            token=password,
-            kubeconfig=kubeconfig,
-            k8s_context=k8s_context,
-        )
-    except Exception as exc:
-        raise RuntimeError(
-            "could not install the Kubernetes imagePullSecret for "
-            f"{joined}: {exc}. Fix kubectl access/registry credentials before submit; "
-            "otherwise every private-image task will fail with ImagePullBackOff."
-        ) from exc
-    console.print(f"Refreshed the Kubernetes pull secret for {joined}")
-
-
 @app.command("prepare-run")
 def prepare_run_cmd(
     yaml_path: Path = typer.Argument(help="npa.workflow/v0.0.1 YAML path."),
@@ -430,16 +356,8 @@ def submit_cmd(
         True,
         "--registry-auth/--no-registry-auth",
         help=(
-            "For VM SONIC image pulls, materialize Docker registry auth envs. "
-            "Nebius Container Registry defaults to a fresh IAM token."
-        ),
-    ),
-    refresh_registry_secret: bool = typer.Option(
-        True,
-        "--refresh-registry-secret/--no-refresh-registry-secret",
-        help=(
-            "Refresh the Kubernetes Nebius pull secret before submit. Disable only "
-            "when the cluster already has a separately managed pull credential."
+            "For VM SONIC private-image pulls, materialize explicit exact-host "
+            "Docker registry credentials."
         ),
     ),
     registry_username: str = typer.Option(
@@ -633,7 +551,9 @@ def submit_cmd(
     from npa.orchestration.npa_workflow.errors import NpaWorkflowError
     from npa.orchestration.npa_workflow.skypilot_render import SkypilotRenderOptions
     from npa.orchestration.npa_workflow.submit import prepare_npa_workflow_for_submit
-    from npa.orchestration.npa_workflow.run_state import PAIDF_WORKFLOW_NAME
+    from npa.orchestration.npa_workflow.run_state import (
+        is_paidf_input_workflow_name,
+    )
     from npa.orchestration.skypilot.workflow import (
         SkyPilotSubmitError,
         WorkflowResult,
@@ -678,7 +598,8 @@ def submit_cmd(
         )
         return
     is_paidf_spec = bool(
-        merged_npa_spec is not None and merged_npa_spec.name == PAIDF_WORKFLOW_NAME
+        merged_npa_spec is not None
+        and is_paidf_input_workflow_name(merged_npa_spec.name)
     )
     legacy_fixture = _is_truthy_submit_value(
         substitutions.get("seed_fixture")
@@ -714,7 +635,7 @@ def submit_cmd(
     ) and not is_paidf_spec:
         _fail(
             "--input-video, --input-uri, --lerobot-uri, and --seed-fixture are "
-            "supported only by the physical-ai-data-factory workflow"
+            "supported only by a Physical AI Data Factory workflow"
         )
         return
     materializer = _resolve_materializer(tool, yaml_path)
@@ -884,12 +805,6 @@ def submit_cmd(
         return
 
     prepared_npa = None
-    # The runtime registry-auth render has its own temporary directory.  Keep
-    # the cleanup sentinel in the enclosing submit scope: fully image-pinned
-    # workflows with --no-stage-src never enter the source-staging branch
-    # below, but their fail-fast render errors must still cleanly reach the
-    # operator instead of being masked by an unbound local in ``finally``.
-    registry_auth_plan = None
     deploy_targets = []
     resolved_deploy_plans: dict[str, Any] = {}
     paidf_placement_prechecked = False
@@ -1409,7 +1324,36 @@ def submit_cmd(
             except PaidfInputError as exc:
                 _fail(str(exc))
                 return
-            substitutions.update(prepared_input.config_overrides())
+            prepared_overrides = prepared_input.config_overrides()
+            from npa.orchestration.npa_workflow.run_state import (
+                PAIDF_COSMOS3_WORKFLOW_NAME,
+            )
+
+            if workflow_identity == PAIDF_COSMOS3_WORKFLOW_NAME:
+                # The independent Cosmos3 spec owns its run-local provenance URI.
+                # The shared preparer still validates/stages the selected media,
+                # but must not redirect the Cosmos3 worker onto the original
+                # PAIDF schema's immutable provenance object.
+                prepared_overrides.pop("input_provenance_uri", None)
+                if prepared_input.selection == "lerobot_dataset":
+                    prepared_overrides.update(
+                        {
+                            "input_kind": "lerobot",
+                            "lerobot_dataset_uri": lerobot_uri.strip(),
+                            "input_episode": str(resolved_lerobot_episode),
+                            "input_camera": lerobot_camera.strip(),
+                        }
+                    )
+                else:
+                    prepared_overrides.update(
+                        {
+                            "input_kind": "video",
+                            "input_video_uri": str(
+                                prepared_input.provenance.get("staged_source_uri") or ""
+                            ),
+                        }
+                    )
+            substitutions.update(prepared_overrides)
             substitutions["seed_fixture"] = (
                 "true" if prepared_input.selection == "synthetic_fixture" else "false"
             )
@@ -1506,40 +1450,6 @@ def submit_cmd(
                 return
 
         if runtime and not plan_only:
-            # Runtime renders one wave at a time and historically returned before
-            # the one-shot path refreshed Kubernetes pull credentials.  Validate
-            # the complete selected plan once solely to install the exact private-
-            # registry secret before any managed job can enter ErrImagePull.  A
-            # dynamic runtime must still read its real gate artifact, so a branch
-            # assumption used only for this throwaway render must not leak into the
-            # runtime driver.  Prefer an operator/spec assumption when present and
-            # otherwise render the promotion branch, which includes the downstream
-            # states whose images need registry authentication.
-            try:
-                registry_auth_assume = (
-                    assume_decision
-                    or str(spec_config.get("plan_assume_decision") or "").strip()
-                    or "promote_checkpoint"
-                )
-                registry_auth_plan = prepare_npa_workflow_for_submit(
-                    yaml_path,
-                    run_id=resolved_run_id,
-                    assume_decision=registry_auth_assume,
-                    config_overrides=substitutions,
-                    render_options=npa_render_options,
-                )
-                if refresh_registry_secret:
-                    _refresh_kubernetes_pull_secrets(
-                        registry_auth_plan.skypilot_yaml_path,
-                        k8s_context=infra_context,
-                        kubeconfig=os.environ.get("KUBECONFIG", ""),
-                    )
-            except NpaWorkflowError as exc:
-                _fail(str(exc))
-                return
-            finally:
-                if registry_auth_plan is not None:
-                    registry_auth_plan.temp_dir.cleanup()
             _run_npa_workflow_runtime(
                 yaml_path,
                 run_id=resolved_run_id,
@@ -1560,7 +1470,6 @@ def submit_cmd(
                 retries=retries,
                 max_concurrency=max_concurrency,
                 resume=resume,
-                refresh_registry_secret=refresh_registry_secret,
                 retry_absent_in_flight=retry_absent_in_flight,
                 output_format=output_format,
                 project=project,
@@ -1694,13 +1603,6 @@ def submit_cmd(
                     typer.echo("details: pass --details (or --output-format json)")
             prepared_npa.temp_dir.cleanup()
             return
-
-        if refresh_registry_secret:
-            _refresh_kubernetes_pull_secrets(
-                prepared_npa.skypilot_yaml_path,
-                k8s_context=infra_context,
-                kubeconfig=os.environ.get("KUBECONFIG", ""),
-            )
 
         # Skip SkyPilot-path materializers; npa.workflow already planned.
         materializer = ""
@@ -2130,7 +2032,6 @@ def _run_npa_workflow_runtime(
     retries: int,
     max_concurrency: int,
     resume: bool,
-    refresh_registry_secret: bool,
     retry_absent_in_flight: bool,
     output_format: "OutputFormat",
     project: str = "",
@@ -2187,19 +2088,6 @@ def _run_npa_workflow_runtime(
     )
 
     resolved_secret_envs = secret_env_names(secret_envs, values=secret_env_values)
-    pre_submit_hook = None
-    if refresh_registry_secret:
-        runtime_k8s_context = _infra_kube_context(infra)
-        runtime_kubeconfig = os.environ.get("KUBECONFIG", "")
-
-        def _refresh_runtime_pull_secret(rendered_path: Path) -> None:
-            _refresh_kubernetes_pull_secrets(
-                rendered_path,
-                k8s_context=runtime_k8s_context,
-                kubeconfig=runtime_kubeconfig,
-            )
-
-        pre_submit_hook = _refresh_runtime_pull_secret
     options = RuntimeOptions(
         poll_seconds=poll_seconds,
         max_wait_seconds=max_wait_seconds,
@@ -2221,7 +2109,6 @@ def _run_npa_workflow_runtime(
             project=project,
             requested=list(resolved_secret_envs),
         ),
-        pre_submit_hook=pre_submit_hook,
     )
     runtime_env = dict(secret_env_values)
     endpoint = str(getattr(render_options, "aws_endpoint_url", "") or "").strip()
@@ -2622,9 +2509,7 @@ def _preflight_submit_images(
         )
         steps = []
         for decision in dict.fromkeys(decisions):
-            plan = build_plan(
-                resolved_spec, run_id=run_id, assume_decision=decision
-            )
+            plan = build_plan(resolved_spec, run_id=run_id, assume_decision=decision)
             steps.extend(plan.steps)
         images = plan_images(resolved_spec, steps, run_id=run_id, options=options)
         pull_secrets_by_image = plan_image_pull_secrets(
@@ -3133,14 +3018,16 @@ def _npa_spec_config(yaml_path: Path, substitutions: dict[str, str]) -> dict:
 
 
 def _is_paidf_workflow_spec(yaml_path: Path) -> bool:
-    """Identify the one workflow whose submit command owns starter preparation."""
+    """Identify workflows whose submit command owns starter preparation."""
 
     from npa.orchestration.npa_workflow.errors import NpaWorkflowError
-    from npa.orchestration.npa_workflow.run_state import PAIDF_WORKFLOW_NAME
+    from npa.orchestration.npa_workflow.run_state import (
+        is_paidf_input_workflow_name,
+    )
     from npa.orchestration.npa_workflow.spec import load_spec
 
     try:
-        return load_spec(yaml_path).name == PAIDF_WORKFLOW_NAME
+        return is_paidf_input_workflow_name(load_spec(yaml_path).name)
     except NpaWorkflowError:
         return False
 
