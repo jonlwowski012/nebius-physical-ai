@@ -102,6 +102,16 @@ def _token_factory_verifier() -> list[str]:
     return TokenFactoryClient(config=config).list_models()
 
 
+def _encord_verifier() -> str:
+    """Live Encord auth probe: authenticate and make the cheapest listed call."""
+
+    from npa.workbench.encord.client import _default_user_client
+
+    user_client = _default_user_client()
+    next(iter(user_client.list_storage_folders(page_size=1)), None)
+    return "storage folders listable"
+
+
 @app.command("preflight")
 def preflight_command(
     checks: str = typer.Option(
@@ -152,6 +162,7 @@ def preflight_command(
                 aws_secret_access_key=credentials.s3_secret_access_key,
             ),
             token_factory_verifier=_token_factory_verifier,
+            encord_verifier=_encord_verifier,
         )
 
     results = run_credential_preflight(credentials, probes=probes, checks=selected)

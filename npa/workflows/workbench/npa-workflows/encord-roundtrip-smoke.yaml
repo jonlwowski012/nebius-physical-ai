@@ -1,0 +1,71 @@
+apiVersion: npa.workflow/v0.0.1
+kind: Workflow
+
+# End-to-end Encord push+pull proof in ONE run, no human in the loop.
+#
+# push registers a fixture prefix into a fresh folder + dataset titled
+# npa-e2e-{{run.id}}; pull then materializes that same dataset by title. A green
+# run proves registration, polling, dataset linking, item enumeration, the
+# same-bucket copy fast path, and the manifest write against live Encord. The
+# human-curated Collection path is exercised manually (curate in the app, then
+# run encord-pull.yaml with the collection uuid).
+#
+# Encord-side artifacts are namespaced npa-e2e-* for easy cleanup:
+# list_storage_folders(search="npa-e2e-").
+
+metadata:
+  name: encord-roundtrip-smoke
+  description: >
+    CPU-only live e2e smoke: register fixture media into a fresh npa-e2e-*
+    Encord folder + dataset, then pull that dataset straight back to S3 and
+    verify media + manifest — both encord toolRefs proven in one submit.
+
+config:
+  bucket: example-bucket
+  prefix: "encord-smoke/{{run.id}}"
+
+  encord_media_uri: "s3://{{config.bucket}}/encord-fixtures/media/"
+  encord_integration: "nebius-s3"
+  encord_folder: "npa-e2e-{{run.id}}"
+  encord_dataset: "npa-e2e-{{run.id}}"
+  encord_media_filter: "videos-images"
+  # register: bytes stay in the bucket. upload: bytes copied into Encord storage.
+  encord_transfer: "register"
+  encord_poll_timeout_seconds: "1800"
+  encord_receipt_uri: "s3://{{config.bucket}}/{{config.prefix}}/push/"
+
+  # pull resolves the dataset push just created by its unique title.
+  encord_source: "dataset"
+  encord_source_id: "npa-e2e-{{run.id}}"
+  encord_pull_uri: "s3://{{config.bucket}}/{{config.prefix}}/pull/"
+
+resources:
+  cpu:
+    cloud: kubernetes
+    cpus: 2
+    memory: 8Gi
+
+initial: push
+
+states:
+  push:
+    description: Register fixture media into a fresh npa-e2e-* folder + dataset.
+    toolRef: workbench.encord.push
+    resources: cpu
+    outputs:
+      - uri: "{{config.encord_receipt_uri}}push_receipt.json"
+        schema: npa.encord.push_receipt.v1
+    next: pull
+
+  pull:
+    description: Pull the freshly linked dataset straight back to S3.
+    needs: [push]
+    toolRef: workbench.encord.pull
+    resources: cpu
+    inputs:
+      - uri: "{{config.encord_receipt_uri}}push_receipt.json"
+        schema: npa.encord.push_receipt.v1
+    outputs:
+      - uri: "{{config.encord_pull_uri}}manifest.json"
+        schema: npa.encord.pull_manifest.v1
+    terminal: true

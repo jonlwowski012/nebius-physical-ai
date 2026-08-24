@@ -7,6 +7,7 @@ import pytest
 from npa.workflows.credential_preflight import (
     CREDENTIAL_CHECKS,
     CredentialProbes,
+    check_encord,
     check_hf,
     check_ngc,
     check_s3,
@@ -20,6 +21,7 @@ from npa.workflows.sim2real_health import FAIL, PASS, WARN
 @dataclass
 class _Creds:
     hf_token: str = ""
+    tokens: dict[str, str] | None = None
     ngc_api_key: str = ""
     token_factory_api_key: str = ""
     s3_access_key_id: str = ""
@@ -187,3 +189,40 @@ def test_has_failure_true_when_any_fail() -> None:
         checks=["s3"],
     )
     assert has_failure(results) is True
+
+
+def test_encord_warns_when_missing(monkeypatch: pytest.MonkeyPatch) -> None:
+    for name in ("ENCORD_SSH_KEY", "ENCORD_SSH_KEY_B64", "ENCORD_SSH_KEY_FILE"):
+        monkeypatch.delenv(name, raising=False)
+    result = check_encord(_Creds(), CredentialProbes())
+    assert result.status == WARN
+    assert "ENCORD_SSH_KEY" in result.summary
+
+
+def test_encord_present_unverified_from_credentials_tokens(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    for name in ("ENCORD_SSH_KEY", "ENCORD_SSH_KEY_B64", "ENCORD_SSH_KEY_FILE"):
+        monkeypatch.delenv(name, raising=False)
+    creds = _Creds(tokens={"ENCORD_SSH_KEY": "-----BEGIN OPENSSH PRIVATE KEY-----"})
+    result = check_encord(creds, CredentialProbes())
+    assert result.status == PASS
+    assert "not verified" in result.summary
+
+
+def test_encord_pass_when_verifier_ok(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setenv("ENCORD_SSH_KEY_B64", "abc")
+    probes = CredentialProbes(encord_verifier=lambda: "storage folders listable")
+    result = check_encord(_Creds(), probes)
+    assert result.status == PASS
+    assert "storage folders listable" in result.summary
+
+
+def test_encord_fail_when_verifier_raises(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setenv("ENCORD_SSH_KEY", "pem")
+    probes = CredentialProbes(
+        encord_verifier=lambda: (_ for _ in ()).throw(RuntimeError("401 unauthorized"))
+    )
+    result = check_encord(_Creds(), probes)
+    assert result.status == FAIL
+    assert result.details == ("401 unauthorized",)

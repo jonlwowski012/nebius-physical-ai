@@ -13,6 +13,7 @@ packages or touches infrastructure at import time.
 
 from __future__ import annotations
 
+import os
 from dataclasses import dataclass
 from typing import Any, Callable, Iterable
 
@@ -29,7 +30,7 @@ from npa.workflows.sim2real_health import (
 HF_PROBE_REPO = "hf-internal-testing/tiny-random-gpt2"
 
 # Canonical order a customer should reason about credentials in.
-CREDENTIAL_CHECKS: tuple[str, ...] = ("hf", "ngc", "s3", "token_factory")
+CREDENTIAL_CHECKS: tuple[str, ...] = ("hf", "ngc", "s3", "token_factory", "encord")
 
 
 @dataclass
@@ -45,6 +46,7 @@ class CredentialProbes:
     hf_validator: Callable[[str, str], Any] | None = None
     s3_client_factory: Callable[[], Any] | None = None
     token_factory_verifier: Callable[[], list[str]] | None = None
+    encord_verifier: Callable[[], str] | None = None
 
 
 def _looks_like_auth_failure(text: str) -> bool:
@@ -240,11 +242,65 @@ def check_token_factory(credentials: Any, probes: CredentialProbes) -> CheckResu
     )
 
 
+ENCORD_CREDENTIAL_NAMES = ("ENCORD_SSH_KEY", "ENCORD_SSH_KEY_B64", "ENCORD_SSH_KEY_FILE")
+
+
+def check_encord(credentials: Any, probes: CredentialProbes) -> CheckResult:
+    """Check an Encord credential is present and (optionally) authenticates.
+
+    Mirrors how workflow submit resolves secrets: the process environment first,
+    then the ``tokens:`` section of ~/.npa/credentials.yaml.
+    """
+
+    tokens = getattr(credentials, "tokens", {}) or {}
+    present = [
+        name
+        for name in ENCORD_CREDENTIAL_NAMES
+        if str(os.environ.get(name) or tokens.get(name) or "").strip()
+    ]
+    if not present:
+        return CheckResult(
+            name="encord",
+            status=WARN,
+            summary="No Encord credential (ENCORD_SSH_KEY / ENCORD_SSH_KEY_B64) is set.",
+            remedy=(
+                "Required only for `npa workbench encord` push/pull. Generate a key "
+                "pair in the Encord app (public keys), store the PEM under "
+                "tokens: ENCORD_SSH_KEY in ~/.npa/credentials.yaml, or export "
+                "ENCORD_SSH_KEY_B64 (base64 of the PEM) for --secret-env forwarding."
+            ),
+        )
+    if probes.encord_verifier is None:
+        return CheckResult(
+            name="encord",
+            status=PASS,
+            summary=f"{present[0]} is set (not verified against Encord).",
+        )
+    try:
+        summary = probes.encord_verifier()
+    except Exception as exc:  # noqa: BLE001 - surface any auth/connectivity error
+        return CheckResult(
+            name="encord",
+            status=FAIL,
+            summary="Encord credential did not authenticate.",
+            remedy=(
+                "Confirm the key pair is registered in the Encord app and "
+                "ENCORD_DOMAIN matches your region (US domains differ)."
+            ),
+            details=(str(exc),),
+        )
+    return CheckResult(
+        name="encord",
+        status=PASS,
+        summary=f"Encord authenticated ({summary}).",
+    )
+
 _CHECK_FUNCS: dict[str, Callable[[Any, CredentialProbes], CheckResult]] = {
     "hf": check_hf,
     "ngc": check_ngc,
     "s3": check_s3,
     "token_factory": check_token_factory,
+    "encord": check_encord,
 }
 
 
@@ -271,6 +327,7 @@ __all__ = [
     "CREDENTIAL_CHECKS",
     "CredentialProbes",
     "HF_PROBE_REPO",
+    "check_encord",
     "check_hf",
     "check_ngc",
     "check_s3",
