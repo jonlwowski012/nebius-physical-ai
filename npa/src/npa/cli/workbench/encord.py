@@ -17,6 +17,8 @@ from typing import Any
 
 import typer
 
+from npa.workbench.encord.schemas import DEFAULT_POLL_TIMEOUT_SECONDS
+
 app = typer.Typer(
     name="encord",
     help="Encord curation SaaS: register-in-place push and curated pull.",
@@ -100,7 +102,7 @@ def push_cmd(
         "experimental MCAP path.",
     ),
     poll_timeout_seconds: int = typer.Option(
-        1800,
+        DEFAULT_POLL_TIMEOUT_SECONDS,
         "--poll-timeout-seconds",
         help="Per-batch registration poll timeout.",
     ),

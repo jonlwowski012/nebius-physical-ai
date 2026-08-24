@@ -11,9 +11,10 @@ from __future__ import annotations
 import tempfile
 from datetime import datetime, timezone
 from pathlib import Path
-from typing import Any
+from typing import Any, NamedTuple
 from urllib.parse import unquote, urlparse
 
+from npa.clients.storage import _parse_bucket_uri
 from npa.workbench.encord.client import (
     _default_user_client,
     resolve_collection,
@@ -22,13 +23,13 @@ from npa.workbench.encord.client import (
     resolve_project,
     resolve_public_endpoint,
 )
-from npa.workbench.encord.push import _parse_s3_uri, _write_json
 from npa.workbench.encord.schemas import (
     PULL_MANIFEST_FILENAME,
     EncordToolError,
     PulledItem,
     PullManifest,
 )
+from npa.workbench.encord.storage import write_json
 
 PULL_SOURCES = ("collection", "dataset", "project")
 LABEL_BUNDLE_SIZE = 100
@@ -45,17 +46,24 @@ def _sanitize_name(name: str) -> str:
     return cleaned or "item"
 
 
-def enumerate_items(
-    user_client: Any, *, source: str, source_id: str
-) -> tuple[str, str, list[Any], Any]:
-    """Resolve the source and list its storage items.
+class PullSource(NamedTuple):
+    source_id: str
+    source_name: str
+    items: list[Any]
+    # Project pulls carry the resolved project and its (already listed) label
+    # rows so export_labels never re-fetches the listing.
+    project: Any = None
+    label_rows: list[Any] = []
 
-    Returns (resolved_source_id, source_name, storage_items, project_or_none).
-    """
+
+def enumerate_items(user_client: Any, *, source: str, source_id: str) -> PullSource:
+    """Resolve the source and list its storage items, signed in bulk."""
 
     if source == "collection":
         collection, resolved_id, name = resolve_collection(user_client, source_id)
-        return resolved_id, name, list(collection.list_items(page_size=1000)), None
+        uuids = [item.uuid for item in collection.list_items(page_size=1000)]
+        items = user_client.get_storage_items(uuids, sign_url=True) if uuids else []
+        return PullSource(resolved_id, name, list(items))
     if source == "dataset":
         dataset, dataset_hash, title, _ = resolve_dataset(
             user_client, source_id, create=False
@@ -66,17 +74,17 @@ def enumerate_items(
             if getattr(row, "backing_item_uuid", None)
         ]
         items = user_client.get_storage_items(backing, sign_url=True) if backing else []
-        return dataset_hash, title, list(items), None
+        return PullSource(dataset_hash, title, list(items))
     if source == "project":
         project, project_hash, title = resolve_project(user_client, source_id)
-        label_rows = project.list_label_rows_v2()
+        label_rows = list(project.list_label_rows_v2())
         backing = [
             row.backing_item_uuid
             for row in label_rows
             if getattr(row, "backing_item_uuid", None)
         ]
         items = user_client.get_storage_items(backing, sign_url=True) if backing else []
-        return project_hash, title, list(items), project
+        return PullSource(project_hash, title, list(items), project, label_rows)
     raise EncordToolError(
         f"Unknown --source value {source!r}. Choices: {', '.join(PULL_SOURCES)}."
     )
@@ -121,7 +129,7 @@ def transfer_item(
         output_uri.rstrip("/")
         + f"/media/{pulled.item_uuid}__{_sanitize_name(pulled.name)}"
     )
-    dest_bucket, dest_key = _parse_s3_uri(dest_uri)
+    dest_bucket, dest_key = _parse_bucket_uri(dest_uri)
 
     signed_url = item.get_signed_url()
     if not signed_url:
@@ -141,31 +149,28 @@ def transfer_item(
             pulled.transfer = "copy"
             return pulled
         except Exception:  # noqa: BLE001 - fall back to the download path
-            source = None
+            pass
 
     import httpx
 
+    def _download(url: str) -> None:
+        with tempfile.TemporaryDirectory(prefix="npa-encord-pull-") as tmp:
+            local = Path(tmp) / _sanitize_name(pulled.name)
+            with httpx.stream("GET", url, timeout=600.0, follow_redirects=True) as response:
+                response.raise_for_status()
+                with local.open("wb") as handle:
+                    for chunk in response.iter_bytes(8 * 1024 * 1024):
+                        handle.write(chunk)
+            storage_client.upload_file(str(local), dest_uri)
+
     try:
-        for attempt in (1, 2):
-            try:
-                with tempfile.TemporaryDirectory(prefix="npa-encord-pull-") as tmp:
-                    local = Path(tmp) / _sanitize_name(pulled.name)
-                    with httpx.stream(
-                        "GET", signed_url, timeout=600.0, follow_redirects=True
-                    ) as response:
-                        response.raise_for_status()
-                        with local.open("wb") as handle:
-                            for chunk in response.iter_bytes(8 * 1024 * 1024):
-                                handle.write(chunk)
-                    storage_client.upload_file(str(local), dest_uri)
-                pulled.media_uri = dest_uri
-                pulled.transfer = "download"
-                return pulled
-            except httpx.HTTPStatusError:
-                if attempt == 2:
-                    raise
-                # The signed URL may simply have expired mid-run; refetch once.
-                signed_url = item.get_signed_url(refetch=True) or signed_url
+        try:
+            _download(signed_url)
+        except httpx.HTTPStatusError:
+            # The signed URL may simply have expired mid-run; refetch once.
+            _download(item.get_signed_url(refetch=True) or signed_url)
+        pulled.media_uri = dest_uri
+        pulled.transfer = "download"
     except Exception as exc:  # noqa: BLE001 - recorded per item, run fails closed
         pulled.transfer = "error"
         pulled.error = str(exc)
@@ -174,13 +179,13 @@ def transfer_item(
 
 def export_labels(
     project: Any,
+    label_rows: list[Any],
     *,
     output_uri: str,
     storage_client: Any,
 ) -> tuple[int, list[str]]:
     """Export every label row as Encord JSON under labels/."""
 
-    label_rows = list(project.list_label_rows_v2())
     if not label_rows:
         return 0, []
     with project.create_bundle(bundle_size=LABEL_BUNDLE_SIZE) as bundle:
@@ -190,7 +195,7 @@ def export_labels(
     for row in label_rows:
         name = str(row.label_hash or row.data_hash or len(label_uris))
         label_uri = output_uri.rstrip("/") + f"/labels/{name}.json"
-        _write_json(
+        write_json(
             row.to_encord_dict(),
             result_uri=label_uri,
             filename=f"{name}.json",
@@ -220,20 +225,17 @@ def run_pull(
     endpoint_url = resolve_public_endpoint(environ)
     client = user_client if user_client is not None else _default_user_client(environ)
 
-    resolved_id, source_name, storage_items, project = enumerate_items(
-        client, source=source, source_id=source_id
-    )
+    found = enumerate_items(client, source=source, source_id=source_id)
 
     pulled: list[PulledItem] = []
-    media_bytes = 0
-    for item in storage_items:
+    for item in found.items:
         record = transfer_item(
             item,
             storage_client=active_storage,
             output_uri=output_path,
             endpoint_url=endpoint_url,
         )
-        _write_json(
+        write_json(
             {
                 "item_uuid": record.item_uuid,
                 "name": record.name,
@@ -246,14 +248,16 @@ def run_pull(
             filename=f"{record.item_uuid}.json",
             storage_client=active_storage,
         )
-        media_bytes += record.file_size if record.transfer in ("copy", "download") else 0
         pulled.append(record)
 
     label_rows = 0
     label_uris: list[str] = []
-    if project is not None:
+    if found.project is not None:
         label_rows, label_uris = export_labels(
-            project, output_uri=output_path, storage_client=active_storage
+            found.project,
+            found.label_rows,
+            output_uri=output_path,
+            storage_client=active_storage,
         )
 
     manifest_uri = pull_manifest_uri_for(output_path)
@@ -262,8 +266,8 @@ def run_pull(
         workflow_run=workflow_run,
         encord_domain=resolve_domain(environ),
         source_kind=source,
-        source_id=resolved_id,
-        source_name=source_name,
+        source_id=found.source_id,
+        source_name=found.source_name,
         output_uri=output_path,
         manifest_uri=manifest_uri,
         items_total=len(pulled),
@@ -271,11 +275,15 @@ def run_pull(
         media_downloaded=sum(1 for record in pulled if record.transfer == "download"),
         media_failed=sum(1 for record in pulled if record.transfer == "error"),
         label_rows=label_rows,
-        media_bytes=media_bytes,
+        media_bytes=sum(
+            record.file_size
+            for record in pulled
+            if record.transfer in ("copy", "download")
+        ),
         label_uris=label_uris,
         items=pulled,
     )
-    _write_json(
+    write_json(
         manifest.model_dump(by_alias=True),
         result_uri=manifest_uri,
         filename=PULL_MANIFEST_FILENAME,

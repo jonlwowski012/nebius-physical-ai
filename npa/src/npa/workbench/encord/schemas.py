@@ -14,6 +14,9 @@ PUSH_RECEIPT_SCHEMA = "npa.encord.push_receipt.v1"
 PULL_MANIFEST_SCHEMA = "npa.encord.pull_manifest.v1"
 PUSH_RECEIPT_FILENAME = "push_receipt.json"
 PULL_MANIFEST_FILENAME = "manifest.json"
+DEFAULT_MEDIA_FILTER = "videos-images"
+DEFAULT_TRANSFER = "register"
+DEFAULT_POLL_TIMEOUT_SECONDS = 1800
 
 
 class EncordToolError(RuntimeError):

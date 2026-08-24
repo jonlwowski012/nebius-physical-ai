@@ -13,7 +13,6 @@ packages or touches infrastructure at import time.
 
 from __future__ import annotations
 
-import os
 from dataclasses import dataclass
 from typing import Any, Callable, Iterable
 
@@ -242,22 +241,18 @@ def check_token_factory(credentials: Any, probes: CredentialProbes) -> CheckResu
     )
 
 
-ENCORD_CREDENTIAL_NAMES = ("ENCORD_SSH_KEY", "ENCORD_SSH_KEY_B64", "ENCORD_SSH_KEY_FILE")
-
-
 def check_encord(credentials: Any, probes: CredentialProbes) -> CheckResult:
     """Check an Encord credential is present and (optionally) authenticates.
 
-    Mirrors how workflow submit resolves secrets: the process environment first,
-    then the ``tokens:`` section of ~/.npa/credentials.yaml.
+    ``load_credentials`` already merges the process environment over the
+    ``tokens:`` section for these names, so reading ``credentials.tokens`` sees
+    exactly what workflow submit will resolve.
     """
 
+    from npa.clients.credentials import ENCORD_TOKEN_KEYS
+
     tokens = getattr(credentials, "tokens", {}) or {}
-    present = [
-        name
-        for name in ENCORD_CREDENTIAL_NAMES
-        if str(os.environ.get(name) or tokens.get(name) or "").strip()
-    ]
+    present = [name for name in ENCORD_TOKEN_KEYS if str(tokens.get(name) or "").strip()]
     if not present:
         return CheckResult(
             name="encord",

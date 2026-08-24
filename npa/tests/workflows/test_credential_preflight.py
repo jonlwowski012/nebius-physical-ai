@@ -191,38 +191,30 @@ def test_has_failure_true_when_any_fail() -> None:
     assert has_failure(results) is True
 
 
-def test_encord_warns_when_missing(monkeypatch: pytest.MonkeyPatch) -> None:
-    for name in ("ENCORD_SSH_KEY", "ENCORD_SSH_KEY_B64", "ENCORD_SSH_KEY_FILE"):
-        monkeypatch.delenv(name, raising=False)
+def test_encord_warns_when_missing() -> None:
     result = check_encord(_Creds(), CredentialProbes())
     assert result.status == WARN
     assert "ENCORD_SSH_KEY" in result.summary
 
 
-def test_encord_present_unverified_from_credentials_tokens(
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    for name in ("ENCORD_SSH_KEY", "ENCORD_SSH_KEY_B64", "ENCORD_SSH_KEY_FILE"):
-        monkeypatch.delenv(name, raising=False)
+def test_encord_present_unverified_from_credentials_tokens() -> None:
     creds = _Creds(tokens={"ENCORD_SSH_KEY": "-----BEGIN OPENSSH PRIVATE KEY-----"})
     result = check_encord(creds, CredentialProbes())
     assert result.status == PASS
     assert "not verified" in result.summary
 
 
-def test_encord_pass_when_verifier_ok(monkeypatch: pytest.MonkeyPatch) -> None:
-    monkeypatch.setenv("ENCORD_SSH_KEY_B64", "abc")
+def test_encord_pass_when_verifier_ok() -> None:
     probes = CredentialProbes(encord_verifier=lambda: "storage folders listable")
-    result = check_encord(_Creds(), probes)
+    result = check_encord(_Creds(tokens={"ENCORD_SSH_KEY_B64": "abc"}), probes)
     assert result.status == PASS
     assert "storage folders listable" in result.summary
 
 
-def test_encord_fail_when_verifier_raises(monkeypatch: pytest.MonkeyPatch) -> None:
-    monkeypatch.setenv("ENCORD_SSH_KEY", "pem")
+def test_encord_fail_when_verifier_raises() -> None:
     probes = CredentialProbes(
         encord_verifier=lambda: (_ for _ in ()).throw(RuntimeError("401 unauthorized"))
     )
-    result = check_encord(_Creds(), probes)
+    result = check_encord(_Creds(tokens={"ENCORD_SSH_KEY": "pem"}), probes)
     assert result.status == FAIL
     assert result.details == ("401 unauthorized",)

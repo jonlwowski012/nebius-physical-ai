@@ -534,8 +534,10 @@ def test_preflight_encord_check_offline(monkeypatch) -> None:
 def test_preflight_encord_present_offline_is_unverified_pass(monkeypatch) -> None:
     from npa.cli.workbench import health as health_module
 
-    monkeypatch.setenv("ENCORD_SSH_KEY_B64", "abc")
-    monkeypatch.setattr(health_module, "load_credentials", lambda *a, **k: _EmptyCreds())
+    class _EncordCreds(_EmptyCreds):
+        tokens = {"ENCORD_SSH_KEY_B64": "abc"}
+
+    monkeypatch.setattr(health_module, "load_credentials", lambda *a, **k: _EncordCreds())
     result = runner.invoke(
         app, ["workbench", "health", "preflight", "--checks", "encord", "--offline"]
     )

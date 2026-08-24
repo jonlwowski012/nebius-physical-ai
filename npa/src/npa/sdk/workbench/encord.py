@@ -4,7 +4,13 @@ from __future__ import annotations
 
 from typing import Any
 
-from npa.workbench.encord.schemas import PullManifest, PushReceipt
+from npa.workbench.encord.schemas import (
+    DEFAULT_MEDIA_FILTER,
+    DEFAULT_POLL_TIMEOUT_SECONDS,
+    DEFAULT_TRANSFER,
+    PullManifest,
+    PushReceipt,
+)
 
 
 def push(
@@ -14,9 +20,9 @@ def push(
     folder: str,
     output_path: str,
     dataset: str = "",
-    media: str = "videos-images",
-    transfer: str = "register",
-    poll_timeout_seconds: int = 1800,
+    media: str = DEFAULT_MEDIA_FILTER,
+    transfer: str = DEFAULT_TRANSFER,
+    poll_timeout_seconds: int = DEFAULT_POLL_TIMEOUT_SECONDS,
     workflow_run: str = "",
     user_client: Any = None,
     storage_client: Any = None,

@@ -94,7 +94,6 @@ class FakePollResult:
         self.status = SimpleNamespace(name=status)
         self.units_done_count = done
         self.units_error_count = errors
-        self.units_pending_count = 0
         self.items_with_names = [
             SimpleNamespace(item_uuid=item_uuid, name=name)
             for item_uuid, name in (items or [])
@@ -156,11 +155,8 @@ class FakeItem:
         self.file_size = file_size
         self.client_metadata = {}
         self._signed_url = signed_url
-        self.refetch_calls = 0
 
     def get_signed_url(self, refetch: bool = False) -> str | None:
-        if refetch:
-            self.refetch_calls += 1
         return self._signed_url
 
 
@@ -181,7 +177,6 @@ class FakeUserClient:
         integrations=None,
         folders=None,
         datasets=None,
-        dataset_rows=None,
         collection=None,
         items=None,
     ) -> None:
@@ -190,7 +185,6 @@ class FakeUserClient:
         ]
         self.folders = folders or []
         self.datasets = datasets or {}
-        self.dataset_rows = dataset_rows or []
         self.collection = collection
         self.items = items or []
         self.created_folders: list[str] = []
@@ -510,21 +504,19 @@ def test_enumerate_items_per_source() -> None:
     client = FakeUserClient(
         collection=collection, datasets={dataset.dataset_hash: dataset}, items=items
     )
-    source_id, name, found, project = enumerate_items(
-        client, source="collection", source_id=str(collection.uuid)
-    )
-    assert name == "keepers" and len(found) == 1 and project is None
-    source_id, name, found, project = enumerate_items(
-        client, source="dataset", source_id=dataset.dataset_hash
-    )
-    assert source_id == dataset.dataset_hash and found == items
+    found = enumerate_items(client, source="collection", source_id=str(collection.uuid))
+    # Collection items are re-fetched in bulk with signed URLs, like the other sources.
+    assert found.source_name == "keepers" and found.items == items
+    assert found.project is None and found.label_rows == []
+    found = enumerate_items(client, source="dataset", source_id=dataset.dataset_hash)
+    assert found.source_id == dataset.dataset_hash and found.items == items
 
 
 def test_run_pull_writes_manifest_and_fails_closed_on_errors(tmp_path: Path) -> None:
     good = FakeItem(_uuid(51), "a.mp4", f"{ENDPOINT}/bkt/p/a.mp4", file_size=7)
     bad = FakeItem(_uuid(52), "b.mp4", None)
     collection = FakeCollection([good, bad])
-    client = FakeUserClient(collection=collection)
+    client = FakeUserClient(collection=collection, items=[good, bad])
     storage = FakeStorage()
     out_uri = "s3://out/pull"
     with pytest.raises(EncordToolError, match="failed for 1 of 2"):
@@ -545,7 +537,7 @@ def test_run_pull_writes_manifest_and_fails_closed_on_errors(tmp_path: Path) -> 
 def test_run_pull_happy_path_counts(tmp_path: Path) -> None:
     good = FakeItem(_uuid(53), "a.mp4", f"{ENDPOINT}/bkt/p/a.mp4", file_size=7)
     collection = FakeCollection([good])
-    client = FakeUserClient(collection=collection)
+    client = FakeUserClient(collection=collection, items=[good])
     storage = FakeStorage()
     manifest = run_pull(
         source="collection",

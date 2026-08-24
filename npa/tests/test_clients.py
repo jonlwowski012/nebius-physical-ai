@@ -2122,3 +2122,32 @@ def test_lazy_storage_client_builds_once_on_first_real_call(monkeypatch) -> None
     assert client.download_path("s3://b/k", "/tmp/x") == "/tmp/x"
     assert client.download_path("s3://b/k", "/tmp/y") == "/tmp/y"
     assert len(built) == 1
+
+
+def test_load_credentials_hydrates_encord_tokens_env_over_file(
+    tmp_path, monkeypatch
+) -> None:
+    """Encord auth names resolve through tokens like HF/TF/NGC (env wins).
+
+    check_encord and the Encord client read only ``credentials.tokens``, so this
+    merge is what keeps preflight, local CLI, and --secret-env resolution seeing
+    the same credential.
+    """
+
+    from npa.clients import credentials
+
+    path = tmp_path / "credentials.yaml"
+    path.write_text("tokens:\n  ENCORD_SSH_KEY: file-pem\n", encoding="utf-8")
+    path.chmod(0o600)
+    monkeypatch.setattr(credentials, "CREDENTIALS_PATH", path)
+
+    merged = credentials.load_credentials(environ={"ENCORD_SSH_KEY_B64": "env-b64"})
+    assert merged.tokens["ENCORD_SSH_KEY"] == "file-pem"
+    assert merged.tokens["ENCORD_SSH_KEY_B64"] == "env-b64"
+
+    env_wins = credentials.load_credentials(environ={"ENCORD_SSH_KEY": "env-pem"})
+    assert env_wins.tokens["ENCORD_SSH_KEY"] == "env-pem"
+
+    absent = credentials.load_credentials(environ={})
+    assert absent.tokens["ENCORD_SSH_KEY"] == "file-pem"
+    assert "ENCORD_SSH_KEY_B64" not in absent.tokens

@@ -25,6 +25,9 @@ FOXGLOVE_API_TOKEN_KEY = "FOXGLOVE_API_TOKEN"
 # transport form. Deliberately NOT in shared_credential_env — a single-tool SaaS
 # secret stays backend-only (Foxglove precedent).
 ENCORD_ENV_KEYS = ("ENCORD_SSH_KEY", "ENCORD_SSH_KEY_B64")
+# All names load_credentials hydrates into tokens (the FILE variant is a local
+# path, deliberately excluded from --save-env-credentials persistence above).
+ENCORD_TOKEN_KEYS = (*ENCORD_ENV_KEYS, "ENCORD_SSH_KEY_FILE")
 KNOWN_TOKEN_KEYS = (
     "HF_TOKEN",
     TOKEN_FACTORY_ENV_KEY,
@@ -364,7 +367,8 @@ def load_credentials(
         file_ssh = _read_file_ssh(credentials_path)
         file_storage = _read_file_storage(credentials_path)
 
-    keys = set(KNOWN_TOKEN_KEYS) | set(file_tokens)
+    # Encord auth is resolved through tokens (env wins over file), like HF/TF/NGC.
+    keys = set(KNOWN_TOKEN_KEYS) | set(ENCORD_TOKEN_KEYS) | set(file_tokens)
     tokens: dict[str, str] = {}
     for key in sorted(keys):
         env_value = env.get(key)

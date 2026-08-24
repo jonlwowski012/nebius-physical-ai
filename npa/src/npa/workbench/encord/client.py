@@ -66,17 +66,21 @@ def resolve_public_endpoint(environ: dict[str, str] | None = None) -> str:
 
 
 def _resolve_auth_env(environ: dict[str, str] | None = None) -> dict[str, str]:
-    """Merge process env with tokens from ~/.npa/credentials.yaml (env wins)."""
+    """The Encord auth names, from an injected env or the resolved credentials.
 
-    env = dict(environ) if environ is not None else dict(os.environ)
-    if environ is None:
-        from npa.clients.credentials import load_credentials
+    ``load_credentials`` merges the process environment over the ``tokens:``
+    section for these names, so the default path needs no extra merging.
+    """
 
-        tokens = load_credentials(environ=env).tokens
-        for name in (ENCORD_SSH_KEY_ENV, ENCORD_SSH_KEY_B64_ENV, ENCORD_SSH_KEY_FILE_ENV):
-            if not env.get(name) and tokens.get(name):
-                env[name] = tokens[name]
-    return env
+    if environ is not None:
+        return dict(environ)
+    from npa.clients.credentials import load_credentials
+
+    tokens = load_credentials().tokens
+    return {
+        name: tokens.get(name, "")
+        for name in (ENCORD_SSH_KEY_ENV, ENCORD_SSH_KEY_B64_ENV, ENCORD_SSH_KEY_FILE_ENV)
+    }
 
 
 def _default_user_client(environ: dict[str, str] | None = None) -> Any:
@@ -179,21 +183,24 @@ def resolve_folder(user_client: Any, value: str) -> tuple[Any, bool]:
     return folder, True
 
 
-def _dataset_storage_location() -> Any:
-    """StorageLocation.CORD_STORAGE, or its name when the SDK is not installed.
+def _resolve_auth_env(environ: dict[str, str] | None = None) -> dict[str, str]:
+    """The Encord auth names, from an injected env or the resolved credentials.
 
-    The fallback is only reachable with an injected (fake) user client: any real
-    client was constructed by ``_default_user_client``, which already imported
-    the SDK.
+    ``load_credentials`` merges the process environment over the ``tokens:``
+    section for these names, so the default path needs no extra merging.
     """
 
-    try:
-        from encord.orm.dataset import StorageLocation
-    except ModuleNotFoundError:
-        return "CORD_STORAGE"
-    return StorageLocation.CORD_STORAGE
+    if environ is not None:
+        return dict(environ)
+    from npa.clients.credentials import load_credentials
 
-
+    tokens = load_credentials().tokens
+    env = {
+        name: tokens.get(name, "")
+        for name in (ENCORD_SSH_KEY_ENV, ENCORD_SSH_KEY_B64_ENV, ENCORD_SSH_KEY_FILE_ENV)
+    }
+    env[ENCORD_DOMAIN_ENV] = os.environ.get(ENCORD_DOMAIN_ENV, "")
+    return env
 def resolve_dataset(
     user_client: Any, value: str, *, create: bool = True
 ) -> tuple[Any, str, str, bool]:
@@ -222,9 +229,17 @@ def resolve_dataset(
     # the dataset needs no backing folder of its own. CORD_STORAGE is the
     # documented type for link_items-driven datasets; the live e2e smoke is the
     # gate that would surface a mismatch.
+    try:
+        from encord.orm.dataset import StorageLocation
+
+        storage_location: Any = StorageLocation.CORD_STORAGE
+    except ModuleNotFoundError:
+        # Only reachable with an injected (fake) user client: a real client was
+        # constructed by _default_user_client, which already imported the SDK.
+        storage_location = "CORD_STORAGE"
     response = user_client.create_dataset(
         value,
-        _dataset_storage_location(),
+        storage_location,
         dataset_description="Created by npa workbench encord push",
         create_backing_folder=False,
     )

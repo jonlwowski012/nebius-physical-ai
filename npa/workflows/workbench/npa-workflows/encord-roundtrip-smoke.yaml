@@ -28,10 +28,9 @@ config:
   encord_integration: "nebius-s3"
   encord_folder: "npa-e2e-{{run.id}}"
   encord_dataset: "npa-e2e-{{run.id}}"
-  encord_media_filter: "videos-images"
-  # register: bytes stay in the bucket. upload: bytes copied into Encord storage.
+  # register (default): bytes stay in the bucket; run with
+  # --var encord_transfer=upload for the byte-copy variant.
   encord_transfer: "register"
-  encord_poll_timeout_seconds: "1800"
   encord_receipt_uri: "s3://{{config.bucket}}/{{config.prefix}}/push/"
 
   # pull resolves the dataset push just created by its unique title.
