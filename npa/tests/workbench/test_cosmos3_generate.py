@@ -183,7 +183,10 @@ def test_run_generate_without_guardrails_needs_no_token_for_staged_weights(
     env.pop("HF_TOKEN")
     output_dir = tmp_path / "out"
 
+    captured_env: dict = {}
+
     def fake_runner(argv, **kwargs):
+        captured_env.update(kwargs.get("env") or {})
         sample = output_dir / "npa-generate"
         sample.mkdir(parents=True)
         (sample / "vision.jpg").write_bytes(b"y" * 2048)
@@ -201,6 +204,10 @@ def test_run_generate_without_guardrails_needs_no_token_for_staged_weights(
     assert result["status"] == "executed"
     assert result["hf_auth"] == "skipped"
     assert result["guardrails"] is False
+    # Fragmentation-resilient allocator default (48GB-class GPUs OOM in the Wan
+    # VAE decode without it); operators can still override either spelling.
+    assert captured_env["PYTORCH_CUDA_ALLOC_CONF"] == "expandable_segments:True"
+    assert captured_env["PYTORCH_ALLOC_CONF"] == "expandable_segments:True"
 
 
 def test_staged_checkpoint_tilde_is_expanded(tmp_path: Path) -> None:

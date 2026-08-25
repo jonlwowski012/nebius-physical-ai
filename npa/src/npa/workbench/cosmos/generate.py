@@ -532,6 +532,12 @@ def run_cosmos3_generate(
         env.setdefault("HUGGING_FACE_HUB_TOKEN", token)
     env.setdefault("HF_HOME", str(Path(output_root).parent / "hf_home"))
     env.setdefault("TOKENIZERS_PARALLELISM", "false")
+    # Wan VAE decode allocates multi-GiB chunks; on 48GB-class GPUs (L40S) the
+    # default caching allocator fragments and OOMs with head-room still free.
+    # Same default the Alpamayo2-Super runtime ships; operators can override.
+    # Both spellings: torch renamed PYTORCH_CUDA_ALLOC_CONF to PYTORCH_ALLOC_CONF.
+    env.setdefault("PYTORCH_CUDA_ALLOC_CONF", "expandable_segments:True")
+    env.setdefault("PYTORCH_ALLOC_CONF", "expandable_segments:True")
 
     run = runner or subprocess.run
     completed = run(list(plan["argv"]), cwd=str(plan["repo"]), env=env, check=False)
