@@ -19,6 +19,50 @@ step:
 > run `npa workbench health preflight --checks encord`, then `push` → curate →
 > `pull`.
 
+## The integration at a glance
+
+```mermaid
+flowchart LR
+    subgraph nebius["Your Nebius project"]
+        SRC[("S3 media prefix<br/>*.mp4 · *.png · *.jpg")]
+        RCPT[("push_receipt.json")]
+        DEST[("S3 output prefix<br/>media/ · items/ · labels/ · manifest.json")]
+    end
+
+    subgraph cli["npa workbench encord"]
+        PUSH["push"]
+        PULL["pull"]
+    end
+
+    subgraph encord["Encord SaaS"]
+        INT["Cloud integration<br/>one-time · read-only keys"]
+        FOLDER["Storage folder"]
+        DATASET["Dataset"]
+        CURATE{{"Human curation<br/>in the Encord app"}}
+        KEEP["Collection · Dataset · Project labels"]
+    end
+
+    SRC -- "list prefix" --> PUSH
+    PUSH == "register (default):<br/>objectUrls only — bytes stay put" ==> FOLDER
+    PUSH -. "--transfer upload:<br/>bytes copied into Encord storage" .-> FOLDER
+    FOLDER -- "resolves registered media via" --> INT
+    INT -- "read-only bucket access" --> SRC
+    PUSH -- "durable receipt" --> RCPT
+    FOLDER -- "link_items (explicit)" --> DATASET
+    DATASET --> CURATE
+    CURATE --> KEEP
+    KEEP -- "--source + --source-id" --> PULL
+    PULL == "registered media:<br/>zero-egress server-side copy" ==> DEST
+    PULL -. "Encord-hosted media:<br/>signed-URL download" .-> DEST
+```
+
+Solid heavy arrows are the default register-mode paths; dashed arrows are the
+upload-mode variants. Both `push` and `pull` authenticate with your Encord API
+key (`ENCORD_SSH_KEY*`); the cloud integration is a separate, Encord-side
+credential that only ever grants *read* on the media bucket. The receipt and
+manifest are written before any failure exit, so lineage survives fail-closed
+runs.
+
 ## One-time setup
 
 ### 1. Create an Encord API key
