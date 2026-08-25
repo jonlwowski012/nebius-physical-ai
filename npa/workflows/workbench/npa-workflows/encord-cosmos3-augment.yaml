@@ -1,0 +1,156 @@
+apiVersion: npa.workflow/v0.0.1
+kind: Workflow
+
+# The post-curation half of the Encord loop, as one run:
+#
+#   pull the curated Encord source -> stage one item at a deterministic URI ->
+#   real Cosmos 3 video2video augmentation -> push the augmented video back
+#   into Encord as a fresh dataset.
+#
+# The pre-curation half stays a separate workflow (encord-push.yaml) because a
+# human curates in the Encord app between the two; this spec starts from the
+# curated Collection/Dataset id that curation produced. v1 augments one item
+# per run (config.encord_item_index selects which).
+
+metadata:
+  name: encord-cosmos3-augment
+  description: >
+    Pull a curated Encord Collection/Dataset item, augment it with a real
+    Cosmos 3 video2video pass, and register the augmented video back into
+    Encord as a new dataset — the post-curation half of the Encord loop.
+
+config:
+  bucket: example-bucket
+  prefix: "encord-augment/{{run.id}}"
+
+  # Default source: a self-seeded demo dataset built from the packaged PAIDF
+  # starter clip (pinned, SHA-256-verified, CC-BY-4.0), so the spec runs out of
+  # the box. Override encord_source/-id with your curated Collection/Dataset
+  # from the Encord app and the seed stage skips itself.
+  encord_source: "dataset"
+  encord_source_id: "npa-demo-src-{{run.id}}"
+  seed_media_uri: "s3://{{config.bucket}}/{{config.prefix}}/seed/"
+  # Which transferred media item of the pull manifest to augment.
+  encord_item_index: "0"
+
+  # Cosmos 3 conditioning. video2video is the point of the loop; the staged
+  # input below is what the pull actually returned from Encord.
+  cosmos3_mode: video2video
+  cosmos3_checkpoint: Cosmos3-Nano
+  cosmos3_seed: "17"
+  cosmos3_guidance: "5.0"
+  cosmos3_steps: "24"
+  prompt: "Preserve the source motion and scene structure while creating a physically plausible appearance variant."
+
+  # Where the augmented result goes back into Encord. encord_media_uri is the
+  # push toolRef's input contract key: it points at the generated/ prefix, where
+  # push discovers the augmented .mp4 (generate.json is skipped as non-media).
+  # The default transfer is upload (bytes copied into Encord storage) so the
+  # out-of-the-box run needs no cloud integration; set encord_transfer=register
+  # and encord_integration=<your integration title> for register-in-place.
+  encord_transfer: "upload"
+  encord_integration: ""
+  encord_folder: "npa-aug-{{run.id}}"
+  encord_dataset: "npa-aug-{{run.id}}"
+  encord_media_uri: "s3://{{config.bucket}}/{{config.prefix}}/generated/"
+
+  encord_pull_uri: "s3://{{config.bucket}}/{{config.prefix}}/pull/"
+  # cosmos3_input_path / output_uri are the workbench.cosmos3.generate contract keys.
+  cosmos3_input_path: "s3://{{config.bucket}}/{{config.prefix}}/augment-input/source.mp4"
+  output_uri: "s3://{{config.bucket}}/{{config.prefix}}/generated/"
+  encord_receipt_uri: "s3://{{config.bucket}}/{{config.prefix}}/push-augmented/"
+
+resources:
+  cpu:
+    cloud: kubernetes
+    cpus: 2
+    memory: 8Gi
+  gpu:
+    cloud: kubernetes
+    # Portable supported default; override the product via
+    # NPA_WORKFLOW_GPU_ACCELERATOR without editing the spec.
+    accelerators: H100:1
+    cpus: 16
+    memory: 80Gi
+
+initial: seed-source
+
+states:
+  seed-source:
+    description: >-
+      Seed the default demo dataset into Encord from the packaged starter clip;
+      a no-op when encord_source_id points at an operator-curated source.
+    resources: cpu
+    run:
+      argv:
+        - python3
+        - -c
+        - >-
+          import sys; from npa.workflows.encord_loop import seed_demo_source;
+          seed_demo_source(*sys.argv[1:])
+        - "{{config.seed_media_uri}}"
+        - "npa-demo-src-{{run.id}}"
+        - "{{config.encord_source_id}}"
+        - "{{config.encord_transfer}}"
+        - "{{config.encord_integration}}"
+    next: pull
+
+  pull:
+    description: Materialize the curated Encord source to S3 with its lineage manifest.
+    needs: [seed-source]
+    toolRef: workbench.encord.pull
+    resources: cpu
+    outputs:
+      - uri: "{{config.encord_pull_uri}}manifest.json"
+        schema: npa.encord.pull_manifest.v1
+    next: stage-input
+
+  stage-input:
+    description: >-
+      Copy the selected pulled item to the deterministic URI the Cosmos stage
+      conditions on (pull names media by item uuid, which a spec cannot know).
+    needs: [pull]
+    resources: cpu
+    run:
+      argv:
+        - python3
+        - -c
+        - >-
+          import sys; from npa.workflows.encord_loop import stage_media_for_augment;
+          stage_media_for_augment(*sys.argv[1:])
+        - "{{config.encord_pull_uri}}manifest.json"
+        - "{{config.cosmos3_input_path}}"
+        - "{{config.encord_item_index}}"
+    inputs:
+      - uri: "{{config.encord_pull_uri}}manifest.json"
+        schema: npa.encord.pull_manifest.v1
+    outputs:
+      - uri: "{{config.cosmos3_input_path}}"
+        schema: video/mp4
+    next: augment
+
+  augment:
+    description: Run a real Cosmos 3 video2video pass conditioned on the pulled media.
+    needs: [stage-input]
+    toolRef: workbench.cosmos3.generate
+    resources: gpu
+    inputs:
+      - uri: "{{config.cosmos3_input_path}}"
+        schema: video/mp4
+    outputs:
+      - uri: "{{config.output_uri}}generate.json"
+        schema: npa.cosmos3.generate.v1
+    next: push-augmented
+
+  push-augmented:
+    description: Register the augmented video back into Encord as a fresh dataset.
+    needs: [augment]
+    toolRef: workbench.encord.push
+    resources: cpu
+    inputs:
+      - uri: "{{config.output_uri}}generate.json"
+        schema: npa.cosmos3.generate.v1
+    outputs:
+      - uri: "{{config.encord_receipt_uri}}push_receipt.json"
+        schema: npa.encord.push_receipt.v1
+    terminal: true

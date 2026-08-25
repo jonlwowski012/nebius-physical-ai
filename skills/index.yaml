@@ -381,6 +381,7 @@ skills:
           - npa/workflows/workbench/npa-workflows/encord-push.yaml
           - npa/workflows/workbench/npa-workflows/encord-pull.yaml
           - npa/workflows/workbench/npa-workflows/encord-roundtrip-smoke.yaml
+          - npa/workflows/workbench/npa-workflows/encord-cosmos3-augment.yaml
   - name: dataset
     category: tools
     when_to_use: "Ingest, validate, curate, or query production sensor data as a versioned dataset-of-record (filter by event, location, quality), or wire the dataset-ingest-curate workflow."

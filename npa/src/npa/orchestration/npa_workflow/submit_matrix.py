@@ -82,6 +82,25 @@ SUBMIT_LIVE_MATRIX: tuple[SubmitLiveCase, ...] = (
     ),
     # --- CPU / zero-GPU (Token Factory hosted) ---
     SubmitLiveCase(
+        "encord-cosmos3-augment.yaml",
+        "gpu",
+        secret_envs=(
+            "ENCORD_SSH_KEY_B64",
+            "HF_TOKEN",
+            "AWS_ACCESS_KEY_ID",
+            "AWS_SECRET_ACCESS_KEY",
+        ),
+        image_tool="cosmos3",
+        runtime=True,
+        notes=(
+            "Self-seeding by default: the seed stage pushes the packaged pinned "
+            "starter clip (CC-BY-4.0) into a run-scoped npa-demo-src-* dataset, "
+            "then pull -> Cosmos3 video2video -> push-augmented. Pass "
+            "--var encord_source_id=<curated id> to run on real curated data "
+            "(the seed stage then no-ops)."
+        ),
+    ),
+    SubmitLiveCase(
         "encord-roundtrip-smoke.yaml",
         "cpu",
         secret_envs=(

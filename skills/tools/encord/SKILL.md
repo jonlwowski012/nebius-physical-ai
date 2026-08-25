@@ -115,6 +115,16 @@ never creates.
   terminal after the receipt (curation is human-in-the-loop).
 - `npa/workflows/workbench/npa-workflows/encord-pull.yaml` — production pull,
   run after curation with the Collection uuid (or dataset/project reference).
+- `npa/workflows/workbench/npa-workflows/encord-cosmos3-augment.yaml` — the
+  curation-to-augmentation loop in one run: pull an Encord source, augment one
+  item with a real Cosmos 3 video2video pass on the GPU profile, and push the
+  result back into Encord as `npa-aug-<run-id>`. Runs out of the box: by
+  default a seed stage uploads the packaged pinned starter clip (CC-BY-4.0,
+  SHA-256-verified) into a run-scoped `npa-demo-src-<run-id>` dataset and the
+  default transfer is `upload`, so no cloud integration is required. Override
+  `--var encord_source_id=<your curated id>` (the seed stage no-ops) and
+  `encord_transfer=register` + `encord_integration=<title>` for real data;
+  `encord_item_index` selects which pulled item to augment.
 - `npa/workflows/workbench/npa-workflows/encord-roundtrip-smoke.yaml` — the
   live e2e test: push fixture media into a fresh `npa-e2e-<run-id>` folder +
   dataset, then pull that dataset back by title in the same run. Submit with

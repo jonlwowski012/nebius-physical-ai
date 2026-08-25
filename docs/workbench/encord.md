@@ -207,6 +207,15 @@ Three shipped specs wrap the same tool
 - `encord-push.yaml` — production push, terminal at the receipt (curation is
   human-in-the-loop between workflows).
 - `encord-pull.yaml` — production pull, run after curation.
+- `encord-cosmos3-augment.yaml` — the curation-to-augmentation loop in one
+  run: pull an Encord source, augment one item with a real Cosmos 3 video2video
+  pass, and push the result back into Encord as `npa-aug-<run-id>`. **Runs out
+  of the box**: the default seeds a run-scoped demo dataset from the packaged
+  pinned starter clip (public, CC-BY-4.0, SHA-256-verified) and uploads bytes,
+  so only the Encord API key is needed. For your real data pass
+  `--var encord_source_id=<your-curated-id>` (seeding no-ops) and, for
+  register-in-place, `--var encord_transfer=register
+  --var encord_integration=<title>`; `encord_item_index` picks the item.
 - `encord-roundtrip-smoke.yaml` — live e2e proof: push fixture media into a
   fresh `npa-e2e-<run-id>` folder + dataset, then pull that dataset straight
   back, no human step. Add `--var encord_transfer=upload` for the

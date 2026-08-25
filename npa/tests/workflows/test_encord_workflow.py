@@ -10,6 +10,7 @@ WORKFLOWS = ROOT / "npa" / "workflows" / "workbench" / "npa-workflows"
 PUSH = WORKFLOWS / "encord-push.yaml"
 PULL = WORKFLOWS / "encord-pull.yaml"
 ROUNDTRIP = WORKFLOWS / "encord-roundtrip-smoke.yaml"
+AUGMENT = WORKFLOWS / "encord-cosmos3-augment.yaml"
 
 
 def test_push_spec_is_a_single_terminal_state() -> None:
@@ -93,3 +94,37 @@ def test_push_plan_omits_dataset_flag_when_empty() -> None:
     spec.config["encord_dataset"] = ""
     argv = build_plan(spec, run_id="t").steps[0].argv
     assert "--dataset" not in argv
+
+
+def test_augment_loop_chains_pull_stage_generate_push() -> None:
+    spec = load_spec(AUGMENT)
+    validate_spec(spec)
+    steps = [step.state for step in build_plan(spec, run_id="t").steps]
+    assert steps == ["seed-source", "pull", "stage-input", "augment", "push-augmented"]
+    assert spec.states["pull"].needs == ["seed-source"]
+    assert spec.states["stage-input"].needs == ["pull"]
+    assert spec.states["augment"].needs == ["stage-input"]
+    assert spec.states["push-augmented"].needs == ["augment"]
+    # Only the Cosmos stage is on the GPU profile.
+    assert spec.states["augment"].resources == "gpu"
+    # Default source is the self-seeded demo dataset; the seed argv carries the
+    # same run-scoped title so an operator override makes seeding a no-op.
+    seed_argv = next(
+        s.argv for s in build_plan(spec, run_id="t").steps if s.state == "seed-source"
+    )
+    assert "npa-demo-src-t" in seed_argv  # demo title
+    assert seed_argv.count("npa-demo-src-t") == 2  # title + defaulted source id
+    for name in ("seed-source", "pull", "stage-input", "push-augmented"):
+        assert spec.states[name].resources == "cpu", name
+    # Schema chain: manifest -> staged video -> generate attestation -> receipt.
+    assert spec.states["stage-input"].inputs[0].schema == "npa.encord.pull_manifest.v1"
+    assert spec.states["augment"].inputs[0].schema == "video/mp4"
+    assert spec.states["push-augmented"].inputs[0].schema == "npa.cosmos3.generate.v1"
+    assert spec.states["push-augmented"].outputs[0].schema == "npa.encord.push_receipt.v1"
+    # The Cosmos stage conditions on exactly the URI the glue stage writes.
+    plan = build_plan(spec, run_id="t")
+    augment_argv = next(s.argv for s in plan.steps if s.state == "augment")
+    stage_argv = next(s.argv for s in plan.steps if s.state == "stage-input")
+    staged_uri = stage_argv[-2]  # the glue's dest_uri positional
+    assert staged_uri.endswith("augment-input/source.mp4")
+    assert staged_uri in augment_argv
