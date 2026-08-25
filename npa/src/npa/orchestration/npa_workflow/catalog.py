@@ -1452,6 +1452,34 @@ TOOL_CATALOG: dict[str, ToolEntry] = {
             "encord_poll_timeout_seconds": "1800",
         },
     ),
+    "workbench.encord.seed_demo": ToolEntry(
+        name="workbench.encord.seed_demo",
+        description=(
+            "Seed the encord-cosmos3-augment demo source: push the packaged "
+            "pinned starter clip into a run-scoped Encord dataset, or no-op "
+            "when the operator supplied a curated source id."
+        ),
+        argv_template=[
+            "npa",
+            "workbench",
+            "encord",
+            "seed-demo",
+            "--media-uri",
+            "{{config.seed_media_uri}}",
+            "--dataset",
+            "npa-demo-src-{{run.id}}",
+            "--active-source-id",
+            "{{config.encord_source_id}}",
+            "--transfer",
+            "{{config.encord_transfer}}",
+            "--integration",
+            "{{config.encord_integration}}",
+            "--output",
+            "json",
+        ],
+        omit_flags_when_empty=("--integration",),
+        config_defaults={"encord_integration": ""},
+    ),
     "workbench.encord.pull": ToolEntry(
         name="workbench.encord.pull",
         description=(

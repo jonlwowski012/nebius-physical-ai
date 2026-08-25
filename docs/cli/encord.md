@@ -12,6 +12,7 @@ Options
 Commands
 push  Register S3 media in Encord and optionally link a dataset.
 pull  Pull curated media + labels + lineage manifest back to S3.
+seed-demo  Seed the demo source dataset for encord-cosmos3-augment, or no-op.
 ```
 
 ## Options
@@ -26,6 +27,7 @@ pull  Pull curated media + labels + lineage manifest back to S3.
 | --- | --- |
 | `push` | Register S3 media in Encord and optionally link a dataset. |
 | `pull` | Pull curated media + labels + lineage manifest back to S3. |
+| `seed-demo` | Seed the demo source dataset for encord-cosmos3-augment, or no-op. |
 
 ## Examples
 

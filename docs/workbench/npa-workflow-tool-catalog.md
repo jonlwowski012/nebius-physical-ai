@@ -105,6 +105,7 @@ except the explicitly public composition primitives `infra.fleet.deploy`,
 | `workbench.dataset.curate` | `npa workbench dataset curate` | `config.manifest_uri`, `config.event_of_interest` | curated dataset version manifest | no |
 | `workbench.dataset.query` | `npa workbench dataset query` | `config.curated_manifest_uri` | matching records (LanceDB-backed) | no |
 | `workbench.encord.push` | `npa workbench encord push` | `config.encord_media_uri`, `config.encord_integration`, `config.encord_folder` | push receipt (`npa.encord.push_receipt.v1`); media registered in place in Encord | no |
+| `workbench.encord.seed_demo` | `npa workbench encord seed-demo` | `config.seed_media_uri`, `config.encord_source_id` | run-scoped demo dataset in Encord (no-op for curated ids) | no |
 | `workbench.encord.pull` | `npa workbench encord pull` | `config.encord_source`, `config.encord_source_id` | curated media + item JSON + lineage manifest (`npa.encord.pull_manifest.v1`) | no |
 | `workbench.dataset.write_quality_decision` | dataset quality-gate decision writer | `config.quality_gate`, `config.decision_uri` | accept/reject decision JSON | no |
 | `workbench.dataset.report_rejection` | dataset rejection report writer | `config.validation_uri`, `config.decision_uri` | rejection report | no |

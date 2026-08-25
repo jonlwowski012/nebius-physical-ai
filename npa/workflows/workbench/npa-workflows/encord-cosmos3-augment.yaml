@@ -79,20 +79,10 @@ states:
   seed-source:
     description: >-
       Seed the default demo dataset into Encord from the packaged starter clip;
-      a no-op when encord_source_id points at an operator-curated source.
+      a no-op when encord_source_id points at an operator-curated source. A real
+      toolRef (not argv glue) so the stage's image setup installs npa[encord].
+    toolRef: workbench.encord.seed_demo
     resources: cpu
-    run:
-      argv:
-        - python3
-        - -c
-        - >-
-          import sys; from npa.workflows.encord_loop import seed_demo_source;
-          seed_demo_source(*sys.argv[1:])
-        - "{{config.seed_media_uri}}"
-        - "npa-demo-src-{{run.id}}"
-        - "{{config.encord_source_id}}"
-        - "{{config.encord_transfer}}"
-        - "{{config.encord_integration}}"
     next: pull
 
   pull:

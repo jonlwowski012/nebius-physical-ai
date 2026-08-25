@@ -215,3 +215,60 @@ def pull_cmd(
             f"{manifest.manifest_uri}"
         ),
     )
+
+
+@app.command("seed-demo")
+def seed_demo_cmd(
+    media_uri: str = typer.Option(
+        ...,
+        "--media-uri",
+        help="s3:// prefix to stage the packaged demo starter clip under.",
+    ),
+    dataset: str = typer.Option(
+        ...,
+        "--dataset",
+        help="Run-scoped demo dataset title to create and push into.",
+    ),
+    active_source_id: str = typer.Option(
+        ...,
+        "--active-source-id",
+        help="The workflow's configured source id; when it differs from "
+        "--dataset the operator supplied a curated source and seeding no-ops.",
+    ),
+    transfer: TransferMode = typer.Option(
+        TransferMode.upload, "--transfer", help="Push mode for the demo clip."
+    ),
+    integration: str = typer.Option(
+        "", "--integration", help="Cloud integration title/uuid (register mode only)."
+    ),
+    output: OutputFormat = typer.Option(
+        OutputFormat.json, "--output", help="Output format."
+    ),
+) -> None:
+    """Seed the demo source dataset for encord-cosmos3-augment, or no-op."""
+
+    from npa.cli.path_contract import PathContractError, validate_write_path
+
+    try:
+        validate_write_path(media_uri, tool="encord seed-demo", option="--media-uri", required=True)
+    except PathContractError as exc:
+        _fail(str(exc))
+
+    from npa.workflows.encord_loop import EncordLoopError, seed_demo_source
+    from npa.workbench.encord.schemas import EncordToolError
+
+    try:
+        summary = seed_demo_source(
+            media_uri, dataset, active_source_id,
+            transfer=transfer.value, integration=integration,
+        )
+    except (EncordLoopError, EncordToolError) as exc:
+        _fail(str(exc))
+    except Exception as exc:  # noqa: BLE001 - CLI boundary
+        _fail(f"encord seed-demo failed: {exc}")
+    _emit(
+        summary,
+        output=output,
+        text=summary.get("skipped") and f"seed skipped: {summary['skipped']}"
+        or f"seeded demo dataset {summary.get('dataset')!r} from the packaged starter clip",
+    )

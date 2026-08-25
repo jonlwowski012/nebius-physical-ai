@@ -112,8 +112,9 @@ def test_augment_loop_chains_pull_stage_generate_push() -> None:
     seed_argv = next(
         s.argv for s in build_plan(spec, run_id="t").steps if s.state == "seed-source"
     )
-    assert "npa-demo-src-t" in seed_argv  # demo title
-    assert seed_argv.count("npa-demo-src-t") == 2  # title + defaulted source id
+    assert seed_argv[:4] == ["npa", "workbench", "encord", "seed-demo"]
+    assert seed_argv.count("npa-demo-src-t") == 2  # demo title + defaulted source id
+    assert "--integration" not in seed_argv  # omitted while the default is empty
     for name in ("seed-source", "pull", "stage-input", "push-augmented"):
         assert spec.states[name].resources == "cpu", name
     # Schema chain: manifest -> staged video -> generate attestation -> receipt.

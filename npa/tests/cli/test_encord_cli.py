@@ -207,3 +207,43 @@ def test_pull_missing_credential_message(monkeypatch: pytest.MonkeyPatch) -> Non
     )
     assert result.exit_code == 1
     assert "ENCORD_SSH_KEY" in result.output or "credential" in result.output.lower()
+
+
+def test_seed_demo_skips_and_seeds(monkeypatch: pytest.MonkeyPatch) -> None:
+    import npa.workflows.encord_loop as loop
+
+    captured: dict = {}
+
+    def fake_seed(media_uri, dataset, active_source_id, *, transfer, integration):
+        captured.update(dict(media_uri=media_uri, dataset=dataset,
+                             active=active_source_id, transfer=transfer))
+        if active_source_id != dataset:
+            return {"stage": "seed_demo_source", "skipped": "operator supplied a curated source id"}
+        return {"stage": "seed_demo_source", "dataset": dataset, "units_done": 1}
+
+    monkeypatch.setattr(loop, "seed_demo_source", fake_seed)
+    result = runner.invoke(
+        app,
+        ["workbench", "encord", "seed-demo",
+         "--media-uri", "s3://bkt/run/seed/",
+         "--dataset", "npa-demo-src-run",
+         "--active-source-id", "npa-demo-src-run",
+         "--output", "text"],
+    )
+    assert result.exit_code == 0, result.output
+    assert "seeded demo dataset" in result.output
+    assert captured["transfer"] == "upload"
+    result = runner.invoke(
+        app,
+        ["workbench", "encord", "seed-demo",
+         "--media-uri", "s3://bkt/run/seed/",
+         "--dataset", "npa-demo-src-run",
+         "--active-source-id", "my-curated", "--output", "text"],
+    )
+    assert result.exit_code == 0 and "seed skipped" in result.output
+    result = runner.invoke(
+        app,
+        ["workbench", "encord", "seed-demo",
+         "--media-uri", "/tmp/local", "--dataset", "d", "--active-source-id", "d"],
+    )
+    assert result.exit_code == 1  # path contract holds
