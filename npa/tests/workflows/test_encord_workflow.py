@@ -51,6 +51,17 @@ def test_roundtrip_smoke_chains_push_then_pull() -> None:
     assert spec.config["encord_source_id"] == spec.config["encord_dataset"]
 
 
+def test_specs_declare_cpu_resource_blocks() -> None:
+    for path in (PUSH, PULL, ROUNDTRIP):
+        spec = load_spec(path)
+        assert "cpu" in spec.resources, path.name
+        profile = spec.resources["cpu"]
+        assert profile.get("cloud") == "kubernetes", path.name
+        assert "accelerators" not in profile, f"{path.name}: encord stages are CPU-only"
+        for state in spec.states.values():
+            assert state.resources == "cpu", f"{path.name}:{state.name}"
+
+
 def test_push_argv_renders_every_flag() -> None:
     argv = argv_for_tool("workbench.encord.push")
     assert argv[:4] == ["npa", "workbench", "encord", "push"]

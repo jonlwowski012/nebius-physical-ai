@@ -349,7 +349,6 @@ def run_credential_preflight(
 __all__ = [
     "CREDENTIAL_CHECKS",
     "CredentialProbes",
-    "HF_PROBE_REPO",
     "check_encord",
     "check_hf",
     "check_ngc",

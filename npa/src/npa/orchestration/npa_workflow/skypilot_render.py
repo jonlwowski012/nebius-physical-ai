@@ -68,9 +68,11 @@ OPENPI_TERMS_ENV = "NPA_OPENPI_ACCEPT_GEMMA_TERMS"
 SECRET_ENV_HINTS: dict[str, tuple[str, ...]] = {
     "workbench.openpi": (OPENPI_TERMS_ENV,),
     "workbench.token_factory": ("NEBIUS_TOKEN_FACTORY_KEY",),
-    # Encord SaaS auth: the SDK-native PEM env, or its base64 transport form for
-    # multi-line-safe --secret-env forwarding (either one satisfies the stage guard).
-    "workbench.encord": ("ENCORD_SSH_KEY", "ENCORD_SSH_KEY_B64"),
+    # Encord SaaS auth. Hint only the base64 transport form: it is the
+    # multi-line-safe way through --secret-env, and the live-matrix guard
+    # requires cases to declare every hinted secret (the stage guard itself
+    # accepts ENCORD_SSH_KEY too).
+    "workbench.encord": ("ENCORD_SSH_KEY_B64",),
     "workbench.vlm_eval": (),
     # Attribute verification generates and answers its questions on Token Factory.
     "workbench.cosmos_evaluator": ("NEBIUS_TOKEN_FACTORY_KEY",),
