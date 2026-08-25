@@ -137,8 +137,10 @@ npa workbench encord push \
   (no integration needed).
 - A durable receipt (`push_receipt.json`, `npa.encord.push_receipt.v1`) records
   every file, its Encord item uuid, and per-file errors. The receipt is written
-  **before** any failure exit, and any unit error fails the command closed.
-- Re-pushing the same prefix is idempotent (`skip_duplicate_urls`).
+  **before** any failure exit, and any unit error fails the command closed. If a step throws after Encord was mutated, the receipt still lands with the exception recorded in its `error` field.
+- In register mode, re-pushing the same prefix is idempotent: duplicates are
+  skipped (`skip_duplicate_urls`) and already-registered items are re-linked
+  into the dataset. Upload mode creates new copies on re-push.
 
 ## Curate in the Encord app
 
@@ -171,6 +173,31 @@ Media registered from your own bucket returns as **zero-egress server-side
 copies**; Encord-hosted (uploaded) media streams back through signed URLs. The
 manifest is written before any failure exit; any failed item fails the command
 closed.
+
+## Python SDK
+
+The CLI is a thin wrapper over the same functions:
+
+```python
+from npa.sdk.workbench import encord
+
+receipt = encord.push(
+    input_path="s3://<bucket>/raw-media/",
+    integration="nebius-s3",
+    folder="my-batch",
+    dataset="my-batch",
+    output_path="s3://<bucket>/encord/push/",
+)
+manifest = encord.pull(
+    source="collection",
+    source_id="keepers",
+    output_path="s3://<bucket>/encord/pull/",
+)
+```
+
+Both return the Pydantic models (`PushReceipt` / `PullManifest`) that are also
+persisted to S3, and raise `EncordToolError` on the same fail-closed conditions
+as the CLI.
 
 ## Workflows
 

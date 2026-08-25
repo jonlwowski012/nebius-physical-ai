@@ -53,7 +53,17 @@ class PullSource(NamedTuple):
     # Project pulls carry the resolved project and its (already listed) label
     # rows so export_labels never re-fetches the listing.
     project: Any = None
-    label_rows: list[Any] = []
+    label_rows: tuple[Any, ...] = ()
+
+
+def _backing_item_uuid(row: Any) -> Any:
+    # The SDK exposes this as a property that RAISES NotImplementedError on
+    # legacy rows without Storage-API backing, so getattr's default alone
+    # cannot guard it.
+    try:
+        return getattr(row, "backing_item_uuid", None)
+    except NotImplementedError:
+        return None
 
 
 def enumerate_items(user_client: Any, *, source: str, source_id: str) -> PullSource:
@@ -69,9 +79,7 @@ def enumerate_items(user_client: Any, *, source: str, source_id: str) -> PullSou
             user_client, source_id, create=False
         )
         backing = [
-            row.backing_item_uuid
-            for row in dataset.data_rows
-            if getattr(row, "backing_item_uuid", None)
+            uuid for row in dataset.data_rows if (uuid := _backing_item_uuid(row))
         ]
         items = user_client.get_storage_items(backing, sign_url=True) if backing else []
         return PullSource(dataset_hash, title, list(items))
@@ -79,12 +87,10 @@ def enumerate_items(user_client: Any, *, source: str, source_id: str) -> PullSou
         project, project_hash, title = resolve_project(user_client, source_id)
         label_rows = list(project.list_label_rows_v2())
         backing = [
-            row.backing_item_uuid
-            for row in label_rows
-            if getattr(row, "backing_item_uuid", None)
+            uuid for row in label_rows if (uuid := _backing_item_uuid(row))
         ]
         items = user_client.get_storage_items(backing, sign_url=True) if backing else []
-        return PullSource(project_hash, title, list(items), project, label_rows)
+        return PullSource(project_hash, title, list(items), project, tuple(label_rows))
     raise EncordToolError(
         f"Unknown --source value {source!r}. Choices: {', '.join(PULL_SOURCES)}."
     )
@@ -227,38 +233,44 @@ def run_pull(
 
     found = enumerate_items(client, source=source, source_id=source_id)
 
+    # Everything past this point mutates the output prefix; the manifest must
+    # land even when a step throws, so lineage survives a mid-run crash.
     pulled: list[PulledItem] = []
-    for item in found.items:
-        record = transfer_item(
-            item,
-            storage_client=active_storage,
-            output_uri=output_path,
-            endpoint_url=endpoint_url,
-        )
-        write_json(
-            {
-                "item_uuid": record.item_uuid,
-                "name": record.name,
-                "item_type": record.item_type,
-                "mime_type": record.mime_type,
-                "file_size": record.file_size,
-                "client_metadata": getattr(item, "client_metadata", None) or {},
-            },
-            result_uri=output_path.rstrip("/") + f"/items/{record.item_uuid}.json",
-            filename=f"{record.item_uuid}.json",
-            storage_client=active_storage,
-        )
-        pulled.append(record)
-
     label_rows = 0
     label_uris: list[str] = []
-    if found.project is not None:
-        label_rows, label_uris = export_labels(
-            found.project,
-            found.label_rows,
-            output_uri=output_path,
-            storage_client=active_storage,
-        )
+    run_error: Exception | None = None
+    try:
+        for item in found.items:
+            record = transfer_item(
+                item,
+                storage_client=active_storage,
+                output_uri=output_path,
+                endpoint_url=endpoint_url,
+            )
+            pulled.append(record)
+            write_json(
+                {
+                    "item_uuid": record.item_uuid,
+                    "name": record.name,
+                    "item_type": record.item_type,
+                    "mime_type": record.mime_type,
+                    "file_size": record.file_size,
+                    "client_metadata": getattr(item, "client_metadata", None) or {},
+                },
+                result_uri=output_path.rstrip("/") + f"/items/{record.item_uuid}.json",
+                filename=f"{record.item_uuid}.json",
+                storage_client=active_storage,
+            )
+
+        if found.project is not None:
+            label_rows, label_uris = export_labels(
+                found.project,
+                list(found.label_rows),
+                output_uri=output_path,
+                storage_client=active_storage,
+            )
+    except Exception as exc:  # noqa: BLE001 - recorded in the manifest, re-raised below
+        run_error = exc
 
     manifest_uri = pull_manifest_uri_for(output_path)
     manifest = PullManifest(
@@ -280,6 +292,7 @@ def run_pull(
             for record in pulled
             if record.transfer in ("copy", "download")
         ),
+        error=f"{type(run_error).__name__}: {run_error}" if run_error else "",
         label_uris=label_uris,
         items=pulled,
     )
@@ -289,6 +302,11 @@ def run_pull(
         filename=PULL_MANIFEST_FILENAME,
         storage_client=active_storage,
     )
+    if run_error is not None:
+        raise EncordToolError(
+            f"Encord pull failed after {len(pulled)} of {len(found.items)} "
+            f"item(s): {manifest.error}. Manifest written to {manifest_uri}."
+        ) from run_error
     if manifest.media_failed > 0:
         raise EncordToolError(
             f"Encord pull failed for {manifest.media_failed} of "

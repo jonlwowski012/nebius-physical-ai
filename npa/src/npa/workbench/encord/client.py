@@ -183,24 +183,6 @@ def resolve_folder(user_client: Any, value: str) -> tuple[Any, bool]:
     return folder, True
 
 
-def _resolve_auth_env(environ: dict[str, str] | None = None) -> dict[str, str]:
-    """The Encord auth names, from an injected env or the resolved credentials.
-
-    ``load_credentials`` merges the process environment over the ``tokens:``
-    section for these names, so the default path needs no extra merging.
-    """
-
-    if environ is not None:
-        return dict(environ)
-    from npa.clients.credentials import load_credentials
-
-    tokens = load_credentials().tokens
-    env = {
-        name: tokens.get(name, "")
-        for name in (ENCORD_SSH_KEY_ENV, ENCORD_SSH_KEY_B64_ENV, ENCORD_SSH_KEY_FILE_ENV)
-    }
-    env[ENCORD_DOMAIN_ENV] = os.environ.get(ENCORD_DOMAIN_ENV, "")
-    return env
 def resolve_dataset(
     user_client: Any, value: str, *, create: bool = True
 ) -> tuple[Any, str, str, bool]:
@@ -251,6 +233,8 @@ def resolve_project(user_client: Any, value: str) -> tuple[Any, str, str]:
     """Resolve a project by hash or title -> (project, hash, title)."""
 
     value = value.strip()
+    if not value:
+        raise EncordToolError("Project reference must not be empty.")
     if looks_like_id(value):
         project = user_client.get_project(value)
         return project, value, str(getattr(project, "title", ""))
@@ -271,6 +255,8 @@ def resolve_collection(user_client: Any, value: str) -> tuple[Any, str, str]:
     """Resolve a collection by uuid or name -> (collection, uuid, name)."""
 
     value = value.strip()
+    if not value:
+        raise EncordToolError("Collection reference must not be empty.")
     if looks_like_id(value):
         collection = user_client.get_collection(value)
         return collection, value, str(getattr(collection, "name", ""))

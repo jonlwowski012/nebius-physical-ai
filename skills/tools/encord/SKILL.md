@@ -99,13 +99,15 @@ never creates.
 
 - Push receipt: `push_receipt.json` (`npa.encord.push_receipt.v1`) — per-item
   objectUrl/uuid/status, unit counts, folder/dataset lineage. Written **before**
-  any failure exit; any unit error fails the command closed (exit 1).
+  any failure exit (crashes after Encord was mutated land in the artifact's
+  `error` field); any unit error fails the command closed (exit 1).
 - Pull output under `--output-path`: `media/<item_uuid>__<name>`,
   `items/<item_uuid>.json`, `labels/<label_hash>.json` (project source only),
   and `manifest.json` (`npa.encord.pull_manifest.v1`) with copy/download/failed
   counts. Media registered from this bucket returns as zero-egress
   **server-side copies**; anything else streams through the Encord signed URL.
-- Re-push is idempotent (`skip_duplicate_urls`); re-pull overwrites.
+- Register-mode re-push is idempotent (duplicates skipped, existing items
+  re-linked); upload-mode re-push creates new copies. Re-pull overwrites.
 
 ## Workflows
 

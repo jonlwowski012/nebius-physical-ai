@@ -211,6 +211,42 @@ def _upload_items(
     return uploaded, done, errors, "done"
 
 
+def _link_dataset(
+    dataset_obj: Any,
+    folder_obj: Any,
+    items: list[PushedItem],
+    registered: list[tuple[str, str]],
+    *,
+    transfer: str,
+) -> int:
+    """Link this push's items into the dataset; return how many were linked.
+
+    Register mode with skip_duplicate_urls reports only newly added items, so a
+    re-push would otherwise link nothing. Resolve the folder's items by name
+    (Encord names registered items by the full object key) and link the union.
+    link_items skips already-linked uuids server-side, so this is idempotent.
+    """
+
+    uuids = {item_uuid for item_uuid, _ in registered}
+    if transfer == "register":
+        wanted = {item.key for item in items} | {
+            Path(item.key).name for item in items
+        }
+        for existing in folder_obj.list_items(page_size=1000):
+            if str(existing.name) in wanted:
+                uuids.add(str(existing.uuid))
+                by_key = str(existing.name)
+                for item in items:
+                    if item.status == "registered" and not item.item_uuid and (
+                        item.key == by_key or Path(item.key).name == by_key
+                    ):
+                        item.item_uuid = str(existing.uuid)
+    if not uuids:
+        return 0
+    dataset_obj.link_items(sorted(uuids))
+    return len(uuids)
+
+
 def run_push(
     *,
     input_path: str,
@@ -276,22 +312,36 @@ def run_push(
             client, dataset
         )
 
-    if transfer == "upload":
-        registered, units_done, units_error, status = _upload_items(
-            folder_obj, registrable, storage_client=active_storage, source_bucket=bucket
-        )
-    else:
-        registered, units_done, units_error, status = _register_items(
-            folder_obj,
-            registrable,
-            integration_id=integration_id,
-            poll_timeout_seconds=poll_timeout_seconds,
-        )
-
+    # Everything past this point mutates Encord; the receipt must land even
+    # when a step throws, so lineage survives a mid-run crash.
+    registered: list[tuple[str, str]] = []
+    units_done = units_error = 0
+    status = "failed"
     linked_count = 0
-    if dataset_obj is not None and registered:
-        dataset_obj.link_items([item_uuid for item_uuid, _ in registered])
-        linked_count = len(registered)
+    run_error: Exception | None = None
+    try:
+        if transfer == "upload":
+            registered, units_done, units_error, status = _upload_items(
+                folder_obj,
+                registrable,
+                storage_client=active_storage,
+                source_bucket=bucket,
+            )
+        else:
+            registered, units_done, units_error, status = _register_items(
+                folder_obj,
+                registrable,
+                integration_id=integration_id,
+                poll_timeout_seconds=poll_timeout_seconds,
+            )
+
+        if dataset_obj is not None:
+            linked_count = _link_dataset(
+                dataset_obj, folder_obj, items, registered, transfer=transfer
+            )
+    except Exception as exc:  # noqa: BLE001 - recorded in the receipt, re-raised below
+        run_error = exc
+        status = "failed"
 
     units_error += sum(1 for item in items if item.status == "experimental_error")
     if status == "done" and units_error > 0:
@@ -319,6 +369,7 @@ def run_push(
         files_discovered=len(items),
         units_done=units_done,
         units_error=units_error,
+        error=f"{type(run_error).__name__}: {run_error}" if run_error else "",
         receipt_uri=receipt_uri,
         items=items,
         skipped_unsupported=skipped,
@@ -329,6 +380,10 @@ def run_push(
         filename=PUSH_RECEIPT_FILENAME,
         storage_client=active_storage,
     )
+    if run_error is not None:
+        raise EncordToolError(
+            f"Encord push failed: {receipt.error}. Receipt written to {receipt_uri}."
+        ) from run_error
     if status != "done":
         raise EncordToolError(
             f"Encord push {status}: {units_error} unit error(s), {units_done} "

@@ -111,6 +111,10 @@ class FakeFolder:
         self.results = results or [FakePollResult()]
         self.start_calls: list[dict[str, Any]] = []
         self._result_index = 0
+        self.folder_items: list[Any] = []
+
+    def list_items(self, page_size: int = 100):
+        return iter(self.folder_items)
 
     def add_private_data_to_folder_start(self, *, integration_id, private_files, ignore_errors):
         self.start_calls.append(
@@ -507,7 +511,7 @@ def test_enumerate_items_per_source() -> None:
     found = enumerate_items(client, source="collection", source_id=str(collection.uuid))
     # Collection items are re-fetched in bulk with signed URLs, like the other sources.
     assert found.source_name == "keepers" and found.items == items
-    assert found.project is None and found.label_rows == []
+    assert found.project is None and found.label_rows == ()
     found = enumerate_items(client, source="dataset", source_id=dataset.dataset_hash)
     assert found.source_id == dataset.dataset_hash and found.items == items
 
@@ -646,3 +650,157 @@ def test_run_push_rejects_unknown_transfer(tmp_path: Path) -> None:
             storage_client=FakeStorage(["p/a.mp4"]),
             environ=dict(ENVIRON),
         )
+
+
+def test_run_push_repush_links_existing_items(tmp_path: Path) -> None:
+    """skip_duplicate_urls adds nothing on a re-push; linking must still happen."""
+
+    storage = FakeStorage(["p/a.mp4", "p/b.png"])
+    folder = FakeFolder(results=[FakePollResult(status="DONE", done=0, items=[])])
+    folder.folder_items = [
+        SimpleNamespace(uuid=_uuid(61), name="p/a.mp4"),
+        SimpleNamespace(uuid=_uuid(62), name="p/b.png"),
+    ]
+    client = FakeUserClient(folders=[folder])
+    receipt = run_push(**_push_kwargs(tmp_path, storage, client, folder=str(folder.uuid), dataset="new-ds"))
+    dataset = next(iter(client.datasets.values()))
+    assert sorted(dataset.linked[0]) == [_uuid(61), _uuid(62)]
+    assert receipt.linked_count == 2
+    # receipt rows regain their uuids from the folder listing
+    assert {item.item_uuid for item in receipt.items} == {_uuid(61), _uuid(62)}
+
+
+def test_run_push_writes_receipt_when_linking_crashes(tmp_path: Path) -> None:
+    """Post-mutation failures must still leave a receipt behind."""
+
+    storage = FakeStorage(["p/a.mp4"])
+    folder = FakeFolder(
+        results=[FakePollResult(status="DONE", done=1, items=[(_uuid(63), "p/a.mp4")])]
+    )
+    client = FakeUserClient(folders=[folder])
+
+    class ExplodingDataset(FakeDataset):
+        def link_items(self, item_uuids):
+            raise RuntimeError("503 from Encord")
+
+    exploding = ExplodingDataset()
+    client.datasets[exploding.dataset_hash] = exploding
+    with pytest.raises(EncordToolError, match="503 from Encord"):
+        run_push(
+            **_push_kwargs(
+                tmp_path, storage, client,
+                folder=str(folder.uuid), dataset=exploding.dataset_hash,
+            )
+        )
+    payload = json.loads((tmp_path / "receipt.json").read_text())
+    assert payload["status"] == "failed"
+    assert "503 from Encord" in payload["error"]
+    assert payload["units_done"] == 1  # registration evidence preserved
+
+
+def test_run_pull_writes_manifest_when_labels_crash(tmp_path: Path) -> None:
+    class ExplodingProject:
+        title = "proj"
+
+        def list_label_rows_v2(self):
+            return [SimpleNamespace(backing_item_uuid=_uuid(71))]
+
+        def create_bundle(self, bundle_size: int):
+            raise RuntimeError("bundle exploded")
+
+    item = FakeItem(_uuid(71), "a.mp4", f"{ENDPOINT}/bkt/p/a.mp4", file_size=3)
+    client = FakeUserClient(items=[item])
+    client.get_project = lambda h: ExplodingProject()  # type: ignore[assignment]
+    storage = FakeStorage()
+    with pytest.raises(EncordToolError, match="bundle exploded"):
+        run_pull(
+            source="project",
+            source_id=_uuid(70),
+            output_path="s3://out/pull",
+            user_client=client,
+            storage_client=storage,
+            environ=dict(ENVIRON),
+        )
+    uploaded = [uri for _, uri in storage.uploads]
+    assert "s3://out/pull/manifest.json" in uploaded  # manifest landed anyway
+
+
+def test_enumerate_items_survives_raising_backing_property() -> None:
+    """SDK DataRow.backing_item_uuid RAISES on legacy rows; getattr can't guard it."""
+
+    class LegacyRow:
+        @property
+        def backing_item_uuid(self):
+            raise NotImplementedError("Storage API is not yet implemented")
+
+    dataset = FakeDataset()
+    dataset.data_rows = [LegacyRow(), SimpleNamespace(backing_item_uuid=_uuid(41))]
+    items = [FakeItem(_uuid(41), "a.mp4", "u")]
+    client = FakeUserClient(datasets={dataset.dataset_hash: dataset}, items=items)
+    found = enumerate_items(client, source="dataset", source_id=dataset.dataset_hash)
+    assert found.items == items  # legacy row skipped, run survives
+
+
+def test_transfer_item_retries_download_after_expired_url(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    import httpx
+
+    import npa.workbench.encord.pull as pull_module  # noqa: F401 - patched via httpx
+
+    calls: list[str] = []
+
+    class FakeResponse:
+        def __init__(self, url: str) -> None:
+            self._expired = "expired" in url
+
+        def raise_for_status(self) -> None:
+            if self._expired:
+                request = httpx.Request("GET", "https://x")
+                raise httpx.HTTPStatusError(
+                    "403", request=request, response=httpx.Response(403, request=request)
+                )
+
+        def iter_bytes(self, chunk_size: int):
+            yield b"payload"
+
+    class FakeStream:
+        def __init__(self, method, url, **kwargs) -> None:
+            calls.append(url)
+            self._response = FakeResponse(url)
+
+        def __enter__(self) -> FakeResponse:
+            return self._response
+
+        def __exit__(self, *args) -> None: ...
+
+    monkeypatch.setattr(httpx, "stream", FakeStream)
+
+    class RefreshingItem(FakeItem):
+        def get_signed_url(self, refetch: bool = False) -> str | None:
+            return "https://cdn.example/fresh" if refetch else "https://cdn.example/expired"
+
+    record = transfer_item(
+        RefreshingItem(_uuid(72), "far.mp4", "unused"),
+        storage_client=FakeStorage(),
+        output_uri="s3://out/pull",
+        endpoint_url=ENDPOINT,
+    )
+    assert record.transfer == "download"
+    assert calls == ["https://cdn.example/expired", "https://cdn.example/fresh"]
+
+
+def test_run_pull_empty_source_writes_manifest_then_raises() -> None:
+    collection = FakeCollection([])
+    client = FakeUserClient(collection=collection)
+    storage = FakeStorage()
+    with pytest.raises(EncordToolError, match="contains no storage items"):
+        run_pull(
+            source="collection",
+            source_id=str(collection.uuid),
+            output_path="s3://out/pull",
+            user_client=client,
+            storage_client=storage,
+            environ=dict(ENVIRON),
+        )
+    assert [uri for _, uri in storage.uploads] == ["s3://out/pull/manifest.json"]

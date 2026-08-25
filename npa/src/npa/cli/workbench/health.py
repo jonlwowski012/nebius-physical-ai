@@ -138,7 +138,7 @@ def preflight_command(
     ),
     output_json: bool = typer.Option(False, "--json", help="Print the report as JSON."),
 ) -> None:
-    """Validate HF, NGC, S3, and Token Factory credentials before a deploy or GPU job.
+    """Validate HF, NGC, S3, Token Factory, and Encord credentials before a deploy or GPU job.
 
     A single PASS/WARN/FAIL/SKIP report over the credentials nearly every
     workbench tool needs, so cold-start credential gaps surface here instead of

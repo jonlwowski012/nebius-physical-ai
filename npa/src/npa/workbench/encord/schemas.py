@@ -67,6 +67,9 @@ class PushReceipt(BaseModel):
     files_discovered: int = 0
     units_done: int = 0
     units_error: int = 0
+    # Populated when the run failed partway: the exception that ended it, so the
+    # receipt still explains a crash that happened after Encord was mutated.
+    error: str = ""
     receipt_uri: str = ""
     items: list[PushedItem] = Field(default_factory=list)
     skipped_unsupported: list[str] = Field(default_factory=list)
@@ -107,5 +110,7 @@ class PullManifest(BaseModel):
     media_failed: int = 0
     label_rows: int = 0
     media_bytes: int = 0
+    # Populated when the run failed partway (see PushReceipt.error).
+    error: str = ""
     label_uris: list[str] = Field(default_factory=list)
     items: list[PulledItem] = Field(default_factory=list)
