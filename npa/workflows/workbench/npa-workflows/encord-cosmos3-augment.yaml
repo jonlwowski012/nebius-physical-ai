@@ -37,6 +37,7 @@ config:
   # input below is what the pull actually returned from Encord.
   cosmos3_mode: video2video
   cosmos3_checkpoint: Cosmos3-Nano
+  # The demo publishes ten distinct, deterministically seeded video variants.
   cosmos3_seed: "17"
   cosmos3_guidance: "5.0"
   cosmos3_steps: "24"
@@ -55,9 +56,10 @@ config:
   encord_media_uri: "s3://{{config.bucket}}/{{config.prefix}}/generated/"
 
   encord_pull_uri: "s3://{{config.bucket}}/{{config.prefix}}/pull/"
-  # cosmos3_input_path / output_uri are the workbench.cosmos3.generate contract keys.
+  # cosmos3_input_path is the workbench.cosmos3.generate conditioning key. Each
+  # augmentation state overrides output_uri + seed so its video and attestation
+  # cannot overwrite another variant.
   cosmos3_input_path: "s3://{{config.bucket}}/{{config.prefix}}/augment-input/source.mp4"
-  output_uri: "s3://{{config.bucket}}/{{config.prefix}}/generated/"
   encord_receipt_uri: "s3://{{config.bucket}}/{{config.prefix}}/push-augmented/"
 
 resources:
@@ -117,29 +119,122 @@ states:
     outputs:
       - uri: "{{config.cosmos3_input_path}}"
         schema: video/mp4
-    next: augment
+    next: augmentations
 
-  augment:
-    description: Run a real Cosmos 3 video2video pass conditioned on the pulled media.
+  augmentations:
+    description: Generate ten distinct real Cosmos 3 video2video augmentations.
     needs: [stage-input]
+    sequence:
+      - augment-01
+      - augment-02
+      - augment-03
+      - augment-04
+      - augment-05
+      - augment-06
+      - augment-07
+      - augment-08
+      - augment-09
+      - augment-10
+    next: push-augmented
+
+  augment-01:
+    description: Generate video augmentation 1 of 10.
     toolRef: workbench.cosmos3.generate
     resources: gpu
+    params: {cosmos3_seed: "17", output_uri: "s3://{{config.bucket}}/{{config.prefix}}/generated/variant-01/"}
     inputs:
       - uri: "{{config.cosmos3_input_path}}"
         schema: video/mp4
     outputs:
-      - uri: "{{config.output_uri}}generate.json"
+      - uri: "s3://{{config.bucket}}/{{config.prefix}}/generated/variant-01/generate.json"
         schema: npa.cosmos3.generate.v1
-    next: push-augmented
+
+  augment-02:
+    description: Generate video augmentation 2 of 10.
+    toolRef: workbench.cosmos3.generate
+    resources: gpu
+    params: {cosmos3_seed: "18", output_uri: "s3://{{config.bucket}}/{{config.prefix}}/generated/variant-02/"}
+    outputs:
+      - uri: "s3://{{config.bucket}}/{{config.prefix}}/generated/variant-02/generate.json"
+        schema: npa.cosmos3.generate.v1
+
+  augment-03:
+    description: Generate video augmentation 3 of 10.
+    toolRef: workbench.cosmos3.generate
+    resources: gpu
+    params: {cosmos3_seed: "19", output_uri: "s3://{{config.bucket}}/{{config.prefix}}/generated/variant-03/"}
+    outputs:
+      - uri: "s3://{{config.bucket}}/{{config.prefix}}/generated/variant-03/generate.json"
+        schema: npa.cosmos3.generate.v1
+
+  augment-04:
+    description: Generate video augmentation 4 of 10.
+    toolRef: workbench.cosmos3.generate
+    resources: gpu
+    params: {cosmos3_seed: "20", output_uri: "s3://{{config.bucket}}/{{config.prefix}}/generated/variant-04/"}
+    outputs:
+      - uri: "s3://{{config.bucket}}/{{config.prefix}}/generated/variant-04/generate.json"
+        schema: npa.cosmos3.generate.v1
+
+  augment-05:
+    description: Generate video augmentation 5 of 10.
+    toolRef: workbench.cosmos3.generate
+    resources: gpu
+    params: {cosmos3_seed: "21", output_uri: "s3://{{config.bucket}}/{{config.prefix}}/generated/variant-05/"}
+    outputs:
+      - uri: "s3://{{config.bucket}}/{{config.prefix}}/generated/variant-05/generate.json"
+        schema: npa.cosmos3.generate.v1
+
+  augment-06:
+    description: Generate video augmentation 6 of 10.
+    toolRef: workbench.cosmos3.generate
+    resources: gpu
+    params: {cosmos3_seed: "22", output_uri: "s3://{{config.bucket}}/{{config.prefix}}/generated/variant-06/"}
+    outputs:
+      - uri: "s3://{{config.bucket}}/{{config.prefix}}/generated/variant-06/generate.json"
+        schema: npa.cosmos3.generate.v1
+
+  augment-07:
+    description: Generate video augmentation 7 of 10.
+    toolRef: workbench.cosmos3.generate
+    resources: gpu
+    params: {cosmos3_seed: "23", output_uri: "s3://{{config.bucket}}/{{config.prefix}}/generated/variant-07/"}
+    outputs:
+      - uri: "s3://{{config.bucket}}/{{config.prefix}}/generated/variant-07/generate.json"
+        schema: npa.cosmos3.generate.v1
+
+  augment-08:
+    description: Generate video augmentation 8 of 10.
+    toolRef: workbench.cosmos3.generate
+    resources: gpu
+    params: {cosmos3_seed: "24", output_uri: "s3://{{config.bucket}}/{{config.prefix}}/generated/variant-08/"}
+    outputs:
+      - uri: "s3://{{config.bucket}}/{{config.prefix}}/generated/variant-08/generate.json"
+        schema: npa.cosmos3.generate.v1
+
+  augment-09:
+    description: Generate video augmentation 9 of 10.
+    toolRef: workbench.cosmos3.generate
+    resources: gpu
+    params: {cosmos3_seed: "25", output_uri: "s3://{{config.bucket}}/{{config.prefix}}/generated/variant-09/"}
+    outputs:
+      - uri: "s3://{{config.bucket}}/{{config.prefix}}/generated/variant-09/generate.json"
+        schema: npa.cosmos3.generate.v1
+
+  augment-10:
+    description: Generate video augmentation 10 of 10.
+    toolRef: workbench.cosmos3.generate
+    resources: gpu
+    params: {cosmos3_seed: "26", output_uri: "s3://{{config.bucket}}/{{config.prefix}}/generated/variant-10/"}
+    outputs:
+      - uri: "s3://{{config.bucket}}/{{config.prefix}}/generated/variant-10/generate.json"
+        schema: npa.cosmos3.generate.v1
 
   push-augmented:
-    description: Register the augmented video back into Encord as a fresh dataset.
-    needs: [augment]
+    description: Register all ten augmented videos back into Encord as a fresh dataset.
+    needs: [augmentations]
     toolRef: workbench.encord.push
     resources: cpu
-    inputs:
-      - uri: "{{config.output_uri}}generate.json"
-        schema: npa.cosmos3.generate.v1
     outputs:
       - uri: "{{config.encord_receipt_uri}}push_receipt.json"
         schema: npa.encord.push_receipt.v1

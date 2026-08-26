@@ -698,6 +698,26 @@ def test_run_push_writes_receipt_when_linking_crashes(tmp_path: Path) -> None:
     assert payload["units_done"] == 1  # registration evidence preserved
 
 
+def test_run_push_writes_receipt_when_dataset_create_fails(tmp_path: Path) -> None:
+    """Folder creation is a mutation too, so setup failure must retain lineage."""
+
+    class DatasetCreateFails(FakeUserClient):
+        def create_dataset(self, *args, **kwargs):
+            raise RuntimeError("dataset create unavailable")
+
+    storage = FakeStorage(["p/a.mp4"])
+    client = DatasetCreateFails()
+    with pytest.raises(EncordToolError, match="dataset create unavailable"):
+        run_push(
+            **_push_kwargs(tmp_path, storage, client, folder="new-folder", dataset="new-dataset")
+        )
+    payload = json.loads((tmp_path / "receipt.json").read_text())
+    assert client.created_folders == ["new-folder"]
+    assert payload["status"] == "failed"
+    assert payload["folder_name"] == "new-folder"
+    assert "dataset create unavailable" in payload["error"]
+
+
 def test_run_pull_writes_manifest_when_labels_crash(tmp_path: Path) -> None:
     class ExplodingProject:
         title = "proj"

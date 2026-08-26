@@ -11,12 +11,25 @@ from __future__ import annotations
 
 import json
 import sys
+from pathlib import Path
 from typing import Any
 from urllib.parse import urlparse
 
 
 class EncordLoopError(RuntimeError):
     """Raised when the pull manifest cannot supply the requested media item."""
+
+
+VIDEO_SUFFIXES = {".mp4", ".mov", ".mkv", ".avi", ".webm"}
+
+
+def _is_video_item(item: dict[str, Any]) -> bool:
+    """Whether an Encord pull-manifest row is safe for Cosmos video2video."""
+
+    mime_type = str(item.get("mime_type", "")).lower()
+    item_type = str(item.get("item_type", "")).lower()
+    suffix = Path(str(item.get("name", ""))).suffix.lower()
+    return mime_type.startswith("video/") or item_type == "video" or suffix in VIDEO_SUFFIXES
 
 
 def _parse_s3(uri: str) -> tuple[str, str]:
@@ -58,6 +71,12 @@ def stage_media_for_augment(
             f"index {position} is unavailable"
         )
     selected = items[position]
+    if not _is_video_item(selected):
+        raise EncordLoopError(
+            "selected Encord item is not a video; Cosmos video2video requires a "
+            f"video item (name={selected.get('name', '')!r}, "
+            f"mime_type={selected.get('mime_type', '')!r})"
+        )
     source_bucket, source_key = _parse_s3(str(selected["media_uri"]))
     dest_bucket, dest_key = _parse_s3(dest_uri)
     client.s3.copy_object(

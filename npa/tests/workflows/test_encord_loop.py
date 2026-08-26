@@ -68,6 +68,18 @@ def test_failed_items_are_not_selectable() -> None:
     assert summary["item_uuid"] == "u1"  # the error row is filtered out
 
 
+def test_image_item_fails_before_gpu_augmentation() -> None:
+    storage = FakeStorage(
+        _manifest(
+            [{"item_uuid": "image", "name": "frame.png", "mime_type": "image/png",
+              "transfer": "copy", "media_uri": "s3://bkt/p/media/frame.png"}]
+        )
+    )
+    with pytest.raises(EncordLoopError, match="not a video"):
+        stage_media_for_augment(MANIFEST_URI, DEST_URI, storage_client=storage)
+    assert storage.s3.copy_calls == []
+
+
 def test_missing_manifest_fails_closed() -> None:
     with pytest.raises(EncordLoopError, match="not found"):
         stage_media_for_augment(MANIFEST_URI, DEST_URI, storage_client=FakeStorage(None))

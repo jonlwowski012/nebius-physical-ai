@@ -303,23 +303,27 @@ def run_push(
     integration_id = integration_title = ""
     if transfer == "register":
         integration_id, integration_title = resolve_integration(client, integration)
-    folder_obj, folder_created = resolve_folder(client, folder)
+    # From this point on Encord may be mutated (folder/dataset creation).  Keep
+    # every such operation inside the receipt-finalization path below: a failed
+    # dataset create must not strand a newly-created folder without lineage.
+    folder_obj: Any = None
+    folder_created = False
     dataset_obj = None
     dataset_hash = dataset_title = ""
     dataset_created = False
-    if dataset.strip():
-        dataset_obj, dataset_hash, dataset_title, dataset_created = resolve_dataset(
-            client, dataset
-        )
-
-    # Everything past this point mutates Encord; the receipt must land even
-    # when a step throws, so lineage survives a mid-run crash.
+    # Everything in this block can mutate Encord; the receipt must land even
+    # when folder/dataset setup or a later transfer step throws.
     registered: list[tuple[str, str]] = []
     units_done = units_error = 0
     status = "failed"
     linked_count = 0
     run_error: Exception | None = None
     try:
+        folder_obj, folder_created = resolve_folder(client, folder)
+        if dataset.strip():
+            dataset_obj, dataset_hash, dataset_title, dataset_created = resolve_dataset(
+                client, dataset
+            )
         if transfer == "upload":
             registered, units_done, units_error, status = _upload_items(
                 folder_obj,
@@ -357,8 +361,10 @@ def run_push(
         transfer=transfer,
         integration_id=integration_id,
         integration_title=integration_title,
-        folder_uuid=str(folder_obj.uuid),
-        folder_name=str(folder_obj.name),
+        folder_uuid=str(getattr(folder_obj, "uuid", "")),
+        # Preserve the requested title when Encord failed before it could be
+        # resolved, while recording the canonical title once it exists.
+        folder_name=str(getattr(folder_obj, "name", folder.strip())),
         folder_created=folder_created,
         dataset_hash=dataset_hash,
         dataset_title=dataset_title,

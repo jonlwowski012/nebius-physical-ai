@@ -95,6 +95,17 @@ Titles resolve wherever they are unique; UUID/hash-shaped values must exist.
 `push --folder/--dataset` titles are created when absent; `pull --source-id`
 never creates.
 
+## Supported formats in NPA
+
+The NPA tool supports individual `.mp4`, `.png`, `.jpg`, and `.jpeg` objects.
+Its Cosmos augmentation workflow accepts video only. Encord itself supports
+additional modalities (including MCAP and point-cloud scenes), but NPA does not
+yet construct the required scene/stream payload: `.mcap` under `--media mcap`
+or `--media all` is recorded as `experimental_error` and the push fails closed.
+ROS bags, point clouds, and other sensor formats are unsupported rather than
+generic file transports. Pull also fails per item for composite image groups and
+DICOM series because they lack one signed media URL.
+
 ## Data contract
 
 - Push receipt: `push_receipt.json` (`npa.encord.push_receipt.v1`) — per-item
@@ -116,15 +127,15 @@ never creates.
 - `npa/workflows/workbench/npa-workflows/encord-pull.yaml` — production pull,
   run after curation with the Collection uuid (or dataset/project reference).
 - `npa/workflows/workbench/npa-workflows/encord-cosmos3-augment.yaml` — the
-  curation-to-augmentation loop in one run: pull an Encord source, augment one
-  item with a real Cosmos 3 video2video pass on the GPU profile, and push the
-  result back into Encord as `npa-aug-<run-id>`. Runs out of the box: by
+  curation-to-augmentation loop in one run: pull an Encord video, generate ten
+  distinct real Cosmos 3 video2video variants on the GPU profile, and push all
+  results back into Encord as `npa-aug-<run-id>`. Runs out of the box: by
   default a seed stage uploads the packaged pinned starter clip (CC-BY-4.0,
   SHA-256-verified) into a run-scoped `npa-demo-src-<run-id>` dataset and the
   default transfer is `upload`, so no cloud integration is required. Override
   `--var encord_source_id=<your curated id>` (the seed stage no-ops) and
   `encord_transfer=register` + `encord_integration=<title>` for real data;
-  `encord_item_index` selects which pulled item to augment.
+  `encord_item_index` selects which pulled video to augment.
 - `npa/workflows/workbench/npa-workflows/encord-roundtrip-smoke.yaml` — the
   live e2e test: push fixture media into a fresh `npa-e2e-<run-id>` folder +
   dataset, then pull that dataset back by title in the same run. Submit with

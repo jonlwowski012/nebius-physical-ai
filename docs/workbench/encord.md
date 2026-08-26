@@ -19,6 +19,23 @@ step:
 > run `npa workbench health preflight --checks encord`, then `push` → curate →
 > `pull`.
 
+## File-format support in this integration
+
+This table describes the formats supported by **NPA's Encord integration**, not
+every format Encord itself can store or annotate.
+
+| Data | NPA Encord support | Details |
+|---|---|---|
+| Video | Supported: `.mp4` | `push` registers or uploads it; `pull` materializes it. The Cosmos augmentation workflow requires video. |
+| Images | Supported: `.png`, `.jpg`, `.jpeg` | `push` registers or uploads individual images; `pull` materializes them. |
+| MCAP / LiDAR / point clouds | Not supported | Encord supports scene and point-cloud modalities, including `.mcap`, but this integration does not yet construct the required per-stream scene payload. `--media mcap` or `--media all` records each MCAP as `experimental_error` and fails closed. |
+| ROS bags / other sensor data | Not supported | No scene, calibration, timestamp, or multi-stream ingestion path is implemented. |
+| Composite Encord items | Pull not supported | Image groups and DICOM series have no single signed URL, so pull records a per-item error. |
+
+Do not use an unsupported suffix as a generic file transport. The tool skips
+unknown formats by default so a successful receipt always means the registered
+items used a supported ingestion path.
+
 ## The integration at a glance
 
 ```mermaid
@@ -130,6 +147,8 @@ npa workbench encord push \
 ```
 
 - Discovers `.mp4`, `.png`, `.jpg`/`.jpeg` under the prefix (`--media` filters).
+  MCAP is visible only through the experimental `--media mcap|all` filters and
+  is deliberately recorded as an error; see the support table above.
 - `--folder`/`--dataset` accept a title or id; unique titles are created when
   absent, so a fresh batch needs no clicking around first.
 - Items are registered in place and **explicitly linked** into the dataset.
@@ -208,14 +227,14 @@ Three shipped specs wrap the same tool
   human-in-the-loop between workflows).
 - `encord-pull.yaml` — production pull, run after curation.
 - `encord-cosmos3-augment.yaml` — the curation-to-augmentation loop in one
-  run: pull an Encord source, augment one item with a real Cosmos 3 video2video
-  pass, and push the result back into Encord as `npa-aug-<run-id>`. **Runs out
+  run: pull an Encord video, generate ten distinct real Cosmos 3 video2video
+  variants, and push all results back into Encord as `npa-aug-<run-id>`. **Runs out
   of the box**: the default seeds a run-scoped demo dataset from the packaged
   pinned starter clip (public, CC-BY-4.0, SHA-256-verified) and uploads bytes,
   so only the Encord API key is needed. For your real data pass
   `--var encord_source_id=<your-curated-id>` (seeding no-ops) and, for
   register-in-place, `--var encord_transfer=register
-  --var encord_integration=<title>`; `encord_item_index` picks the item.
+  --var encord_integration=<title>`; `encord_item_index` picks the video.
 - `encord-roundtrip-smoke.yaml` — live e2e proof: push fixture media into a
   fresh `npa-e2e-<run-id>` folder + dataset, then pull that dataset straight
   back, no human step. Add `--var encord_transfer=upload` for the
