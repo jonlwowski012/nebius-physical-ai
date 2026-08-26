@@ -227,7 +227,7 @@ Three shipped specs wrap the same tool
   human-in-the-loop between workflows).
 - `encord-pull.yaml` — production pull, run after curation.
 - `encord-cosmos3-augment.yaml` — the curation-to-augmentation loop in one
-  run: pull an Encord video, generate ten distinct real Cosmos 3 video2video
+  run: pull an Encord video, generate two distinct real Cosmos 3 video2video
   variants, and push all results back into Encord as `npa-aug-<run-id>`. **Runs out
   of the box**: the default seeds a run-scoped demo dataset from the packaged
   pinned starter clip (public, CC-BY-4.0, SHA-256-verified) and uploads bytes,

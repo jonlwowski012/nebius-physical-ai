@@ -37,8 +37,9 @@ config:
   # input below is what the pull actually returned from Encord.
   cosmos3_mode: video2video
   cosmos3_checkpoint: Cosmos3-Nano
-  # The demo publishes ten distinct, deterministically seeded video variants.
-  cosmos3_seed: "17"
+  # The serial loop publishes this many distinct, deterministically seeded
+  # video variants. Override at submission time when more are required.
+  augmentation_count: "2"
   cosmos3_guidance: "5.0"
   cosmos3_steps: "24"
   prompt: "Preserve the source motion and scene structure while creating a physically plausible appearance variant."
@@ -56,9 +57,9 @@ config:
   encord_media_uri: "s3://{{config.bucket}}/{{config.prefix}}/generated/"
 
   encord_pull_uri: "s3://{{config.bucket}}/{{config.prefix}}/pull/"
-  # cosmos3_input_path is the workbench.cosmos3.generate conditioning key. Each
-  # augmentation state overrides output_uri + seed so its video and attestation
-  # cannot overwrite another variant.
+  # cosmos3_input_path is the workbench.cosmos3.generate conditioning key. The
+  # augmentation loop derives the output URI + seed from its iteration so videos
+  # and attestations cannot overwrite one another.
   cosmos3_input_path: "s3://{{config.bucket}}/{{config.prefix}}/augment-input/source.mp4"
   encord_receipt_uri: "s3://{{config.bucket}}/{{config.prefix}}/push-augmented/"
 
@@ -122,116 +123,30 @@ states:
     next: augmentations
 
   augmentations:
-    description: Generate ten distinct real Cosmos 3 video2video augmentations.
+    description: Generate the configured number of serial Cosmos 3 video2video variants.
     needs: [stage-input]
+    loop:
+      max: "{{config.augmentation_count}}"
     sequence:
-      - augment-01
-      - augment-02
-      - augment-03
-      - augment-04
-      - augment-05
-      - augment-06
-      - augment-07
-      - augment-08
-      - augment-09
-      - augment-10
+      - augment
     next: push-augmented
 
-  augment-01:
-    description: Generate video augmentation 1 of 10.
+  augment:
+    description: Generate one video augmentation for the current loop iteration.
     toolRef: workbench.cosmos3.generate
     resources: gpu
-    params: {cosmos3_seed: "17", output_uri: "s3://{{config.bucket}}/{{config.prefix}}/generated/variant-01/"}
+    params:
+      cosmos3_seed: "{{loop.augmentations}}"
+      output_uri: "s3://{{config.bucket}}/{{config.prefix}}/generated/variant-{{loop.augmentations}}/"
     inputs:
       - uri: "{{config.cosmos3_input_path}}"
         schema: video/mp4
     outputs:
-      - uri: "s3://{{config.bucket}}/{{config.prefix}}/generated/variant-01/generate.json"
-        schema: npa.cosmos3.generate.v1
-
-  augment-02:
-    description: Generate video augmentation 2 of 10.
-    toolRef: workbench.cosmos3.generate
-    resources: gpu
-    params: {cosmos3_seed: "18", output_uri: "s3://{{config.bucket}}/{{config.prefix}}/generated/variant-02/"}
-    outputs:
-      - uri: "s3://{{config.bucket}}/{{config.prefix}}/generated/variant-02/generate.json"
-        schema: npa.cosmos3.generate.v1
-
-  augment-03:
-    description: Generate video augmentation 3 of 10.
-    toolRef: workbench.cosmos3.generate
-    resources: gpu
-    params: {cosmos3_seed: "19", output_uri: "s3://{{config.bucket}}/{{config.prefix}}/generated/variant-03/"}
-    outputs:
-      - uri: "s3://{{config.bucket}}/{{config.prefix}}/generated/variant-03/generate.json"
-        schema: npa.cosmos3.generate.v1
-
-  augment-04:
-    description: Generate video augmentation 4 of 10.
-    toolRef: workbench.cosmos3.generate
-    resources: gpu
-    params: {cosmos3_seed: "20", output_uri: "s3://{{config.bucket}}/{{config.prefix}}/generated/variant-04/"}
-    outputs:
-      - uri: "s3://{{config.bucket}}/{{config.prefix}}/generated/variant-04/generate.json"
-        schema: npa.cosmos3.generate.v1
-
-  augment-05:
-    description: Generate video augmentation 5 of 10.
-    toolRef: workbench.cosmos3.generate
-    resources: gpu
-    params: {cosmos3_seed: "21", output_uri: "s3://{{config.bucket}}/{{config.prefix}}/generated/variant-05/"}
-    outputs:
-      - uri: "s3://{{config.bucket}}/{{config.prefix}}/generated/variant-05/generate.json"
-        schema: npa.cosmos3.generate.v1
-
-  augment-06:
-    description: Generate video augmentation 6 of 10.
-    toolRef: workbench.cosmos3.generate
-    resources: gpu
-    params: {cosmos3_seed: "22", output_uri: "s3://{{config.bucket}}/{{config.prefix}}/generated/variant-06/"}
-    outputs:
-      - uri: "s3://{{config.bucket}}/{{config.prefix}}/generated/variant-06/generate.json"
-        schema: npa.cosmos3.generate.v1
-
-  augment-07:
-    description: Generate video augmentation 7 of 10.
-    toolRef: workbench.cosmos3.generate
-    resources: gpu
-    params: {cosmos3_seed: "23", output_uri: "s3://{{config.bucket}}/{{config.prefix}}/generated/variant-07/"}
-    outputs:
-      - uri: "s3://{{config.bucket}}/{{config.prefix}}/generated/variant-07/generate.json"
-        schema: npa.cosmos3.generate.v1
-
-  augment-08:
-    description: Generate video augmentation 8 of 10.
-    toolRef: workbench.cosmos3.generate
-    resources: gpu
-    params: {cosmos3_seed: "24", output_uri: "s3://{{config.bucket}}/{{config.prefix}}/generated/variant-08/"}
-    outputs:
-      - uri: "s3://{{config.bucket}}/{{config.prefix}}/generated/variant-08/generate.json"
-        schema: npa.cosmos3.generate.v1
-
-  augment-09:
-    description: Generate video augmentation 9 of 10.
-    toolRef: workbench.cosmos3.generate
-    resources: gpu
-    params: {cosmos3_seed: "25", output_uri: "s3://{{config.bucket}}/{{config.prefix}}/generated/variant-09/"}
-    outputs:
-      - uri: "s3://{{config.bucket}}/{{config.prefix}}/generated/variant-09/generate.json"
-        schema: npa.cosmos3.generate.v1
-
-  augment-10:
-    description: Generate video augmentation 10 of 10.
-    toolRef: workbench.cosmos3.generate
-    resources: gpu
-    params: {cosmos3_seed: "26", output_uri: "s3://{{config.bucket}}/{{config.prefix}}/generated/variant-10/"}
-    outputs:
-      - uri: "s3://{{config.bucket}}/{{config.prefix}}/generated/variant-10/generate.json"
+      - uri: "s3://{{config.bucket}}/{{config.prefix}}/generated/variant-{{loop.augmentations}}/generate.json"
         schema: npa.cosmos3.generate.v1
 
   push-augmented:
-    description: Register all ten augmented videos back into Encord as a fresh dataset.
+    description: Register all generated videos back into Encord as a fresh dataset.
     needs: [augmentations]
     toolRef: workbench.encord.push
     resources: cpu

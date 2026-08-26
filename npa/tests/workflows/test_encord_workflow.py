@@ -96,19 +96,20 @@ def test_push_plan_omits_dataset_flag_when_empty() -> None:
     assert "--dataset" not in argv
 
 
-def test_augment_loop_chains_pull_stage_ten_generations_push() -> None:
+def test_augment_loop_chains_pull_stage_two_generations_push() -> None:
     spec = load_spec(AUGMENT)
     validate_spec(spec)
-    steps = [step.state for step in build_plan(spec, run_id="t").steps]
-    augmentations = [f"augment-{index:02d}" for index in range(1, 11)]
-    assert steps == ["seed-source", "pull", "stage-input", *augmentations, "push-augmented"]
+    plan = build_plan(spec, run_id="t")
+    steps = [step.state for step in plan.steps]
+    assert steps == ["seed-source", "pull", "stage-input", "augment", "augment", "push-augmented"]
     assert spec.states["pull"].needs == ["seed-source"]
     assert spec.states["stage-input"].needs == ["pull"]
     assert spec.states["augmentations"].needs == ["stage-input"]
-    assert spec.states["augmentations"].sequence == augmentations
+    assert spec.config["augmentation_count"] == "2"
+    assert spec.states["augmentations"].loop.max == "{{config.augmentation_count}}"
+    assert spec.states["augmentations"].sequence == ["augment"]
     assert spec.states["push-augmented"].needs == ["augmentations"]
-    # Only the ten Cosmos stages are on the GPU profile.
-    assert all(spec.states[name].resources == "gpu" for name in augmentations)
+    assert spec.states["augment"].resources == "gpu"
     # Default source is the self-seeded demo dataset; the seed argv carries the
     # same run-scoped title so an operator override makes seeding a no-op.
     seed_argv = next(
@@ -119,24 +120,23 @@ def test_augment_loop_chains_pull_stage_ten_generations_push() -> None:
     assert "--integration" not in seed_argv  # omitted while the default is empty
     for name in ("seed-source", "pull", "stage-input", "push-augmented"):
         assert spec.states[name].resources == "cpu", name
-    # Schema chain: manifest -> staged video -> ten generate attestations -> receipt.
+    # Schema chain: manifest -> staged video -> generated attestations -> receipt.
     assert spec.states["stage-input"].inputs[0].schema == "npa.encord.pull_manifest.v1"
-    assert spec.states["augment-01"].inputs[0].schema == "video/mp4"
-    assert spec.states["augment-01"].outputs[0].schema == "npa.cosmos3.generate.v1"
+    assert spec.states["augment"].inputs[0].schema == "video/mp4"
+    assert spec.states["augment"].outputs[0].schema == "npa.cosmos3.generate.v1"
     assert spec.states["push-augmented"].outputs[0].schema == "npa.encord.push_receipt.v1"
-    # Every Cosmos stage conditions on exactly the URI the glue stage writes,
-    # has a distinct seed, and publishes into a distinct prefix for push.
-    plan = build_plan(spec, run_id="t")
+    # Each loop iteration conditions on the staged video, has a distinct seed,
+    # and publishes a distinct video and attestation for push.
     stage_argv = next(s.argv for s in plan.steps if s.state == "stage-input")
     staged_uri = stage_argv[-2]  # the glue's dest_uri positional
     assert staged_uri.endswith("augment-input/source.mp4")
-    variant_steps = [step for step in plan.steps if step.state in augmentations]
+    variant_steps = [step for step in plan.steps if step.state == "augment"]
     assert all(staged_uri in step.argv for step in variant_steps)
     seeds = [step.argv[step.argv.index("--seed") + 1] for step in variant_steps]
     output_paths = [step.argv[step.argv.index("--output-path") + 1] for step in variant_steps]
-    assert seeds == [str(seed) for seed in range(17, 27)]
-    assert len(set(output_paths)) == 10
+    assert seeds == ["1", "2"]
+    assert len(set(output_paths)) == 2
     assert all("/generated/variant-" in path for path in output_paths)
-    attestation_paths = [spec.states[name].outputs[0].uri for name in augmentations]
-    assert len(set(attestation_paths)) == 10
+    attestation_paths = [step.outputs[0]["uri"] for step in variant_steps]
+    assert len(set(attestation_paths)) == 2
     assert all("/generated/variant-" in path for path in attestation_paths)

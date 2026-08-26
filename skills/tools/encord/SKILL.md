@@ -127,7 +127,7 @@ DICOM series because they lack one signed media URL.
 - `npa/workflows/workbench/npa-workflows/encord-pull.yaml` — production pull,
   run after curation with the Collection uuid (or dataset/project reference).
 - `npa/workflows/workbench/npa-workflows/encord-cosmos3-augment.yaml` — the
-  curation-to-augmentation loop in one run: pull an Encord video, generate ten
+  curation-to-augmentation loop in one run: pull an Encord video, generate two
   distinct real Cosmos 3 video2video variants on the GPU profile, and push all
   results back into Encord as `npa-aug-<run-id>`. Runs out of the box: by
   default a seed stage uploads the packaged pinned starter clip (CC-BY-4.0,
