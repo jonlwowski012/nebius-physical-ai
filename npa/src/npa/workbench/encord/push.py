@@ -121,6 +121,37 @@ def _chunks(items: list[PushedItem], size: int) -> list[list[PushedItem]]:
     return [items[index : index + size] for index in range(0, len(items), size)]
 
 
+def _attach_item_uuid(items: list[PushedItem], item_uuid: str, name: str) -> None:
+    """Attach an Encord uuid only when its source item is unambiguous.
+
+    Encord normally returns the full object key, but some SDK responses contain
+    only a basename. A basename shared by multiple source keys must never be
+    used for receipt lineage: that would associate one Encord item with more
+    than one source object.
+    """
+
+    if any(item.item_uuid == item_uuid for item in items):
+        return
+    candidates = [
+        item
+        for item in items
+        if item.status == "registered" and not item.item_uuid and item.key == name
+    ]
+    if len(candidates) != 1:
+        basename = Path(name).name
+        candidates = [
+            item
+            for item in items
+            if (
+                item.status == "registered"
+                and not item.item_uuid
+                and Path(item.key).name == basename
+            )
+        ]
+    if len(candidates) == 1:
+        candidates[0].item_uuid = item_uuid
+
+
 def _register_items(
     folder_obj: Any,
     items: list[PushedItem],
@@ -161,17 +192,10 @@ def _register_items(
             status = "failed"
             break
 
-    # Attach item uuids to receipt rows. Encord names registered items by the
-    # full object key (observed live), so match that first and fall back to the
-    # basename; ambiguity leaves the row blank without affecting linking, which
-    # uses the uuid list directly.
-    by_name: dict[str, list[str]] = {}
+    # Attach receipt lineage only if Encord's returned name identifies exactly
+    # one source item. Linking always uses the uuid list directly.
     for item_uuid, name in registered:
-        by_name.setdefault(name, []).append(item_uuid)
-    for item in items:
-        candidates = by_name.get(item.key) or by_name.get(Path(item.key).name) or []
-        if len(candidates) == 1 and item.status == "registered":
-            item.item_uuid = candidates[0]
+        _attach_item_uuid(items, item_uuid, name)
     return registered, done, errors, status
 
 
@@ -229,18 +253,18 @@ def _link_dataset(
 
     uuids = {item_uuid for item_uuid, _ in registered}
     if transfer == "register":
-        wanted = {item.key for item in items} | {
-            Path(item.key).name for item in items
-        }
+        wanted_keys = {item.key for item in items}
+        basename_counts: dict[str, int] = {}
+        for item in items:
+            basename = Path(item.key).name
+            basename_counts[basename] = basename_counts.get(basename, 0) + 1
         for existing in folder_obj.list_items(page_size=1000):
-            if str(existing.name) in wanted:
-                uuids.add(str(existing.uuid))
-                by_key = str(existing.name)
-                for item in items:
-                    if item.status == "registered" and not item.item_uuid and (
-                        item.key == by_key or Path(item.key).name == by_key
-                    ):
-                        item.item_uuid = str(existing.uuid)
+            name = str(existing.name)
+            if name not in wanted_keys and basename_counts.get(Path(name).name) != 1:
+                continue
+            item_uuid = str(existing.uuid)
+            uuids.add(item_uuid)
+            _attach_item_uuid(items, item_uuid, name)
     if not uuids:
         return 0
     dataset_obj.link_items(sorted(uuids))

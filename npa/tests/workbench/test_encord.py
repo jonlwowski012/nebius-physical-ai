@@ -670,6 +670,24 @@ def test_run_push_repush_links_existing_items(tmp_path: Path) -> None:
     assert {item.item_uuid for item in receipt.items} == {_uuid(61), _uuid(62)}
 
 
+def test_run_push_does_not_assign_shared_basename_to_multiple_receipt_rows(
+    tmp_path: Path,
+) -> None:
+    """A basename-only SDK response cannot provide per-object receipt lineage."""
+
+    storage = FakeStorage(["p/left/clip.mp4", "p/right/clip.mp4"])
+    folder = FakeFolder(
+        results=[FakePollResult(status="DONE", done=2, items=[(_uuid(64), "clip.mp4")])]
+    )
+    client = FakeUserClient(folders=[folder])
+    receipt = run_push(
+        **_push_kwargs(tmp_path, storage, client, folder=str(folder.uuid), dataset="new-ds")
+    )
+    dataset = next(iter(client.datasets.values()))
+    assert dataset.linked == [[_uuid(64)]]
+    assert [item.item_uuid for item in receipt.items] == ["", ""]
+
+
 def test_run_push_writes_receipt_when_linking_crashes(tmp_path: Path) -> None:
     """Post-mutation failures must still leave a receipt behind."""
 
