@@ -172,7 +172,7 @@ class RoundtripItem(BaseModel):
 
     source_uri: str = ""
     item_uuid: str = ""
-    # matched | missing | unexpected | unresolved
+    # matched | missing | unexpected
     relation: str
     expected_size: int = 0
     observed_size: int = 0

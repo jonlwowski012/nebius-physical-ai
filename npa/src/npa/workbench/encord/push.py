@@ -154,7 +154,11 @@ def _folder_inventory(folder_obj: Any) -> list[Any]:
 
 
 def _resolve_identities(
-    folder_obj: Any, items: list[PushedItem], *, attempts: int = 2
+    folder_obj: Any,
+    items: list[PushedItem],
+    *,
+    attempts: int = 2,
+    fail_unresolved: bool = False,
 ) -> int:
     """Resolve each registered item's Encord uuid by exact identity only.
 
@@ -163,9 +167,14 @@ def _resolve_identities(
     display names, and in particular basenames, are never identity. Items the
     old code registered without metadata still resolve through their
     objectUrl. One short re-list absorbs listing lag right after registration.
+
+    Returns the number of items failed. With ``fail_unresolved`` (the
+    post-registration pass) an item that still has no exact identity is an
+    error, not a silent gap: an unattributed row could never be linked,
+    pulled, or verified.
     """
 
-    conflicts = 0
+    failed = 0
     for attempt in range(attempts):
         pending = [
             item
@@ -173,7 +182,7 @@ def _resolve_identities(
             if item.status == "registered" and not item.item_uuid
         ]
         if not pending:
-            break
+            return failed
         if attempt:
             time.sleep(IDENTITY_RELIST_DELAY_SECONDS)
         inventory = _folder_inventory(folder_obj)
@@ -189,8 +198,17 @@ def _resolve_identities(
             elif resolution.error_code == "identity_conflict":
                 item.status = "error"
                 item.error = resolution.error
-                conflicts += 1
-    return conflicts
+                failed += 1
+    if fail_unresolved:
+        for item in items:
+            if item.status == "registered" and not item.item_uuid:
+                item.status = "error"
+                item.error = (
+                    "registered but no exact metadata or object URL identity "
+                    "matched in the folder inventory"
+                )
+                failed += 1
+    return failed
 
 
 def _register_items(
@@ -203,7 +221,6 @@ def _register_items(
     """Register objectUrls in batches; return (uuid, name) pairs, counts, status."""
 
     by_url = {item.object_url: item for item in items}
-    registered: list[tuple[str, str]] = []
     done = errors = 0
     status = "done"
     for batch in _chunks(items, BATCH_SIZE):
@@ -218,8 +235,6 @@ def _register_items(
         state = getattr(result.status, "name", str(result.status)).upper()
         done += int(getattr(result, "units_done_count", 0) or 0)
         errors += int(getattr(result, "units_error_count", 0) or 0)
-        for entry in getattr(result, "items_with_names", None) or []:
-            registered.append((str(entry.item_uuid), str(entry.name)))
         for unit_error in getattr(result, "unit_errors", None) or []:
             for url in getattr(unit_error, "object_urls", None) or []:
                 matched = by_url.get(str(url))
@@ -232,10 +247,8 @@ def _register_items(
         if state in ("ERROR", "CANCELLED"):
             status = "failed"
             break
-
-    # Lineage is resolved afterwards by exact identity (_resolve_identities);
-    # the (uuid, name) pairs only evidence what this run created.
-    return registered, done, errors, status
+    # Lineage is attached afterwards by exact identity (_resolve_identities).
+    return done, errors, status
 
 
 def _upload_items(
@@ -252,7 +265,6 @@ def _upload_items(
     item and the run still fails closed after the receipt is written.
     """
 
-    uploaded: list[tuple[str, str]] = []
     done = errors = 0
     for item in items:
         try:
@@ -280,13 +292,12 @@ def _upload_items(
             item.item_uuid = str(item_uuid)
             item.identity_signal = "uploaded"
             item.status = "uploaded"
-            uploaded.append((str(item_uuid), item.key))
             done += 1
         except Exception as exc:  # noqa: BLE001 - recorded per item, run fails closed
             item.status = "error"
             item.error = str(exc)
             errors += 1
-    return uploaded, done, errors, "done"
+    return done, errors, "done"
 
 
 def _link_dataset(dataset_obj: Any, items: list[PushedItem]) -> int:
@@ -407,7 +418,6 @@ def run_push(
     dataset_created = False
     # Everything in this block can mutate Encord; the receipt must land even
     # when folder/dataset setup or a later transfer step throws.
-    registered: list[tuple[str, str]] = []
     units_done = units_error = 0
     status = "failed"
     linked_count = 0
@@ -434,7 +444,7 @@ def run_push(
             for item in registrable:
                 if item.item_uuid:
                     item.status = "uploaded"
-            registered, units_done, units_error_new, status = _upload_items(
+            units_done, units_error_new, status = _upload_items(
                 folder_obj,
                 pending,
                 storage_client=active_storage,
@@ -442,7 +452,7 @@ def run_push(
             )
             units_error += units_error_new
         elif pending:
-            registered, units_done, units_error_new, status = _register_items(
+            units_done, units_error_new, status = _register_items(
                 folder_obj,
                 pending,
                 integration_id=integration_id,
@@ -450,8 +460,11 @@ def run_push(
             )
             units_error += units_error_new
             # Exact identity resolution (metadata/objectUrl only) attaches the
-            # Encord uuid for the freshly registered items.
-            units_error += _resolve_identities(folder_obj, pending)
+            # Encord uuid for the freshly registered items; an item Encord
+            # accepted but exact identity cannot attribute fails closed.
+            units_error += _resolve_identities(
+                folder_obj, pending, fail_unresolved=status == "done"
+            )
         else:
             status = "done"
         units_done += preexisting

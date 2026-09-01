@@ -537,11 +537,27 @@ def test_run_push_batches_at_500(tmp_path: Path) -> None:
     keys = [f"p/{index:04d}.png" for index in range(BATCH_SIZE + 1)]
     storage = FakeStorage(keys)
     folder = FakeFolder(results=[FakePollResult(status="DONE", done=BATCH_SIZE + 1)])
+    folder.post_registration_items = [
+        _folder_item(1000 + index, key) for index, key in enumerate(keys)
+    ]
     client = FakeUserClient(folders=[folder])
     run_push(**_push_kwargs(tmp_path, storage, client, folder=str(folder.uuid)))
     assert len(folder.start_calls) == 2
     first = folder.start_calls[0]["private_files"]
     assert len(first["images"]) == BATCH_SIZE
+
+
+def test_run_push_unattributable_item_fails_closed(tmp_path: Path) -> None:
+    """Encord accepted the batch but no exact identity matched: never silent."""
+
+    storage = FakeStorage(["p/a.mp4"])
+    folder = FakeFolder(results=[FakePollResult(status="DONE", done=1)])
+    client = FakeUserClient(folders=[folder])  # inventory never shows the item
+    with pytest.raises(EncordToolError, match="unit error"):
+        run_push(**_push_kwargs(tmp_path, storage, client, folder=str(folder.uuid)))
+    payload = json.loads((tmp_path / "receipt.json").read_text())
+    assert payload["items"][0]["status"] == "error"
+    assert "no exact metadata or object URL identity" in payload["items"][0]["error"]
 
 
 def test_run_push_rejects_local_input(tmp_path: Path) -> None:

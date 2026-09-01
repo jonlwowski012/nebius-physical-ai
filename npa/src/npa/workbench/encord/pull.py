@@ -264,40 +264,31 @@ def run_pull(
                 output_uri=output_path,
                 endpoint_url=endpoint_url,
             )
-            write_json(
-                {
-                    "item_uuid": record.item_uuid,
-                    "name": record.name,
-                    "item_type": record.item_type,
-                    "mime_type": record.mime_type,
-                    "file_size": record.file_size,
-                    "client_metadata": getattr(item, "client_metadata", None) or {},
-                },
-                result_uri=output_path.rstrip("/") + f"/items/{record.item_uuid}.json",
-                filename=f"{record.item_uuid}.json",
-                storage_client=active_storage,
-            )
+            try:
+                write_json(
+                    {
+                        "item_uuid": record.item_uuid,
+                        "name": record.name,
+                        "item_type": record.item_type,
+                        "mime_type": record.mime_type,
+                        "file_size": record.file_size,
+                        "client_metadata": getattr(item, "client_metadata", None) or {},
+                    },
+                    result_uri=output_path.rstrip("/") + f"/items/{record.item_uuid}.json",
+                    filename=f"{record.item_uuid}.json",
+                    storage_client=active_storage,
+                )
+            except Exception as exc:  # noqa: BLE001 - recorded per item, run fails closed
+                record.transfer = "error"
+                record.error = f"item metadata write failed: {exc}"
             return record
 
         if found.items:
-            from concurrent.futures import ThreadPoolExecutor, as_completed
+            from concurrent.futures import ThreadPoolExecutor
 
             workers = min(PULL_TRANSFER_WORKERS, len(found.items))
-            results: list[PulledItem | None] = [None] * len(found.items)
-            first_error: Exception | None = None
             with ThreadPoolExecutor(max_workers=workers) as pool:
-                futures = {
-                    pool.submit(_transfer_and_record, item): index
-                    for index, item in enumerate(found.items)
-                }
-                for future in as_completed(futures):
-                    try:
-                        results[futures[future]] = future.result()
-                    except Exception as exc:  # noqa: BLE001 - kept for the manifest
-                        first_error = first_error or exc
-            pulled = [record for record in results if record is not None]
-            if first_error is not None:
-                raise first_error
+                pulled = list(pool.map(_transfer_and_record, found.items))
 
         if found.project is not None:
             label_rows, label_uris = export_labels(

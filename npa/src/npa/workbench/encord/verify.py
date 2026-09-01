@@ -92,31 +92,19 @@ def run_verify(
         manifest = PullManifest.model_validate(
             read_json(manifest_uri, storage_client=active_storage)
         )
+        # Push fails closed on any successful item without an exact-identity
+        # uuid, so every successful receipt row is attributable by uuid here.
         pushed_ok = [
             item
             for item in receipt.items
             if item.status in ("registered", "uploaded") and item.item_uuid
-        ]
-        unattributed = [
-            item
-            for item in receipt.items
-            if item.status in ("registered", "uploaded") and not item.item_uuid
         ]
         pulled_ok = {
             item.item_uuid: item
             for item in manifest.items
             if item.transfer in ("copy", "download")
         }
-        expected = len(pushed_ok) + len(unattributed)
-        for item in unattributed:
-            items.append(
-                RoundtripItem(
-                    source_uri=item.source_uri,
-                    relation="unresolved",
-                    expected_size=item.source_size,
-                    reasons=["push row has no exact-identity Encord uuid"],
-                )
-            )
+        expected = len(pushed_ok)
         for pushed in pushed_ok:
             pulled = pulled_ok.get(pushed.item_uuid)
             if pulled is None:
