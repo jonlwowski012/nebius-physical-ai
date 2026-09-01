@@ -10,6 +10,7 @@ from __future__ import annotations
 
 import ast
 import builtins
+import hashlib
 import json
 import re
 import secrets
@@ -21,6 +22,23 @@ from types import SimpleNamespace
 import pytest
 
 from npa.cli.agent_embed import embedded_python_source
+from npa.cli.agent_viewer_runtime import _sha256_file
+
+
+def test_sha256_file_streams_recording_without_read_bytes(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    recording = tmp_path / "large.rrd"
+    payload = (b"RRF2" + b"recording-block") * 1000
+    recording.write_bytes(payload)
+
+    monkeypatch.setattr(
+        Path,
+        "read_bytes",
+        lambda _path: (_ for _ in ()).throw(AssertionError("must stream file")),
+    )
+
+    assert _sha256_file(recording, chunk_size=31) == hashlib.sha256(payload).hexdigest()
 
 
 def _clear_rendered_agent_backend_modules() -> None:
@@ -1204,6 +1222,7 @@ def _import_rendered_backend(monkeypatch, tmp_path, *, module_name: str):
         "foxglove_routes",
         "gpu_allocation_fallback",
         "gpu_allocation_routes",
+        "access_approval",
         "artifact_routes",
         "leisaac_registry",
         "leisaac",
@@ -1353,6 +1372,7 @@ def test_workflow_dry_run_plans_provision_even_with_existing_infra(
         ("trace", "def analyze_traces"),
         ("gpu_allocation_fallback", "def record_attempt"),
         ("gpu_allocation_routes", "def register_gpu_allocation_routes"),
+        ("access_approval", "def classify_followup"),
         ("artifact_routes", "def register_artifact_routes"),
         ("canonical_mcap", "def prepare_canonical_mcap"),
         ("foxglove_cloud", "class FoxgloveCloudClient"),
@@ -1420,6 +1440,7 @@ def test_rendered_backend_imports_and_registers_foxglove_routes(monkeypatch, tmp
         "foxglove_routes",
         "gpu_allocation_fallback",
         "gpu_allocation_routes",
+        "access_approval",
         "artifact_routes",
         "leisaac_registry",
         "leisaac",
@@ -1726,8 +1747,14 @@ def test_source_qualified_rrd_loads_keep_independent_history(
         assert snapshots[ref_one]["served_recording_sha256"] == (
             hashlib.sha256(selections["npa1_source_one"][2]).hexdigest()
         )
+        assert snapshots[ref_one]["served_recording_size_bytes"] == len(
+            selections["npa1_source_one"][2]
+        )
         assert snapshots[ref_two]["served_recording_sha256"] == (
             hashlib.sha256(selections["npa1_source_two"][2]).hexdigest()
+        )
+        assert snapshots[ref_two]["served_recording_size_bytes"] == len(
+            selections["npa1_source_two"][2]
         )
         assert (
             snapshots[ref_one]["served_recording_sha256"]
@@ -1832,6 +1859,38 @@ def test_rerun_self_heal_preserves_same_run_canonical_mcap(
         assert repaired["foxglove_url"] == current["foxglove_url"]
         assert state["sim_viz"] == repaired
         assert state["sim_viz_runs"][run_id]["canonical_mcap_sha256"] == "a" * 64
+    finally:
+        sys.modules.pop(module_name, None)
+
+
+def test_active_run_recording_does_not_republish_on_page_refresh(
+    monkeypatch, tmp_path
+) -> None:
+    """Selection/status refreshes must remain metadata-only for a bound RRD."""
+    import sys
+
+    module_name = "npa_rendered_bound_rrd_refresh_backend"
+    module = _import_rendered_backend(monkeypatch, tmp_path, module_name=module_name)
+    recording = tmp_path / "sim2real.rrd"
+    recording.write_bytes(b"RRF2run-specific-recording")
+    module.RECORDING_PATH = recording
+    run_id = "run-already-loaded"
+    current = {
+        "run_id": run_id,
+        "rrd_uri": f"file://{recording}",
+        "served_recording_sha256": hashlib.sha256(recording.read_bytes()).hexdigest(),
+        "served_recording_size_bytes": recording.stat().st_size,
+    }
+    state = {"sim_viz": current, "latest_submit": {"run_id": run_id}}
+    monkeypatch.setattr(module, "_load_state", lambda: state)
+    monkeypatch.setattr(
+        module,
+        "_publish_rrd_recording",
+        lambda _source: (_ for _ in ()).throw(AssertionError("must not republish")),
+    )
+
+    try:
+        assert module._wire_active_sim2real_recording(state) is current
     finally:
         sys.modules.pop(module_name, None)
 
@@ -2008,6 +2067,9 @@ def test_rendered_artifact_routes_reject_foreign_buckets_and_malformed_keys(
                 module._safe_artifact_key(key)
             assert exc_info.value.status_code == 400
 
+        # /artifacts/download is served by the embedded secure module, whose
+        # handler takes the request. Every rejection below happens before any S3
+        # call, so the stubbed client is never touched.
         request = module.Request(
             {"type": "http", "method": "GET", "path": "/artifacts/download", "headers": []}
         )
@@ -2023,6 +2085,17 @@ def test_rendered_artifact_routes_reject_foreign_buckets_and_malformed_keys(
                 request, s3_uri="s3://configured-bucket/../secret.bin"
             )
         assert exc_info.value.status_code == 400
+
+        # A run_id alone is not enough: the object must still be named, and a
+        # caller cannot smuggle a second bucket/key past the one in the URI.
+        for kwargs in (
+            {"run_id": "run-one"},
+            {"run_id": "run-one", "s3_uri": "s3://b/k", "key": "other"},
+            {"run_id": "run-one", "s3_uri": "s3://b/k", "resource_bucket": "other"},
+        ):
+            with pytest.raises(module.HTTPException) as exc_info:
+                module.artifacts_download(request, **kwargs)
+            assert exc_info.value.status_code == 400
 
         allowed_key = "nested/root/category/run-one/reports/run.rrd"
         allowed_artifact = module.Artifact(
@@ -2067,6 +2140,54 @@ def test_rendered_artifact_routes_reject_foreign_buckets_and_malformed_keys(
                 }
             )
         assert exc_info.value.status_code == 400
+    finally:
+        sys.modules.pop(module_name, None)
+
+
+def test_rendered_backend_registers_no_shadowed_routes(monkeypatch, tmp_path) -> None:
+    """No method+path may be registered twice in the emitted backend.
+
+    Starlette resolves the first matching route, so a second registration of the
+    same method+path is unreachable code that still reads as authoritative. That
+    is how ``/artifacts/file`` and ``/artifacts/download`` ended up with copies in
+    agent.py shadowed by the hardened versions in the embedded artifact-content
+    module: the copies lacked the ``Content-Disposition``/``nosniff`` headers and
+    the inventory authorization, so whichever one won changed the security
+    posture of the deployment.
+    """
+    import sys
+    from collections import Counter
+
+    module_name = "npa_rendered_route_uniqueness_backend"
+    module = _import_rendered_backend(monkeypatch, tmp_path, module_name=module_name)
+
+    def registered_methods(app) -> Counter:
+        return Counter(
+            (method, getattr(route, "path", ""))
+            for route in app.routes
+            for method in sorted(getattr(route, "methods", None) or ())
+        )
+
+    try:
+        registered = registered_methods(module.app)
+        # Without this the assertion below passes vacuously if `app.routes` ever
+        # stops yielding what this reads -- an empty counter has no duplicates.
+        assert ("GET", "/health") in registered, (
+            "route inventory did not include a known route, so this guard would "
+            f"pass without inspecting anything: {len(registered)} entries"
+        )
+        shadowed = {key: count for key, count in registered.items() if count > 1}
+        assert not shadowed, (
+            "these method+path pairs are registered more than once; every "
+            f"registration after the first is unreachable: {sorted(shadowed)}"
+        )
+
+        # Prove the detector is sensitive: re-registering a live path must be
+        # caught. Otherwise "no duplicates" only means "nothing was measured".
+        module.app.add_api_route("/health", lambda: {}, methods=["GET"])
+        assert ("GET", "/health") in {
+            key for key, count in registered_methods(module.app).items() if count > 1
+        }
     finally:
         sys.modules.pop(module_name, None)
 
@@ -2994,6 +3115,7 @@ def test_rendered_backend_loads_real_skill_excerpts(monkeypatch, tmp_path):
         "foxglove_routes",
         "gpu_allocation_fallback",
         "gpu_allocation_routes",
+        "access_approval",
         "artifact_routes",
         "leisaac_registry",
         "leisaac",
@@ -3034,8 +3156,180 @@ def test_rendered_backend_loads_real_skill_excerpts(monkeypatch, tmp_path):
         )
         assert names[0] == "cosmos3-npa-workflow", names
         assert "npa.workflow" in context
+
+        access_excerpt = module._skill_excerpt("access-approval")
+        assert access_excerpt, "access-approval excerpt is empty"
+        access_names, access_context = module._resolve_skill_context(
+            user_text="prepare full catalog access", intent=None
+        )
+        assert access_names[0] == "access-approval", access_names
+        assert "human-bound" in access_context
     finally:
         sys.modules.pop("npa_rendered_skill_backend", None)
+
+
+def test_rendered_grounded_access_approval_reports_skill_without_model_call(
+    monkeypatch, tmp_path
+) -> None:
+    module_name = "npa_rendered_access_approval_skill_backend"
+    module = _import_rendered_backend(monkeypatch, tmp_path, module_name=module_name)
+    state: dict[str, object] = {}
+    plan = {
+        "status": "blocked",
+        "counts": {"hf": 1, "ngc": 1},
+        "official_urls": [
+            "https://huggingface.co/vendor/repo",
+            "https://catalog.ngc.nvidia.com/orgs/vendor/models/repo",
+        ],
+        "resume_command": "npa configure --prepare-catalog-access",
+    }
+    monkeypatch.setattr(module, "_load_state", lambda: state)
+    monkeypatch.setattr(module, "_save_state", lambda _state: None)
+    monkeypatch.setattr(module._access_approval, "build_plan", lambda **_kwargs: plan)
+    monkeypatch.setattr(
+        module,
+        "_provider_chat",
+        lambda *_args, **_kwargs: (_ for _ in ()).throw(
+            AssertionError("approval interaction must remain zero-token grounded")
+        ),
+    )
+    try:
+        response = module.chat(
+            {
+                "messages": [
+                    {"role": "user", "content": "prepare full catalog access"}
+                ]
+            }
+        )
+        assert response["grounded"] is True
+        assert response["tier"] == "grounded-access-approval"
+        assert response["skills_used"] == ["access-approval"]
+        assert response["open_urls"] == []
+
+        opened = module.chat(
+            {"messages": [{"role": "user", "content": "yes"}]}
+        )
+        assert opened["grounded"] is True
+        assert opened["skills_used"] == ["access-approval"]
+        assert opened["open_urls"] == plan["official_urls"]
+
+        declined = module.chat(
+            {"messages": [{"role": "user", "content": "later"}]}
+        )
+        assert declined["grounded"] is True
+        assert declined["open_urls"] == []
+        assert "npa configure --prepare-catalog-access" in declined["reply"]
+    finally:
+        sys.modules.pop(module_name, None)
+
+
+def test_rendered_visual_turn_with_approval_words_stays_on_vision_path(
+    monkeypatch, tmp_path
+) -> None:
+    module_name = "npa_rendered_visual_approval_words_backend"
+    module = _import_rendered_backend(monkeypatch, tmp_path, module_name=module_name)
+    state: dict[str, object] = {
+        "access_approval": {
+            "status": "blocked",
+            "official_urls": ["https://huggingface.co/vendor/repo"],
+        }
+    }
+    captured: dict[str, object] = {}
+
+    def visual_chat(*, messages, requested_model="", tier="standard", interactive=True):
+        captured.update(
+            messages=messages,
+            requested_model=requested_model,
+            tier=tier,
+            interactive=interactive,
+        )
+        return (
+            {
+                "choices": [
+                    {
+                        "message": {
+                            "content": (
+                                "**What I see**: A model evaluation chart.\n\n"
+                                "**Likely meaning**: Dataset quality varies by split.\n\n"
+                                "**Operator feedback**: Inspect the lowest bar.\n\n"
+                                "**Next actions**: Compare it with the gated-catalog baseline."
+                            )
+                        }
+                    }
+                ],
+                "usage": {"prompt_tokens": 12, "completion_tokens": 18},
+            },
+            "mock-provider",
+            "mock-vision-model",
+        )
+
+    monkeypatch.setattr(module, "_load_state", lambda: state)
+    monkeypatch.setattr(module, "_save_state", lambda _state: None)
+    monkeypatch.setattr(
+        module._access_approval,
+        "classify_followup",
+        lambda *_args, **_kwargs: (_ for _ in ()).throw(
+            AssertionError("visual turns must not enter access-approval classification")
+        ),
+    )
+    monkeypatch.setattr(
+        module._access_approval,
+        "build_plan",
+        lambda **_kwargs: (_ for _ in ()).throw(
+            AssertionError("visual turns must not build an approval plan")
+        ),
+    )
+    monkeypatch.setattr(module, "_chat_with_resilience", visual_chat)
+    monkeypatch.setattr(
+        module,
+        "_append_chat_turn",
+        lambda session_id, *_args, **_kwargs: module._normalize_chat_session(
+            session_id,
+            {"id": session_id, "title": "Visual review", "chat_history": []},
+        ),
+    )
+    try:
+        response = module.chat(
+            {
+                "visual_context": {
+                    "kind": "image",
+                    "run_id": "evaluation-run",
+                    "artifact_key": "reports/model-dataset-catalog.png",
+                    "capture": "frame",
+                },
+                "messages": [
+                    {
+                        "role": "user",
+                        "content": [
+                            {
+                                "type": "text",
+                                "text": (
+                                    "[npa-visual-feedback] Describe this model dataset "
+                                    "catalog approval status image."
+                                ),
+                            },
+                            {
+                                "type": "image_url",
+                                "image_url": {
+                                    "url": "data:image/jpeg;base64,c3ludGhldGlj"
+                                },
+                            },
+                        ],
+                    }
+                ],
+            }
+        )
+
+        assert captured["tier"] == module.TIER_VISION
+        assert response["tier"] == module.TIER_VISION
+        assert response["model"] == "mock-vision-model"
+        assert response["visual_kind"] == "image"
+        assert response["skills_used"][0] == "agent-visual-feedback"
+        assert response.get("approval_plan") is None
+        assert response.get("open_urls") is None
+        assert "What I see" in response["reply"]
+    finally:
+        sys.modules.pop(module_name, None)
 
 
 def test_rendered_backend_has_no_mangled_regex_escapes(monkeypatch) -> None:

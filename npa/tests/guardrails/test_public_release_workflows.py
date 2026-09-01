@@ -56,6 +56,24 @@ def test_public_publisher_builds_only_immutable_public_development_refs() -> Non
         assert stale_variable not in text
 
 
+def test_public_development_build_runner_is_dispatch_scoped_and_defaults_hosted() -> None:
+    spec = _spec(PUBLISH)
+    triggers = spec.get("on") or spec[True]
+    inputs = triggers["workflow_dispatch"]["inputs"]
+
+    assert inputs["build_runner_label"] == {
+        "description": "Runner label for public development image builds",
+        "required": False,
+        "default": "ubuntu-latest",
+    }
+    assert spec["jobs"]["build-development"]["runs-on"] == (
+        "${{ inputs.build_runner_label || 'ubuntu-latest' }}"
+    )
+    for name, job in spec["jobs"].items():
+        if name != "build-development":
+            assert job["runs-on"] == "ubuntu-latest"
+
+
 def test_public_channel_workflows_do_not_restore_retired_channel_language() -> None:
     combined = "\n".join(
         path.read_text(encoding="utf-8").lower()
@@ -79,20 +97,65 @@ def test_prepublication_gates_run_before_the_public_dev_push() -> None:
         "test_packaging_contract.py",
         "npa.guardrails.confidentiality",
         "gitleaks detect",
-        "Prove an existing destination package is public",
+        "Prove destination cannot expose unvalidated tagged bytes",
         "scan_image_omniverse_payload.py",
         "scan_image_ltx_payload.py",
         "scan_image_wan_payload.py",
+        "scan_image_cosmos3_ray_serve_payload.py",
         "test_ltx_runtime_bootstrap.py",
-        "scanners: vuln,secret,license",
-        "format: spdx-json",
+        "test_cosmos3_ray_serve_image_contract.py",
+        "--scanners vuln,secret,license",
+        "--format spdx-json",
         "non-root runtime required",
         "cached EULA acceptance",
     ):
         assert required in text
         assert text.index(required) < push
-    assert "organisation policy and post-push anonymous verification apply" in text
+    assert "exact pushed-byte gates and post-push anonymous verification apply" in text
     assert "if matrix and head != sha" in text
+
+
+def test_public_base_pull_authentication_precedes_local_build() -> None:
+    spec = _spec(PUBLISH)
+    steps = spec["jobs"]["build-development"]["steps"]
+    names = [str(step.get("name") or "") for step in steps]
+    auth = names.index("Authenticate immutable public base pulls")
+    build = names.index("Build immutable development image locally")
+    push = names.index("Push only after every pre-publication gate passes")
+    assert steps[auth]["uses"] == "docker/login-action@v3"
+    assert auth < build < push
+
+
+def test_large_image_scan_reclaims_only_disposable_build_cache_and_tar() -> None:
+    spec = _spec(PUBLISH)
+    step = next(
+        item
+        for item in spec["jobs"]["build-development"]["steps"]
+        if item.get("name")
+        == "Enforce runtime, revision, bootstrap, config, and history contracts"
+    )
+    script = step["run"]
+    assert script.index("docker buildx prune --all --force") < script.index(
+        'docker save --output "$RUNNER_TEMP/${TOOL}.tar"'
+    )
+    assert 'rm -f "$RUNNER_TEMP/${TOOL}.tar"' in script
+
+
+def test_large_image_scan_reclaims_build_cache_and_reuses_large_volume() -> None:
+    text = PUBLISH.read_text(encoding="utf-8")
+    prepare = text.index("Prepare capacity for full-image security scans")
+    scan = text.index("Pre-publication vulnerability, secret, and license scan")
+    sbom = text.index("Generate pre-publication SBOM")
+    push = text.index("Push only after every pre-publication gate passes")
+    assert prepare < scan < sbom < push
+    assert "docker buildx prune --all --force" in text[prepare:scan]
+    assert text[scan:push].count("TRIVY_TEMP_DIR: /mnt/npa-trivy") == 2
+    assert text[scan:push].count("--cache-dir /tmp/trivy/cache") == 2
+    assert text[scan:push].count("--timeout 2562047h47m16s") == 2
+    assert text[scan:push].count("-e TMPDIR=/tmp/trivy") == 2
+    trivy = "aquasec/trivy:0.70.0@sha256:be1190afcb28352bfddc4ddeb71470835d16462af68d310f9f4bca710961a41e image"
+    assert text[scan:push].count(trivy) == 2
+    assert "docker image prune" not in text[scan:push]
 
 
 def test_post_push_and_promotion_gates_are_digest_bound() -> None:
@@ -103,13 +166,42 @@ def test_post_push_and_promotion_gates_are_digest_bound() -> None:
         "subject-name: ${{ steps.push.outputs.repository }}",
         "Require both digest-bound attestation results",
         "crane digest",
-        "DOCKER_CONFIG=\"$anonymous_config\" crane manifest",
+        'DOCKER_CONFIG="$anonymous_config" crane manifest',
         "--development-sha",
         "--mode preflight",
         "--mode publish",
         "Retained immutable dev tags as release provenance",
     ):
         assert required in text
+    visibility = text.index('gh api --method PATCH "$package_api" -f visibility=public')
+    anonymous = text.index('DOCKER_CONFIG="$anonymous_config" crane manifest')
+    pushed_scan = text.index(
+        "scan_image_cosmos3_ray_serve_payload.py", text.index("Verify pushed bytes")
+    )
+    assert pushed_scan < visibility < anonymous
+    prepush = text.index("Prove destination cannot expose unvalidated tagged bytes")
+    push = text.index("Push only after every pre-publication gate passes")
+    assert prepush < push
+    assert "Private destination contains tagged versions" in text[prepush:push]
+    assert "tagged_count" in text[prepush:push]
+    verify = text[text.index("Verify pushed bytes") :]
+    assert "pushed-payload-attempt-${payload_attempt}.log" in verify
+    assert "anonymous-manifest-attempt-${anonymous_attempt}.log" in verify
+    assert verify.count("TOOMANYREQUESTS|429 Too Many Requests") == 2
+    assert verify.count("while true; do") >= 2
+    assert "if ! grep -Eq" in verify
+
+
+def test_post_push_payload_scan_binds_remote_digest_to_local_full_tar() -> None:
+    text = PUBLISH.read_text(encoding="utf-8")
+    post_push = text[text.index("Verify pushed bytes") :]
+
+    assert 'docker pull "$exact"' in post_push
+    assert post_push.count("docker image inspect --format '{{.Id}}'") == 2
+    assert 'docker save --output "$RUNNER_TEMP/${TOOL}-pushed.tar" "$exact"' in post_push
+    assert '--tarball "$RUNNER_TEMP/${TOOL}-pushed.tar"' in post_push
+    assert 'rm -f "$RUNNER_TEMP/${TOOL}-pushed.tar"' in post_push
+    assert 'scan_image_omniverse_payload.py \\\n+            "$exact"' not in post_push
 
 
 def test_build_and_cleanup_dispatches_cannot_fall_through_to_promotion() -> None:

@@ -13,6 +13,31 @@ _LIGHT_IMPORT = os.environ.get("NPA_SKIP_EAGER_IMPORTS", "").strip().lower() in 
     "true",
     "yes",
 }
+_LIGHT_TOOL = os.environ.get("NPA_LIGHT_WORKBENCH_TOOL", "").strip().lower()
+
+
+def _groot_light_app() -> typer.Typer:
+    """Build the dependency-minimal workbench surface baked into the GR00T image."""
+
+    from npa.cli.groot import app as groot_app
+
+    light = typer.Typer(
+        name="workbench",
+        help="Physical AI workbench tools.",
+        no_args_is_help=True,
+    )
+
+    @light.callback()
+    def main() -> None:
+        """Physical AI workbench tools."""
+
+        load_credentials(
+            warn=lambda msg: typer.echo(msg, err=True),
+            export_to_environment=True,
+        )
+
+    light.add_typer(groot_app, name="groot")
+    return light
 
 
 def _full_app() -> typer.Typer:
@@ -106,27 +131,12 @@ def _full_app() -> typer.Typer:
 
 
 if _LIGHT_IMPORT:
-    # Capability images need only their own commands and deliberately omit the
-    # unrelated platform SDK dependency tree. The GR00T image also bakes
-    # NPA_SKIP_EAGER_IMPORTS=1, and its toolRef argv is
-    # `npa workbench groot finetune`, so the light tree must register the
-    # import-light groot app too (stdlib + typer only) or that stage cannot
-    # resolve its own command. cosmos2 stage argv never dispatches through this
-    # app: `npa.cli.entry` intercepts ("workbench", "cosmos2", "transfer")
-    # before the command tree loads.
-    from npa.cli.workbench.cosmos2 import app as _cosmos2_app
-
-    app = typer.Typer(
-        name="workbench",
-        help="Physical AI workbench tools (capability image).",
-        no_args_is_help=True,
-    )
-    app.add_typer(_cosmos2_app, name="cosmos2")
-    try:
-        from npa.cli.groot import app as _groot_app
-    except ImportError:  # pragma: no cover - image without the groot CLI extras
-        pass
+    # Capability images need only this one command and deliberately omit the
+    # unrelated platform SDK dependency tree. Preserve the historical Cosmos2
+    # surface unless an image explicitly declares another narrow capability.
+    if _LIGHT_TOOL == "groot":
+        app = _groot_light_app()
     else:
-        app.add_typer(_groot_app, name="groot")
+        from npa.cli.workbench.cosmos2 import app
 else:
     app = _full_app()

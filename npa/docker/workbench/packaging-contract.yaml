@@ -318,6 +318,18 @@ images:
       accepted terms, or gated assets. Both gated model repositories are probed
       before the documented 8-GPU service starts.
     redistribution: public
+  cosmos3-ray-serve:
+    dockerfile: cosmos3-ray-serve/Dockerfile
+    tier: service
+    ports: [8000]
+    notes: >-
+      Persistent Cosmos3-Nano service using cosmos-framework 1.2.2's native
+      OmniModelDeployment and @ray.serve.batch path. Derives from the exact
+      accepted npa-cosmos3 digest and adds only NPA's authenticated ingress and
+      S3 client contract. No model, VAE, or guardrail weights are baked;
+      operator-entitled assets use the standard runtime model cache. Guardrails
+      default on and the API returns structured SampleOutputs plus hashed media.
+    redistribution: public
   content-agents:
     dockerfile: content-agents/Dockerfile
     ovrtx_runtime_fetch: true
@@ -346,6 +358,7 @@ images:
     tier: job
     passwordless_root_exemption: "SkyPilot Kubernetes bootstrap only; non-root runtime user, no default sshd service, and no baked credentials."
     redistribution: public
+    skypilot_bootstrap_contract: skypilot-0.12.2-v1
   cosmos-curate:
     dockerfile: cosmos-curate/Dockerfile
     tier: job
@@ -375,7 +388,15 @@ images:
     dockerfile: isaac-lab/Dockerfile
     isaac_runtime_fetch: true
     tier: interactive
+    notes: >-
+      Bakes OSS dependencies only and uses Debian FFmpeg at runtime. The image
+      removes imageio-ffmpeg's wheel-bundled static executable in the same layer
+      that installs the Python environment, and removes the CUDA development
+      base's unrelated Nsight Compute profiler tree from the final filesystem.
+      Isaac Sim/Lab and task assets remain cryptographically verified runtime
+      fetches after EULA preflight.
     redistribution: public
+    skypilot_bootstrap_contract: skypilot-0.12.2-v1
   leisaac:
     dockerfile: leisaac/Dockerfile
     isaac_runtime_fetch: true
@@ -415,6 +436,7 @@ images:
     redistribution: public
   groot:
     dockerfile: groot/Dockerfile
+    skypilot_bootstrap_contract: skypilot-0.12.2-v1
     isaac_runtime_fetch: true
     tier: interactive
     ports: [8080]
@@ -429,6 +451,8 @@ images:
         - common/install_isaac_runtime_base.sh
         - groot/Dockerfile.k8s-prereqs
       grants:
+        - source: groot/Dockerfile
+          sudoers_entry: "ubuntu ALL=(ALL) NOPASSWD:ALL"
         - source: common/install_isaac_runtime_base.sh
           sudoers_entry: "ubuntu ALL=(ALL) NOPASSWD:ALL"
         - source: groot/Dockerfile.k8s-prereqs
@@ -439,10 +463,12 @@ images:
       verification: runtime_probe_required
     notes: >-
       EXPOSE 8080 without default server CMD. The canonical build supplies the
-      ubuntu user and passwordless sudo but not the complete SkyPilot contract;
-      the derived repair source supplies sshd, runtime host keys, and argument
-      forwarding. Its label is never trusted by itself: submit requires an exact-
-      digest runtime capability probe. Promote to service when ready.
+      complete SkyPilot contract: a non-root ubuntu user with passwordless sudo,
+      sshd with per-pod host keys, rsync, and argument forwarding. The derived
+      repair source remains available for historical canonical images. Because
+      both forms share one image repository, a label is never trusted by itself:
+      submit requires an exact-digest runtime capability probe. Promote to service
+      when ready.
     redistribution: public
   retargeting:
     dockerfile: retargeting/Dockerfile
@@ -451,14 +477,27 @@ images:
   sim2real-envgen:
     dockerfile: sim2real-envgen/Dockerfile
     tier: interactive
+    notes: >-
+      The flattened public runtime removes the parent image's optional AGPL
+      tetgen wrapper, W&B client, and Nsight Compute tree. Canonical Sim2Real
+      environment generation does not use tetrahedralization, experiment
+      tracking, or profiler tooling. The runtime correspondingly removes the
+      Genesis/LeRobot metadata edges for those absent optional dependencies;
+      a repository-owned fail-closed import shim rejects tetrahedralization,
+      while build-time imports and pip consistency checks protect the reduced
+      contract.
     redistribution: public
   rerun-viewer:
     dockerfile: rerun-viewer/Dockerfile
     tier: job
     ports: [9090]
+    final_user: ubuntu
     notes: >-
       Command-passthrough entrypoint supports SkyPilot Kubernetes setup as the
       non-root ubuntu user; an empty argv starts the interactive Rerun server.
+      The image also bakes the exact NPA source revision and resolver-closed
+      Stage 14 S3/MCAP dependencies so the canonical no-overlay workflow can
+      finalize Rerun and MCAP artifacts with source attestation.
     passwordless_root_exemption: >-
       SkyPilot's Kubernetes bootstrap installs and starts its in-pod SSH runtime
       as the non-root ubuntu user. The image deletes all build-time SSH host keys,

@@ -36,6 +36,93 @@ describe("NPA agent UI with mocked APIs", () => {
     cy.get("#runSummary").should("contain.text", "mock-run");
   });
 
+  it("consolidates same-bucket aliases and loads a pasted basename from the exact primary source", () => {
+    const runId = "shared-logical-run";
+    const projectId = "project-a";
+    const bucket = "project-artifacts";
+    const output = {
+      run_id: runId,
+      run_ref: "npa1_stronger_output",
+      project_id: projectId,
+      bucket,
+      resolved_prefix: "workflow-output",
+      source_type: "artifact_storage",
+      has_viewable: true,
+      summary_complete: true,
+      artifact_count: 154000,
+      last_modified: "2026-08-30T04:00:00Z",
+    };
+    const seed = {
+      run_id: runId,
+      run_ref: "npa1_seed_input",
+      project_id: projectId,
+      bucket,
+      resolved_prefix: "trigger-input",
+      source_type: "artifact_storage",
+      has_viewable: true,
+      summary_complete: true,
+      artifact_count: 13,
+      last_modified: "2026-08-30T05:00:00Z",
+    };
+    const crossBucket = { ...seed, run_ref: "npa1_other_bucket", bucket: "archive-artifacts" };
+    const crossProject = { ...seed, run_ref: "npa1_other_project", project_id: "project-b" };
+
+    cy.window().then((win) => {
+      const merged = win.__NPA_AGENT_TEST__.mergeRunsLatestFirst(
+        [], [seed, output, crossBucket, crossProject]
+      );
+      expect(merged).to.have.length(3);
+      const sameScope = merged.find((item) => item.project_id === projectId && item.bucket === bucket);
+      expect(sameScope.run_ref).to.eq(output.run_ref);
+      expect(sameScope.alternate_sources).to.deep.include({
+        run_id: runId,
+        run_ref: seed.run_ref,
+        project_id: projectId,
+        bucket,
+        resolved_prefix: seed.resolved_prefix,
+        source_selected: true,
+        has_viewable: true,
+        summary_complete: true,
+        artifact_count: 13,
+        last_modified: seed.last_modified,
+      });
+      const activeMerged = win.__NPA_AGENT_TEST__.setArtifactRunsForTest(
+        [], [seed, output], { run_id: runId, run_ref: seed.run_ref }
+      );
+      expect(activeMerged).to.have.length(1);
+      expect(activeMerged[0].run_ref).to.eq(seed.run_ref);
+      const primaryMerged = win.__NPA_AGENT_TEST__.setArtifactRunsForTest([], [seed, output], {});
+      expect(primaryMerged).to.have.length(1);
+      expect(primaryMerged[0].run_ref).to.eq(output.run_ref);
+    });
+
+    const rrdKey = `${output.resolved_prefix}/${runId}/000-policy-view/policy-rollout.rrd`;
+    cy.intercept("GET", `/api/artifacts/run/${output.run_ref}*`, (req) => {
+      const url = new URL(req.url);
+      expect(url.searchParams.get("project_id")).to.eq(projectId);
+      expect(url.searchParams.get("resource_bucket")).to.eq(bucket);
+      expect(url.searchParams.get("resolved_prefix")).to.eq(output.resolved_prefix);
+      expect(url.searchParams.get("source_selected")).to.eq("1");
+      req.alias = "consolidatedPrimaryArtifacts";
+      req.reply({
+        statusCode: 200,
+        body: {
+          ok: true,
+          ...output,
+          artifacts: [{ key: rrdKey, render: "rerun", role: "output", size: 4096 }],
+          count: 1,
+          truncated: false,
+          next_cursor: "",
+          pagination_complete: true,
+        },
+      });
+    });
+    cy.get("#stagesRunInput").clear().type(runId);
+    cy.get("#stagesRunSelect option").should("have.length", 2);
+    cy.get("#stagesLoadRun").click();
+    cy.wait("@consolidatedPrimaryArtifacts");
+  });
+
   it("merges every artifact page before globally preferring a later-page RRD", () => {
     const runId = "paginated-preference-run";
     const runRef = "npa1_paginated_preference";
@@ -1240,7 +1327,7 @@ describe("NPA agent UI with mocked APIs", () => {
     cy.get("#chatLog").should("contain.text", "Latest workflow status");
 
     cy.get("#tabRerun").click();
-    cy.get('#runIdSelect option[value="mock-run"][data-source-type="workflow_history"]').then(($opt) => {
+    cy.get('#runIdSelect option[value="cosmos-reason-run"][data-source-type="workflow_history"]').then(($opt) => {
       const select = $opt[0].parentElement;
       select.selectedIndex = [...select.options].indexOf($opt[0]);
       cy.wrap(select).trigger("change");
@@ -1248,7 +1335,7 @@ describe("NPA agent UI with mocked APIs", () => {
     cy.wait("@loadRun");
     cy.get("#tabMain").click();
     cy.get("#chatLog").should("contain.text", "Loaded run context");
-    cy.get("#runLog").should("contain.text", "mock run log");
+    cy.get("#runLog").should("contain.text", "generic workflow stages active");
     cy.get("#stagesPanel h3").should("have.text", "Stages");
 
     cy.get("#tabRerun").click();
@@ -2509,7 +2596,7 @@ describe("NPA agent UI with mocked APIs", () => {
     });
   });
 
-  it("keeps duplicate run basenames as separate source-qualified cards", () => {
+  it("consolidates duplicate same-bucket basenames onto the stronger exact source", () => {
     const RUN_ID = "duplicate-run";
     const REF_A = "npa1_source_a";
     const REF_B = "npa1_source_b";
@@ -2519,8 +2606,8 @@ describe("NPA agent UI with mocked APIs", () => {
         ok: true,
         contract: "s3-source-qualified-v1",
         runs: [
-          { run_id: RUN_ID, run_ref: REF_A, bucket: "mock", project_id: "project-local", resolved_prefix: "shared/category-a", source_prefix: "shared/category-a", has_viewable: true, artifact_count: 1 },
-          { run_id: RUN_ID, run_ref: REF_B, bucket: "mock", project_id: "project-local", resolved_prefix: "shared/category-b", source_prefix: "shared/category-b", has_viewable: true, artifact_count: 1 },
+          { run_id: RUN_ID, run_ref: REF_A, bucket: "mock", project_id: "project-local", resolved_prefix: "shared/category-a", source_prefix: "shared/category-a", has_viewable: true, summary_complete: true, artifact_count: 1 },
+          { run_id: RUN_ID, run_ref: REF_B, bucket: "mock", project_id: "project-local", resolved_prefix: "shared/category-b", source_prefix: "shared/category-b", has_viewable: true, summary_complete: true, artifact_count: 2 },
         ],
         total_runs: 2,
         truncated: false,
@@ -2549,8 +2636,9 @@ describe("NPA agent UI with mocked APIs", () => {
     cy.get("#artifactRefreshRuns").should("be.enabled").and("have.attr", "aria-busy", "false");
     cy.get("#runIdSelect option").should(($opts) => {
       const values = [...$opts].map((option) => option.value).filter(Boolean);
-      expect(values).to.include(REF_A);
       expect(values).to.include(REF_B);
+      expect(values).not.to.include(REF_A);
+      expect(values.filter((value) => value === REF_B)).to.have.length(1);
       expect(values.filter((value) => value === RUN_ID)).to.have.length(0);
     });
     cy.get("#runIdSelect").select(REF_B, { force: true });
@@ -2894,26 +2982,136 @@ describe("NPA agent UI with mocked APIs", () => {
     });
   });
 
-  it("falls back to 30 fps when captureStream(0) lacks requestFrame", () => {
+  it("primes the Rerun MediaStream bridge before the first non-preserved paint", () => {
+    cy.get("#tabRerun").click();
+    cy.window().then(async (win) => {
+      const api = win.__NPA_AGENT_TEST__;
+      const iframe = win.document.getElementById("rerunFrame");
+      iframe.hidden = false;
+      iframe.srcdoc = `<!doctype html><html><body><script>
+        const canvas = document.createElement("canvas");
+        canvas.width = 320;
+        canvas.height = 180;
+        document.body.appendChild(canvas);
+        const nativeCaptureStream = canvas.captureStream.bind(canvas);
+        const state = { painted: false, capturedBeforePaint: false };
+        canvas.captureStream = (rate) => {
+          if (!state.painted) state.capturedBeforePaint = true;
+          return nativeCaptureStream(rate);
+        };
+        window.__NPA_CAPTURE_LIFECYCLE__ = state;
+        window.setTimeout(() => {
+          state.painted = true;
+          const ctx = canvas.getContext("2d");
+          ctx.fillStyle = "#07111f";
+          ctx.fillRect(0, 0, canvas.width, canvas.height);
+          ctx.fillStyle = "#ff8a1f";
+          ctx.fillRect(35, 35, 110, 90);
+          ctx.fillStyle = "#5eead4";
+          ctx.fillRect(175, 55, 100, 75);
+        }, 1200);
+      <\/script></body></html>`;
+
+      const documentDeadline = Date.now() + 1500;
+      while (
+        Date.now() < documentDeadline
+        && !iframe.contentWindow.__NPA_CAPTURE_LIFECYCLE__
+      ) {
+        await new Promise((resolve) => setTimeout(resolve, 20));
+      }
+      api.primeRerunCaptureBridge(iframe, 3000);
+      const deadline = Date.now() + 2500;
+      while (
+        Date.now() < deadline
+        && !(iframe.contentWindow.__NPA_CAPTURE_LIFECYCLE__ || {}).painted
+      ) {
+        await new Promise((resolve) => setTimeout(resolve, 40));
+      }
+      const lifecycle = iframe.contentWindow.__NPA_CAPTURE_LIFECYCLE__;
+      expect(lifecycle, "lifecycle fixture").to.exist;
+      expect(lifecycle.capturedBeforePaint, "stream armed before first paint").to.eq(true);
+      const grabbed = await api.grabFromRerunCaptureBridge(3000, { forceRestart: false });
+      expect(grabbed).to.match(/^data:image\/jpeg;base64,/);
+      expect(grabbed.length).to.be.greaterThan(1000);
+    });
+  });
+
+  it("keeps priming when Rerun replaces a decoded loading canvas", () => {
+    cy.get("#tabRerun").click();
+    cy.window().then(async (win) => {
+      const api = win.__NPA_AGENT_TEST__;
+      const iframe = win.document.getElementById("rerunFrame");
+      iframe.hidden = false;
+      iframe.srcdoc = `<!doctype html><html><body><script>
+        const state = { initialCaptured: false, replacementCaptured: false };
+        const paint = (canvas, color) => {
+          canvas.width = 320;
+          canvas.height = 180;
+          const ctx = canvas.getContext("2d");
+          ctx.fillStyle = color;
+          ctx.fillRect(0, 0, canvas.width, canvas.height);
+          ctx.fillStyle = "#5eead4";
+          ctx.fillRect(170, 45, 110, 85);
+        };
+        const initial = document.createElement("canvas");
+        const initialCapture = initial.captureStream.bind(initial);
+        initial.captureStream = (rate) => {
+          state.initialCaptured = true;
+          return initialCapture(rate);
+        };
+        document.body.appendChild(initial);
+        paint(initial, "#07111f");
+        window.__NPA_CAPTURE_REPLACEMENT__ = state;
+        window.setTimeout(() => {
+          const replacement = document.createElement("canvas");
+          const replacementCapture = replacement.captureStream.bind(replacement);
+          replacement.captureStream = (rate) => {
+            state.replacementCaptured = true;
+            return replacementCapture(rate);
+          };
+          initial.replaceWith(replacement);
+          paint(replacement, "#ff8a1f");
+        }, 700);
+      <\/script></body></html>`;
+
+      const documentDeadline = Date.now() + 1500;
+      while (
+        Date.now() < documentDeadline
+        && !iframe.contentWindow.__NPA_CAPTURE_REPLACEMENT__
+      ) {
+        await new Promise((resolve) => setTimeout(resolve, 20));
+      }
+      api.primeRerunCaptureBridge(iframe, 2200);
+      const replacementDeadline = Date.now() + 1800;
+      while (
+        Date.now() < replacementDeadline
+        && !(iframe.contentWindow.__NPA_CAPTURE_REPLACEMENT__ || {}).replacementCaptured
+      ) {
+        await new Promise((resolve) => setTimeout(resolve, 40));
+      }
+      const lifecycle = iframe.contentWindow.__NPA_CAPTURE_REPLACEMENT__;
+      expect(lifecycle.initialCaptured, "loading canvas stream").to.eq(true);
+      expect(lifecycle.replacementCaptured, "replacement canvas stream").to.eq(true);
+      const grabbed = await api.grabFromRerunCaptureBridge(3000, { forceRestart: false });
+      expect(grabbed).to.match(/^data:image\/jpeg;base64,/);
+      expect(grabbed.length).to.be.greaterThan(1000);
+    });
+  });
+
+  it("keeps the primed Rerun bridge continuous across later canvas paints", () => {
     cy.window().then((win) => {
       const api = win.__NPA_AGENT_TEST__;
       const rates = [];
-      const stopped = cy.stub();
-      const fallback = { getVideoTracks: () => [{ requestFrame() {} }], getTracks: () => [] };
-      const partial = {
-        getVideoTracks: () => [{}],
-        getTracks: () => [{ stop: stopped }],
-      };
+      const continuous = { getVideoTracks: () => [{}], getTracks: () => [] };
       const canvas = {
         captureStream(rate) {
           rates.push(rate);
-          return rate === 0 ? partial : fallback;
+          return continuous;
         },
       };
 
-      expect(api.captureStreamWithFrameFallback(canvas)).to.eq(fallback);
-      expect(rates).to.deep.eq([0, 30]);
-      expect(stopped).to.have.been.calledOnce;
+      expect(api.captureStreamWithFrameFallback(canvas)).to.eq(continuous);
+      expect(rates).to.deep.eq([30]);
     });
   });
 

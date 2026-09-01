@@ -52,6 +52,18 @@ def test_per_env_from_distances_scoring():
     assert rows[0]["details"]["object_goal_distance_m"] == 0.0
 
 
+def test_manipulator_contact_rejects_table_force_without_reach() -> None:
+    ee_distance = np.array([0.20, 0.02, 0.02])
+    force_contact = np.array([True, False, True])
+
+    assert ev.manipulator_contact_signal(ee_distance, force_contact).tolist() == [
+        False,
+        False,
+        True,
+    ]
+    assert ev.manipulator_contact_signal(ee_distance).tolist() == [False, True, True]
+
+
 def test_build_isaac_eval_job_manifest_shape():
     m = ev.build_isaac_eval_job_manifest(
         job_name="s2r-byo-isaac-eval-run1",
@@ -158,6 +170,28 @@ def test_eval_manifest_rejects_oversized_embedded_scenarios():
             gpu_product="NVIDIA-RTX-PRO-6000-Blackwell-Server-Edition",
             scenarios_jsonl="x" * (ev._MAX_EMBEDDED_SCENARIOS_BYTES + 1),
         )
+
+
+def test_eval_manifest_materializes_embedded_scenarios_without_argv_payload():
+    manifest = ev.build_isaac_eval_job_manifest(
+        job_name="j",
+        run_id="r",
+        image="reg/npa-isaac-lab:tag",
+        task="Isaac-Lift-Cube-Franka-v0",
+        num_envs=2,
+        checkpoint_uri="s3://b/model.pt",
+        per_env_s3_uri="s3://b/out.json",
+        s3_endpoint="https://s3.example",
+        namespace="default",
+        service_account="agent-sa",
+        gpu_product="NVIDIA-RTX-PRO-6000-Blackwell-Server-Edition",
+        scenarios_jsonl='{"scenario_config_digest":"digest"}\n',
+    )
+    script = _manifest_script(manifest)
+
+    assert "base64 --decode > /tmp/evalwork/scenarios.jsonl" in script
+    assert "NPA_EVAL_SCENARIOS_B64" in script
+    assert "--payload" not in script
 
 
 def test_publish_eval_scenarios_is_content_addressed():

@@ -122,6 +122,55 @@ def test_leisaac_dockerfile_removes_parent_imageio_ffmpeg_payload() -> None:
     assert 'test ! -e /home/"${NPA_RUNTIME_USER}"/.cache' in dockerfile
 
 
+def test_shared_isaac_runtime_uses_system_ffmpeg_without_bundled_payload() -> None:
+    installer = (
+        REPO_ROOT
+        / "npa"
+        / "docker"
+        / "workbench"
+        / "common"
+        / "install_isaac_runtime_base.sh"
+    ).read_text(encoding="utf-8")
+
+    assert "  ffmpeg \\\n" in installer
+    assert "*/imageio_ffmpeg/binaries/ffmpeg*" in installer
+    assert "imageio_ffmpeg.get_ffmpeg_exe()" in installer
+    assert "--no-binary imageio-ffmpeg" in installer
+    assert "IMAGEIO_FFMPEG_EXE=/usr/bin/ffmpeg" in installer
+    assert '!= "/usr/bin/ffmpeg"' in installer
+
+
+def test_blackwell_envgen_chain_uses_system_ffmpeg_without_bundled_payload() -> None:
+    paths = (
+        REPO_ROOT / "npa" / "docker" / "workbench" / "base" / "cuda13-b300" / "Dockerfile",
+        REPO_ROOT / "npa" / "docker" / "workbench" / "genesis" / "Dockerfile.sm120",
+        REPO_ROOT / "npa" / "docker" / "workbench" / "sim2real-envgen" / "Dockerfile",
+    )
+    for path in paths:
+        dockerfile = path.read_text(encoding="utf-8")
+        assert "IMAGEIO_FFMPEG_EXE=/usr/bin/ffmpeg" in dockerfile
+        assert "*/imageio_ffmpeg/binaries/ffmpeg*" in dockerfile
+        assert "get_ffmpeg_exe()" in dockerfile
+        assert '== "/usr/bin/ffmpeg"' in dockerfile
+    envgen = paths[-1].read_text(encoding="utf-8")
+    assert "python -m pip uninstall -y npa" in envgen
+    assert "pip install --no-deps -e /opt/npa" not in envgen
+
+
+def test_isaac_lab_dockerfile_excludes_bundled_imageio_ffmpeg_payload() -> None:
+    dockerfile = (
+        REPO_ROOT / "npa" / "docker" / "workbench" / "isaac-lab" / "Dockerfile"
+    ).read_text(encoding="utf-8")
+    assert "IMAGEIO_FFMPEG_EXE=/usr/bin/ffmpeg" in dockerfile
+    runtime_base_layer = dockerfile.split(
+        "COPY --chmod=0755 docker/workbench/isaac-lab/npa_cli.sh", 1
+    )[0].rsplit("RUN ", 1)[1]
+    assert "apt-get install -y --no-install-recommends ffmpeg" in runtime_base_layer
+    assert "*/imageio_ffmpeg/binaries/ffmpeg*" in runtime_base_layer
+    assert "-delete" in runtime_base_layer
+    assert "imageio_ffmpeg.get_ffmpeg_exe()" in runtime_base_layer
+
+
 @pytest.mark.parametrize("path", PAYLOAD_PATHS)
 def test_scanner_flags_real_kit_payload(path: str) -> None:
     why = scanner.classify_path(path)
@@ -266,6 +315,66 @@ def test_oci_layout_tarball_scans_root_level_blob_layers(tmp_path: Path) -> None
 
     assert "isaac-sim/kit/libcarb.so" in paths
     assert scanner.classify_path(paths[0])
+
+
+def test_streamed_docker_save_scans_nested_layers_without_seek() -> None:
+    layer_stream = io.BytesIO()
+    with tarfile.open(fileobj=layer_stream, mode="w") as layer:
+        member = tarfile.TarInfo("isaac-sim/kit/libcarb.so")
+        member.size = 3
+        layer.addfile(member, io.BytesIO(b"kit"))
+    image_stream = io.BytesIO()
+    with tarfile.open(fileobj=image_stream, mode="w") as outer:
+        payload = layer_stream.getvalue()
+        member = tarfile.TarInfo("blobs/sha256/exact-layer")
+        member.size = len(payload)
+        outer.addfile(member, io.BytesIO(payload))
+    image_stream.seek(0)
+
+    paths = list(scanner._iter_saved_image(image_stream, mode="r|*"))
+
+    assert "isaac-sim/kit/libcarb.so" in paths
+
+
+def test_local_docker_scan_combines_streamed_layers_and_history(monkeypatch) -> None:
+    monkeypatch.setattr(
+        scanner,
+        "_iter_docker_save",
+        lambda image: iter(["isaac-sim/kit/libcarb.so"]),
+    )
+    monkeypatch.setattr(
+        scanner,
+        "_local_image_history",
+        lambda image: ["RUN pip install isaacsim==6.0.1.0"],
+    )
+
+    report = scanner.scan(None, None, docker_image="local:test")
+
+    assert report.source == "local-docker-stream"
+    assert report.entries_scanned == 1
+    assert report.payload_hits
+    assert report.history_hits
+
+
+def test_local_docker_history_only_skips_filesystem_export(monkeypatch) -> None:
+    monkeypatch.setattr(
+        scanner,
+        "_iter_docker_save",
+        lambda image: pytest.fail("history-only must not run docker save"),
+    )
+    monkeypatch.setattr(
+        scanner,
+        "_local_image_history",
+        lambda image: ["RUN pip install isaacsim==6.0.1.0"],
+    )
+
+    report = scanner.scan(None, None, docker_image="local:test", history_only=True)
+
+    assert report.source == "local-docker-stream"
+    assert report.history_only is True
+    assert report.entries_scanned == 0
+    assert report.history_hits
+    assert not report.clean
 
 
 # --------------------------------------------------------------------------------------
@@ -540,19 +649,61 @@ def test_registry_export_failure_is_fatal_after_a_valid_partial_tar(
     """A truncated export must never become a clean redistribution report."""
 
     class FailedExport:
-        stdout = _empty_tar_stream()
+        def __init__(self) -> None:
+            self.stdout = _empty_tar_stream()
 
         @staticmethod
         def wait() -> int:
             return 17
 
     monkeypatch.setattr(scanner, "_require", lambda _tool: "/usr/bin/crane")
+    calls = 0
+
+    def failed_export(*_args, **_kwargs):
+        nonlocal calls
+        calls += 1
+        return FailedExport()
+
     monkeypatch.setattr(
-        scanner.subprocess, "Popen", lambda *_args, **_kwargs: FailedExport()
+        scanner.subprocess, "Popen", failed_export
     )
+    monkeypatch.setattr(scanner.time, "sleep", lambda _seconds: None)
 
     with pytest.raises(subprocess.CalledProcessError, match="exit status 17"):
         list(scanner._iter_crane_export("registry.example/image:tag"))
+    assert calls == 4
+
+
+def test_registry_export_retry_deduplicates_partial_paths(monkeypatch) -> None:
+    partial = io.BytesIO()
+    with tarfile.open(fileobj=partial, mode="w") as archive:
+        member = tarfile.TarInfo("opt/shared")
+        member.size = 0
+        archive.addfile(member)
+    partial.seek(0)
+
+    complete = io.BytesIO()
+    with tarfile.open(fileobj=complete, mode="w") as archive:
+        for name in ("opt/shared", "opt/final"):
+            member = tarfile.TarInfo(name)
+            member.size = 0
+            archive.addfile(member)
+    complete.seek(0)
+
+    processes = iter(
+        (
+            SimpleNamespace(stdout=partial, wait=lambda: 17),
+            SimpleNamespace(stdout=complete, wait=lambda: 0),
+        )
+    )
+    monkeypatch.setattr(scanner, "_require", lambda _tool: "/usr/bin/crane")
+    monkeypatch.setattr(scanner.subprocess, "Popen", lambda *_args, **_kwargs: next(processes))
+    monkeypatch.setattr(scanner.time, "sleep", lambda _seconds: None)
+    monkeypatch.setattr(scanner, "_image_history", lambda _image: ([], "sha256:" + "a" * 64))
+
+    report = scanner.scan("registry.example/image:tag", None)
+
+    assert report.entries_scanned == 2
 
 
 def test_registry_config_failure_is_fatal(monkeypatch) -> None:

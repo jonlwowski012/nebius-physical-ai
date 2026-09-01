@@ -4,6 +4,7 @@ Use the single canonical spec and complete the operator runbook before submit:
 
 - [onboarding, preflight, submit, and remediation](../../../../docs/workbench/guides/sim2real-workflow.md)
 - [data and customer-asset contracts](../../../../docs/workbench/guides/sim2real-customer-assets.md)
+- [canonical RobotSpec and URDF example](../../../../docs/workbench/guides/sim2real-robot-spec.md)
 - [architecture and durable resume](../../../../docs/architecture/sim2real-compositional-workflow.md)
 
 Configured operators submit through the standard durable runtime:
@@ -13,22 +14,23 @@ npa workbench workflow submit \
   npa/workflows/workbench/npa-workflows/sim2real.yaml \
   --runtime --run-id <run-id> \
   --var bucket=<bucket> \
+  --var robot_spec_uri=<exact-s3-object-or-empty> \
   --var controller_image=<immutable-ref> \
   --var transfer_image=<immutable-ref> \
   --var envgen_image=<immutable-ref> \
-  --var reason_image=<immutable-ref> \
   --var isaac_image=<immutable-ref> \
   --var viewer_image=<immutable-ref> \
   --var isaac_cache_pvc=<bound-rwx-pvc> \
   --secret-env AWS_ACCESS_KEY_ID \
   --secret-env AWS_SECRET_ACCESS_KEY \
-  --secret-env HF_TOKEN
+  --secret-env HF_TOKEN \
+  --secret-env NEBIUS_TOKEN_FACTORY_KEY
 ```
 
 The YAML exposes all 14 stages and runs through the standard workflow runtime.
 Each real solution has its own image/resource state, S3 inputs and outputs, and
-ComponentRecord. Parallel Stage 4/8 leaves publish attributable lane records,
-and their barrier consumers own the canonical aggregate record. Stage 11 early
+ComponentRecord. Parallel Stage 4 leaves publish attributable lane records;
+Stage 8 is one CPU-only hosted Cosmos3 evaluator with a direct Stage 9 barrier. Stage 11 early
 exit is explicit (`allow_early_exit`), Stage 13/14 use the completed loop
 iteration, shard cardinality is validated before submission, and visualization
 downloads only its declared artifact set into cleaned ephemeral storage.

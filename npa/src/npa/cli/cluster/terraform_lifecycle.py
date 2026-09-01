@@ -301,6 +301,14 @@ def up_cmd(
             "reservation selection. Equivalent to TF_VAR_capacity_block_group."
         ),
     ),
+    infiniband_fabric: str = typer.Option(
+        "",
+        "--infiniband-fabric",
+        help=(
+            "InfiniBand fabric required by NVSwitch GPU clusters "
+            "(overrides TF_VAR_infiniband_fabric)."
+        ),
+    ),
     gpu_nodes: int = typer.Option(
         -1,
         "--gpu-nodes",
@@ -535,8 +543,9 @@ def up_cmd(
                 else None
             ),
             enable_gpu_cluster=_tfvar_bool(tfvars, env, "enable_gpu_cluster", False),
-            infiniband_fabric=str(
-                _tfvar_value(tfvars, env, "infiniband_fabric", "") or ""
+            infiniband_fabric=(
+                infiniband_fabric.strip()
+                or str(_tfvar_value(tfvars, env, "infiniband_fabric", "") or "")
             ),
             enable_filestore=(
                 _tfvar_bool(tfvars, env, "enable_filestore", False)
@@ -544,6 +553,12 @@ def up_cmd(
             ),
             existing_filestore=str(
                 _tfvar_value(tfvars, env, "existing_filestore", "") or ""
+            ),
+            filesystem_csi_chart_repository=str(
+                _tfvar_value(
+                    tfvars, env, "filesystem_csi_chart_repository", ""
+                )
+                or ""
             ),
             subnet_id=str(_tfvar_value(tfvars, env, "subnet_id", "") or ""),
             filestore_disk_size_gibibytes=int(
@@ -771,6 +786,7 @@ def up_cmd(
             # explicitly so `--capacity-block-group` is not silently dropped by a
             # `capacity_block_group = ""` line in a checked-in tfvars file.
             *_capacity_block_group_var_args(capacity_block_group),
+            *_string_var_args("infiniband_fabric", infiniband_fabric),
             *_string_var_args(
                 "cluster_name", str(tfvars.get("cluster_name") or "npa-cluster")
             ),
@@ -2644,7 +2660,19 @@ def _preflight_filestore_quota(
     existing_filestore = str(
         _tfvar_value(tfvars, env, "existing_filestore", "") or ""
     ).strip()
-    if not enable_filestore or existing_filestore:
+    if not enable_filestore and not existing_filestore:
+        return
+    chart_repository = str(
+        _tfvar_value(tfvars, env, "filesystem_csi_chart_repository", "") or ""
+    ).strip()
+    if not chart_repository:
+        raise typer.BadParameter(
+            "Shared filesystem CSI requires filesystem_csi_chart_repository when "
+            "enable_filestore or existing_filestore is set. Supply the operator-approved "
+            "Helm repository through terraform.tfvars or "
+            "TF_VAR_filesystem_csi_chart_repository before running apply."
+        )
+    if existing_filestore:
         return
     tenant_id = str(_tfvar_value(tfvars, env, "tenant_id", "") or "").strip()
     region = str(_tfvar_value(tfvars, env, "region", "") or "").strip()

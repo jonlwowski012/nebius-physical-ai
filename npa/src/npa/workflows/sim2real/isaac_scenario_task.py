@@ -26,6 +26,32 @@ EXPECTED_LIGHT_INTENSITY = 3000.0
 STABLE_PLACEMENT_DISTANCE_M = 0.05
 STABLE_PLACEMENT_SPEED_MPS = 0.03
 STABLE_PLACEMENT_STEPS = 3
+# A real nine-pass Franka run drove deterministic held-out reach from 0/64 to
+# 64/64 while contact stayed 0/64 throughout. PPO's sampled training episodes
+# still reported lift reward, but the actor mean kept the binary gripper open.
+# Install the already-proven robot-agnostic grasp terms on the stock scenario
+# task as well: closure is rewarded only near the object, and lift intent remains
+# gated by near + closed so raising an empty hand cannot retain the signal.
+GRASP_CLOSURE_REWARD_WEIGHT = 16.0
+GRASP_CLOSURE_STD_M = 0.06
+GRASP_LIFT_ATTEMPT_REWARD_WEIGHT = 32.0
+GRASP_LIFT_ATTEMPT_STD_M = 0.05
+# The first real stock-Franka run with the grasp precursors converted 0/64
+# contact into 64/64 contact and 53/64 stable grasps, but deterministic rollouts
+# repeatedly stopped at 0.040-0.044 m object lift.  The stock Lift reward is a
+# step at its minimal-height boundary, so the last centimetre before the strict
+# 5 cm evaluator threshold still had no object-space gradient.  Reuse the
+# existing robot-agnostic continuous object-height term on the stock task.  Its
+# weight matches the lift-attempt precursor: the hand signal bootstraps motion,
+# then real object displacement—not a scripted action—must retain the reward.
+STOCK_DENSE_LIFT_REWARD_WEIGHT = 32.0
+STOCK_DENSE_LIFT_STD_M = 0.08
+STOCK_GRIPPER_JOINT_NAMES = (
+    "panda_finger_joint1",
+    "panda_finger_joint2",
+)
+STOCK_GRIPPER_OPEN_POSITION = 0.04
+STOCK_GRIPPER_CLOSED_POSITION = 0.0
 # The first validation canary learned reach/contact and 2/3 grasp+lift, but the
 # closest goal distance remained 0.205-0.364 m.  A 0.15 m tanh scale multiplied
 # by weight 8 is effectively flat at that boundary, so lifting remains the much
@@ -213,6 +239,25 @@ def scenario_contract_summary(rows: list[dict[str, Any]]) -> dict[str, Any]:
     }
 
 
+def scenario_assignment_indices(
+    *, count: int, row_count: int, cursor: int = 0, offset: int = 0
+) -> list[int]:
+    """Return a deterministic round-robin window over curated scenarios.
+
+    Reset callbacks can contain only a subset of vector environments.  Advancing
+    each environment independently can therefore revisit already-seen records
+    before the tail of the curated split is ever assigned.  A single monotonic
+    cursor guarantees complete coverage after ``row_count`` assignments while
+    retaining deterministic wraparound and an operator-selected offset.
+    """
+
+    if count < 0:
+        raise ValueError("scenario assignment count must be non-negative")
+    if row_count <= 0:
+        raise ValueError("scenario assignment requires at least one row")
+    return [int((cursor + offset + index) % row_count) for index in range(count)]
+
+
 def _ensure_runtime_buffers(env: Any, rows: list[dict[str, Any]]) -> None:
     import torch
 
@@ -220,11 +265,17 @@ def _ensure_runtime_buffers(env: Any, rows: list[dict[str, Any]]) -> None:
         env.npa_scenario_indices = torch.zeros(
             env.num_envs, dtype=torch.long, device=env.device
         )
-        env.npa_scenario_episode_counts = torch.zeros_like(env.npa_scenario_indices)
+        env.npa_scenario_assignment_cursor = 0
         env.npa_scenario_applied_counts = torch.zeros(
             len(rows), dtype=torch.long, device=env.device
         )
         env.npa_scenario_rows = rows
+    if not hasattr(env, "npa_scenario_assignment_cursor"):
+        env.npa_scenario_assignment_cursor = 0
+    if not hasattr(env, "npa_scenario_episode_counts"):
+        env.npa_scenario_episode_counts = torch.zeros(
+            env.num_envs, dtype=torch.long, device=env.device
+        )
     if not hasattr(env, "npa_stable_placement_steps"):
         env.npa_stable_placement_steps = torch.zeros(
             env.num_envs, dtype=torch.long, device=env.device
@@ -255,11 +306,18 @@ def _assign(env: Any, env_ids: Any, rows: list[dict[str, Any]]) -> Any:
     rotate = os.environ.get("NPA_SIM2REAL_SCENARIO_ROTATE_ON_RESET", "1") != "0"
     offset = int(os.environ.get("NPA_SIM2REAL_SCENARIO_OFFSET", "0") or 0)
     if rotate:
-        # A prime stride makes complete passes through non-prime split sizes while
-        # different vector env indices cover adjacent records in parallel.
-        scenario_ids = (
-            ids + offset + env.npa_scenario_episode_counts[ids] * 104729
-        ) % len(rows)
+        cursor = int(env.npa_scenario_assignment_cursor)
+        scenario_ids = torch.tensor(
+            scenario_assignment_indices(
+                count=int(ids.numel()),
+                row_count=len(rows),
+                cursor=cursor,
+                offset=offset,
+            ),
+            dtype=torch.long,
+            device=env.device,
+        )
+        env.npa_scenario_assignment_cursor = cursor + int(ids.numel())
         env.npa_scenario_episode_counts[ids] += 1
     else:
         scenario_ids = (ids + offset) % len(rows)
@@ -1027,6 +1085,45 @@ def install_env_cfg(env_cfg: Any) -> bool:
     )
     env_cfg.commands.object_pose.class_type = _scenario_command_type()
     env_cfg.commands.object_pose.resampling_time_range = (1.0e9, 1.0e9)
+    # The stock task's sparse lift reward did not teach the deterministic actor
+    # mean to close its gripper on the curated distribution. Reuse the same
+    # embodiment-aware shaping functions as BYO robots, with the stock Franka
+    # finger contract made explicit. Both terms are precursors only; strict
+    # placement remains the unchanged object-space verdict below.
+    import isaac_byo_robot_task as robot_task  # noqa: WPS433 - baked runtime module
+
+    env_cfg.rewards.grasp_closure_curriculum = RewardTermCfg(
+        func=robot_task.grasp_shaping,
+        weight=GRASP_CLOSURE_REWARD_WEIGHT,
+        params={
+            "std": GRASP_CLOSURE_STD_M,
+            "object_name": "object",
+            "ee_frame_name": "ee_frame",
+            "gripper_joint_names": STOCK_GRIPPER_JOINT_NAMES,
+            "gripper_open": STOCK_GRIPPER_OPEN_POSITION,
+            "gripper_close": STOCK_GRIPPER_CLOSED_POSITION,
+        },
+    )
+    env_cfg.rewards.grasp_lift_attempt_curriculum = RewardTermCfg(
+        func=robot_task.grasp_lift_hold,
+        weight=GRASP_LIFT_ATTEMPT_REWARD_WEIGHT,
+        params={
+            "std": GRASP_LIFT_ATTEMPT_STD_M,
+            "object_name": "object",
+            "ee_frame_name": "ee_frame",
+            "gripper_joint_names": STOCK_GRIPPER_JOINT_NAMES,
+            "gripper_open": STOCK_GRIPPER_OPEN_POSITION,
+            "gripper_close": STOCK_GRIPPER_CLOSED_POSITION,
+        },
+    )
+    env_cfg.rewards.dense_object_lift_curriculum = RewardTermCfg(
+        func=robot_task.object_lift_progress,
+        weight=STOCK_DENSE_LIFT_REWARD_WEIGHT,
+        params={
+            "std": STOCK_DENSE_LIFT_STD_M,
+            "object_name": "object",
+        },
+    )
     env_cfg.rewards.stable_placement_curriculum = RewardTermCfg(
         func=stable_placement_curriculum,
         weight=STABLE_PLACEMENT_REWARD_WEIGHT,
@@ -1148,6 +1245,15 @@ def install_env_cfg(env_cfg: Any) -> bool:
         json.dumps(
             {
                 **scenario_contract_summary(rows),
+                "grasp_curriculum": {
+                    "closure_reward_weight": GRASP_CLOSURE_REWARD_WEIGHT,
+                    "closure_std_m": GRASP_CLOSURE_STD_M,
+                    "lift_attempt_reward_weight": GRASP_LIFT_ATTEMPT_REWARD_WEIGHT,
+                    "lift_attempt_std_m": GRASP_LIFT_ATTEMPT_STD_M,
+                    "gripper_joint_names": list(STOCK_GRIPPER_JOINT_NAMES),
+                    "gripper_open_position": STOCK_GRIPPER_OPEN_POSITION,
+                    "gripper_closed_position": STOCK_GRIPPER_CLOSED_POSITION,
+                },
                 "placement_curriculum": {
                     "weight": STABLE_PLACEMENT_REWARD_WEIGHT,
                     "approach_std_m": PLACEMENT_APPROACH_STD_M,

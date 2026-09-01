@@ -32,6 +32,7 @@ from npa.cli.agent_workflow import (
     generate_workflow_yaml,
     plan_workflow_yaml_text,
     validate_workflow_yaml_text,
+    _TEMPLATES,
 )
 from npa.cli.main import app
 
@@ -439,7 +440,10 @@ def test_sim2real_staged_chat_parameters_validate_and_plan() -> None:
     assert spec["config"]["env_count"] == "12000"
     assert spec["config"]["threshold"] == "0.82"
     assert spec["config"]["task_id"] == "Isaac-Lift-Cube-Franka-v0"
-    assert len(spec["states"]) == 20
+    assert len(spec["states"]) == 24
+    assert "stage-08-cosmos3" in spec["states"]
+    assert "stage-08-wave" not in spec["states"]
+    assert "stage-08-reason2" not in spec["states"]
     assert "run-sim2real" not in spec["states"]
     validation = validate_workflow_yaml_text(workflow)
     assert validation["ok"] is True
@@ -521,7 +525,7 @@ def test_sim2real_named_text_and_clause_boundaries_are_exact() -> None:
         ("rollout length 3", "--steps-per-rollout", "3"),
         ("12 held-out environments", "--gold-count", "12"),
         ("5000 environments", "--env-count", "5000"),
-        ("2 envgen shards", "--shard-count", "2"),
+        ("8 envgen shards", "--shard-count", "8"),
         ("seed 9", "--seed", "9"),
         ("80% success threshold", "--threshold", "0.8"),
         ("75% train fraction", "--train-fraction", "0.75"),
@@ -551,7 +555,7 @@ def test_unsupported_envgen_shards_fail_draft_planning() -> None:
     )
     assert draft["plan"]["ok"] is False
     assert "parallelCount resolves to 16" in draft["plan"]["error"]
-    assert "declares 2 members" in draft["plan"]["error"]
+    assert "declares 8 members" in draft["plan"]["error"]
 
 
 @pytest.mark.parametrize(
@@ -1208,6 +1212,8 @@ def test_generate_isaac_byof_yaml_validates() -> None:
     assert result["ok"] is True, f"isaac-byof validate failed: {result.get('error')}"
     assert result["name"] == "byof"
     assert "<repo-url>" in yaml_text
+    assert "repo_auth: none" in yaml_text
+    assert "repo_token_env: GH_TOKEN" in yaml_text
     assert "base_profile: ubuntu" in yaml_text
     assert "byof-run" in set(result["states"])
 
@@ -1388,6 +1394,23 @@ def test_generate_workflow_draft_sets_not_runnable_when_plan_fails(monkeypatch) 
     assert draft["validation"]["ok"] is True
     assert draft["plan"]["ok"] is False
     assert draft["runnable"] is False
+
+
+def test_every_agent_template_toolref_resolves_catalog() -> None:
+    """Agent drafts must not surface retired or doc-only workflow toolRefs."""
+    from npa.orchestration.npa_workflow.catalog import TOOL_CATALOG
+
+    emitted = []
+    for template in _TEMPLATES:
+        spec = yaml.safe_load(generate_workflow_yaml(template))
+        emitted.extend(
+            state["toolRef"]
+            for state in spec["states"].values()
+            if "toolRef" in state
+        )
+
+    unknown = sorted(set(emitted) - set(TOOL_CATALOG))
+    assert unknown == []
 
 
 def test_generate_workflow_yaml_aliases() -> None:

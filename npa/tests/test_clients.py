@@ -156,6 +156,35 @@ def test_storage_client_uploads_and_downloads_directories(
     )
 
 
+@pytest.mark.parametrize(
+    "key",
+    [
+        "prefix/../../escape.txt",
+        "prefix/nested/../escape.txt",
+        "prefix/./escape.txt",
+        "prefix//tmp/escape.txt",
+        "prefix/nested\\escape.txt",
+        "other/escape.txt",
+    ],
+)
+def test_storage_client_rejects_unsafe_directory_object_keys(
+    tmp_path: Path, mock_s3, key: str
+) -> None:
+    paginator = mock_s3.get_paginator.return_value
+    paginator.paginate.return_value = [{"Contents": [{"Key": key}]}]
+    client = StorageClient(
+        endpoint_url="https://storage",
+        aws_access_key_id="key",
+        aws_secret_access_key="secret",
+    )
+
+    with pytest.raises(StorageError, match="outside|unsafe"):
+        client.download_directory("s3://bucket/prefix", str(tmp_path / "download"))
+
+    mock_s3.download_file.assert_not_called()
+    assert not (tmp_path / "escape.txt").exists()
+
+
 def test_storage_client_downloads_object_via_head_object_when_list_is_empty(
     tmp_path: Path, mock_s3
 ) -> None:
@@ -1240,6 +1269,8 @@ def test_nebius_bootstrap_uses_explicit_bucket_name(mocker) -> None:
         "chosen",
         max_size_bytes=123,
         default_storage_class="standard",
+        on_created=mocker.ANY,
+        allow_existing=True,
     )
 
 
@@ -1515,13 +1546,20 @@ def test_nebius_bootstrap_agent_environment_falls_back_on_permission_denied(
 
 
 def test_nebius_bucket_exists(mocker) -> None:
-    mocker.patch(
+    run_json = mocker.patch(
         "npa.clients.nebius._run_json",
-        return_value={"items": [{"metadata": {"name": "npa-bucket-abc"}}]},
+        side_effect=[
+            {"metadata": {"name": "npa-bucket-abc", "parent_id": "project"}},
+            nebius.NebiusError("NotFound: bucket does not exist"),
+        ],
     )
 
     assert nebius.bucket_exists("project", "npa-bucket-abc") is True
     assert nebius.bucket_exists("project", "other") is False
+    assert all(
+        call.args[0][:3] == ["storage", "bucket", "get-by-name"]
+        for call in run_json.call_args_list
+    )
 
 
 def test_cli_env_strips_stale_iam_token(monkeypatch) -> None:
@@ -1586,23 +1624,19 @@ def test_is_permission_denied_matches_access_denied() -> None:
     assert not nebius.is_permission_denied("NotFound: bucket missing")
 
 
-def test_nebius_bucket_list_paginates_with_all(mocker) -> None:
-    """Bucket existence checks must page past the CLI default.
-
-    Regression: an unpaged ``storage bucket list`` dropped existing buckets
-    beyond the first page, so ``bucket_exists`` returned False for a real
-    bucket and ``npa configure`` wrongly prompted for new-bucket storage class.
-    Uses ``--all`` (true pagination) for consistency with the other listers.
-    """
+def test_nebius_bucket_exact_lookup_does_not_enumerate_project(mocker) -> None:
     run_json = mocker.patch(
         "npa.clients.nebius._run_json",
-        return_value={"items": [{"metadata": {"name": "npa-bucket-abc"}}]},
+        return_value={
+            "metadata": {"name": "npa-bucket-abc", "parent_id": "project"}
+        },
     )
 
     assert nebius.bucket_exists("project", "npa-bucket-abc") is True
     args = run_json.call_args.args[0]
-    assert args[:3] == ["storage", "bucket", "list"]
-    assert "--all" in args, args
+    assert args[:3] == ["storage", "bucket", "get-by-name"]
+    assert args[args.index("--name") + 1] == "npa-bucket-abc"
+    assert "--all" not in args
 
 
 def test_nebius_ensure_bucket_reuses_existing_without_create(mocker) -> None:
@@ -1644,6 +1678,27 @@ def test_nebius_ensure_bucket_reuses_on_already_exists_conflict(mocker) -> None:
     )
 
     assert nebius.ensure_bucket("project", "npa-bucket-abc") == "npa-bucket-abc"
+
+
+def test_nebius_ensure_bucket_refuses_generated_name_create_race(mocker) -> None:
+    mocker.patch("npa.clients.nebius.bucket_exists", return_value=False)
+    mocker.patch(
+        "npa.clients.nebius._run",
+        side_effect=nebius.NebiusError("AlreadyExists: bucket exists"),
+    )
+    mocker.patch(
+        "npa.clients.nebius.get_bucket_by_name",
+        return_value={
+            "metadata": {"name": "npa-bucket-abc", "parent_id": "project"}
+        },
+    )
+
+    with pytest.raises(nebius.NebiusError, match="refusing to adopt"):
+        nebius.ensure_bucket(
+            "project",
+            "npa-bucket-abc",
+            allow_existing=False,
+        )
 
 
 def test_nebius_ensure_bucket_reports_clear_conflict_when_name_taken_elsewhere(
@@ -1957,6 +2012,47 @@ def test_nebius_public_ipv4_quota_best_effort_on_error(mocker) -> None:
 def test_nebius_public_ipv4_quota_requires_tenant_and_region() -> None:
     assert nebius.get_public_ipv4_quota("", "us-central1") == (None, None)
     assert nebius.get_public_ipv4_quota("tenant-x", "") == (None, None)
+
+
+def test_nebius_quota_reads_are_profile_scoped(mocker, monkeypatch) -> None:
+    """Quota reads must carry the selected profile like every other read here.
+
+    A tenant reachable only through a non-default profile answers
+    PermissionDenied without it. `list_quota_allowances` fails closed, so that
+    denial became "unverified mutation prerequisite" and blocked an agent deploy
+    the operator was entitled to make.
+    """
+    monkeypatch.setenv("NPA_NEBIUS_PROFILE", "other-tenant")
+    run_json = mocker.patch(
+        "npa.clients.nebius._run_json", return_value=_public_ip_quota_items()
+    )
+
+    nebius.get_public_ipv4_quota("tenant-x", "us-central1")
+    nebius.get_compute_instance_quota("tenant-x", "us-central1")
+    nebius.list_quota_allowances("tenant-x")
+
+    assert run_json.call_count == 3
+    for call in run_json.call_args_list:
+        argv = call.args[0]
+        assert argv[:2] == ["--profile", "other-tenant"], argv
+        # The profile is a global flag, so it must precede the subcommand.
+        assert argv[2:5] == ["quotas", "quota-allowance", "list"], argv
+
+    # An explicit profile overrides the ambient one.
+    nebius.list_quota_allowances("tenant-x", profile="explicit")
+    assert run_json.call_args_list[-1].args[0][:2] == ["--profile", "explicit"]
+
+
+def test_nebius_quota_reads_omit_profile_flag_when_unset(mocker, monkeypatch) -> None:
+    monkeypatch.delenv("NPA_NEBIUS_PROFILE", raising=False)
+    monkeypatch.delenv("NEBIUS_PROFILE", raising=False)
+    run_json = mocker.patch(
+        "npa.clients.nebius._run_json", return_value=_public_ip_quota_items()
+    )
+
+    nebius.list_quota_allowances("tenant-x")
+
+    assert run_json.call_args_list[-1].args[0][0] == "quotas"
 
 
 def _compute_instance_quota_items() -> dict:

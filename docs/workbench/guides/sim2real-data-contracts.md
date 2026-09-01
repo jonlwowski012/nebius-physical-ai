@@ -12,6 +12,7 @@ loop. Other guides link here instead of duplicating tables.
 | **[sim2real-workflow.md](./sim2real-workflow.md)** | Run the loop: quickstart, CLI, local smoke |
 | **This file** | What each artifact *is* (LeRobot vs NPA JSON vs media) |
 | **[sim2real-customer-assets.md](./sim2real-customer-assets.md)** | What the customer uploads (robot, scene, trigger) |
+| **[sim2real-robot-spec.md](./sim2real-robot-spec.md)** | Canonical RobotSpec contract, runnable URDF example, and proof artifacts |
 | **[sim2real-architecture.md](./sim2real-architecture.md)** | Standard-runtime control flow, parallel waves, loops, and resume |
 | **[sim2real-demo-script-10min.md](./sim2real-demo-script-10min.md)** | Presentation walkthrough |
 
@@ -45,10 +46,10 @@ policy rollouts.
 | --- | --- | --- | --- |
 | `NPA_SIM2REAL_TRIGGER_DATASET_URI` | Customer/operator | Task-aligned Isaac seed dataset plus `task-dataset-manifest.json`; PushT is incompatible with the default Franka lift task | 1 |
 | `ASSETS_URI`, `SCENE_SPEC_URI` | Customer (optional) | Meshes + optional `npa.sim2real.scene_spec.v1` | 2 |
-| `ROBOT_SPEC_URI`, `ROBOT_PRESET` | Customer (optional) | `npa.sim2real.robot_spec.v1` or preset name | 2 |
+| `config.robot_spec_uri` | Customer (optional) | Exact S3 object containing `npa.sim2real.robot_spec.v1`; empty is stock Franka | 2 |
 | `train_envs_uri` / `validation_envs_uri` / `gold_heldout_envs_uri` | **Workflow** | Curated, disjoint, stratified NPA scenario JSONL with task/config digests | 4–6 |
 | `actions/train/…` | Workflow / policy job | Rollout dirs + `npa.sim2real.action_rollout.v1` | 7 |
-| `vlm_eval/…` | Workflow / VLM job | `npa.sim2real.vlm_eval.v1` | 8 |
+| `vlm_eval/…` | Workflow / hosted Cosmos3 evaluator | `npa.sim2real.vlm_eval.v3` | 8 |
 | `training_signal/…` | Workflow | `npa.sim2real.rl_signal.v1` | 9 |
 | `eval/validation/outer-XX/iter-YY/report.json` | Workflow / eval job | Validation-only checkpoint comparison | 9 |
 | `eval/gold-heldout/outer-XX/report.json` | Workflow / eval job | Final untouched gold evaluation, `npa.sim2real.heldout_eval.v1` | 10 |
@@ -79,7 +80,7 @@ Every JSON artifact should include a top-level `"schema"` string. Constants live
 | `npa.sim2real.trigger.v1` | `stage_01_trigger/trigger.json` | 1 | Points at the task-aligned trigger URI and its verified seed provenance |
 | `npa.sim2real.task_contract.v1` | `stage_02_assets/task-contract.json` | 2 | Normalized task/data/embodiment/physics/camera/success contract and digest |
 | `npa.sim2real.consumed_scene_spec.v1` | `stage_02_assets/consumed_scene_spec.json` | 2 | Stock or BYO scene after materialization |
-| `npa.sim2real.consumed_robot_spec.v1` | `stage_02_assets/consumed_robot_spec.json` | 2 | Stock Franka or BYO / preset metadata |
+| `npa.sim2real.robot_contract.v1` | `stage_02_assets/consumed_robot_spec.json` | 2 | Stock marker or immutable BYO contract with embodiment/content digests and resolved-USD target |
 | `npa.sim2real.stock_scene_spec.v1` | (embedded in consumed scene) | 2 | Stock-only wrapper |
 | `npa.sim2real.stock_robot_spec.v1` | (embedded in consumed robot) | 2 | Stock-only wrapper |
 | `npa.sim2real.scene_spec.v1` | envgen / BYO input | 2–6 | Scene composition for envgen |
@@ -107,7 +108,7 @@ Every JSON artifact should include a top-level `"schema"` string. Constants live
 | `npa.sim2real.reference_actions.v1` | policy job output | 7 | Reference policy contract |
 | `npa.sim2real.actions_summary.v1` | policy job summary | 7 | |
 | `npa.sim2real.policy_image_contract.v1` | policy job metadata | 7 | |
-| `npa.sim2real.vlm_eval.v1` | `vlm_eval/…/*.json` | 8 | Per-rollout VLM critique |
+| `npa.sim2real.vlm_eval.v3` | `vlm_eval/…/*.json` | 8 | Per-rollout Cosmos3 critique with provider/backend, request IDs, tokens, latency, retries, and authoritative response cost or explicit null; v1/v2 remain read-compatible only in archived/legacy readers |
 | `npa.sim2real.rl_signal.v1` | `training_signal/…/*.json` | 9 | Converted RL training signal |
 | `npa.sim2real.inner_loop_evidence.v1` | `inner_loop/outer-XX/evidence.json` | 9 | Reward trend, trainer deltas |
 
@@ -136,7 +137,7 @@ schemas above on stdout files:
 
 | Hook | Reads | Writes |
 | --- | --- | --- |
-| `BYO_VLM_COMMAND` | Rollout dir + manifest | `npa.sim2real.vlm_eval.v1` |
+| `BYO_VLM_COMMAND` | Rollout dir + manifest | `npa.sim2real.vlm_eval.v2` |
 | `BYO_SIGNAL_CONVERTER` | VLM eval JSON | `npa.sim2real.rl_signal.v1` |
 | `BYO_TRAINER_COMMAND` | Signal batch JSON | Trainer update JSON (see policy_container) |
 | `BYO_EVAL_COMMAND` | Held-out env list | `npa.sim2real.heldout_eval.v1` |
@@ -149,6 +150,7 @@ schemas above on stdout files:
 ```text
 # INPUT (customer)
 s3://<bucket>/sim2real-triggers/<run-id>/<task>/           # task-aligned seed dataset + manifest
+# explicit public preset: <task> = public-franka-lift; staged at runtime, never vendored
 
 # OPTIONAL BYO (customer)
 s3://<bucket>/sim2real-assets/<task>/                       # meshes, scene-spec.json, robot-spec.json
