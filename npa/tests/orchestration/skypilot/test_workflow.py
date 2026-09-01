@@ -288,6 +288,19 @@ def test_local_api_daemon_probe_finds_deleted_executor_cwd(tmp_path) -> None:
     assert "1 of 2" in result.error
 
 
+def test_local_api_daemon_probe_is_unsupported_without_procfs(tmp_path) -> None:
+    """macOS has no /proc: cannot-assess must not block every Darwin submit."""
+
+    result = workflow_module._probe_local_api_daemon_cwd(
+        str(tmp_path / "venv" / "bin" / "sky"),
+        proc_root=tmp_path / "no-such-proc",
+        uid=1234,
+    )
+
+    assert result.healthy is True
+    assert result.outcome == "procfs_unsupported"
+
+
 def test_local_api_daemon_probe_accepts_durable_process_tree(tmp_path) -> None:
     proc_root = tmp_path / "proc"
     bin_dir = tmp_path / "venv" / "bin"

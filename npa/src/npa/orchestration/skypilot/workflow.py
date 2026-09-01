@@ -235,6 +235,12 @@ def _probe_local_api_daemon_cwd(
     rsync, so every cwd in the local server process tree must remain resolvable.
     """
 
+    if not proc_root.exists():
+        # No procfs on this platform (macOS operator workstations): the
+        # poisoned-cwd inspection is Linux-only. Cannot-assess is not
+        # unhealthy — blocking here would fail every submit from Darwin, where
+        # this failure mode was never detectable in the first place.
+        return ApiDaemonCwdProbe(True, "procfs_unsupported")
     expected_uid = os.getuid() if uid is None else uid
     try:
         caller_mount_namespace = os.readlink(proc_root / "self" / "ns" / "mnt")
