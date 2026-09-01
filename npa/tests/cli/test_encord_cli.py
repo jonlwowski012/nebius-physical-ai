@@ -11,6 +11,7 @@ from typer.testing import CliRunner
 import npa.clients.credentials as credentials_module
 from npa.cli.main import app
 from npa.workbench.encord.schemas import (
+    CurateReceipt,
     EncordToolError,
     PullManifest,
     PushReceipt,
@@ -62,10 +63,30 @@ def _manifest(**overrides) -> PullManifest:
     return PullManifest(**payload)
 
 
+def _curate_receipt(**overrides) -> CurateReceipt:
+    payload = dict(
+        generated_at="2026-08-24T00:00:00+00:00",
+        encord_domain="https://api.encord.com",
+        folder_uuid="00000000-0000-0000-0000-000000000001",
+        folder_name="src",
+        collection_uuid="00000000-0000-0000-0000-0000000000c8",
+        collection_name="keepers",
+        collection_created=True,
+        preset_uuid="00000000-0000-0000-0000-00000000012c",
+        preset_name="npa-curate-run-1",
+        items_selected=2,
+        status="done",
+        receipt_uri="s3://bkt/curate/curate_receipt.json",
+    )
+    payload.update(overrides)
+    return CurateReceipt(**payload)
+
+
 def test_encord_group_registered() -> None:
     result = runner.invoke(app, ["workbench", "encord", "--help"])
     assert result.exit_code == 0
     assert "push" in result.output and "pull" in result.output
+    assert "curate" in result.output
 
 
 def test_push_help_contains_contract_options() -> None:
@@ -143,6 +164,151 @@ def test_push_tool_error_exits_nonzero(monkeypatch: pytest.MonkeyPatch) -> None:
     )
     assert result.exit_code == 1
     assert "unit error" in result.output
+
+
+def test_curate_help_contains_contract_options() -> None:
+    result = runner.invoke(app, ["workbench", "encord", "curate", "--help"])
+    assert result.exit_code == 0
+    for option in ("folder", "filter", "collection", "output-path", "poll-seconds"):
+        assert option in result.output
+
+
+def test_curate_happy_path_json(monkeypatch: pytest.MonkeyPatch) -> None:
+    captured: dict = {}
+
+    def fake_curate(**kwargs):
+        captured.update(kwargs)
+        return _curate_receipt()
+
+    monkeypatch.setattr("npa.sdk.workbench.encord.curate", fake_curate)
+    result = runner.invoke(
+        app,
+        [
+            "workbench", "encord", "curate",
+            "--folder", "src",
+            "--filter", "brightness:0.2:0.8,sharpness:0.3:1",
+            "--filter", "width:32:4096",
+            "--collection", "keepers",
+            "--output-path", "s3://bkt/curate/",
+            "--workflow-run", "run-1",
+            "--output", "json",
+        ],
+    )
+    assert result.exit_code == 0, result.output
+    payload = json.loads(result.output)
+    assert payload["schema"] == "npa.encord.curate_receipt.v1"
+    assert captured["folder"] == "src"
+    assert captured["filters"] == ["brightness:0.2:0.8,sharpness:0.3:1", "width:32:4096"]
+    assert captured["collection"] == "keepers"
+    assert captured["workflow_run"] == "run-1"
+
+
+def test_curate_text_output(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setattr(
+        "npa.sdk.workbench.encord.curate", lambda **kwargs: _curate_receipt()
+    )
+    result = runner.invoke(
+        app,
+        [
+            "workbench", "encord", "curate",
+            "--folder", "src",
+            "--filter", "width:1:100000",
+            "--collection", "keepers",
+            "--output-path", "s3://bkt/curate/",
+            "--output", "text",
+        ],
+    )
+    assert result.exit_code == 0, result.output
+    assert "curated 2 item(s)" in result.output
+
+
+def test_curate_rejects_local_output_path() -> None:
+    result = runner.invoke(
+        app,
+        [
+            "workbench", "encord", "curate",
+            "--folder", "src",
+            "--filter", "width:1:100000",
+            "--collection", "keepers",
+            "--output-path", "/tmp/out",
+        ],
+    )
+    assert result.exit_code == 1
+
+
+def test_curate_tool_error_exits_nonzero(monkeypatch: pytest.MonkeyPatch) -> None:
+    def fake_curate(**kwargs):
+        raise EncordToolError("Encord curate selected 0 items.")
+
+    monkeypatch.setattr("npa.sdk.workbench.encord.curate", fake_curate)
+    result = runner.invoke(
+        app,
+        [
+            "workbench", "encord", "curate",
+            "--folder", "src",
+            "--filter", "brightness:0.2:0.8",
+            "--collection", "keepers",
+            "--output-path", "s3://bkt/curate/",
+        ],
+    )
+    assert result.exit_code == 1
+    assert "selected 0 items" in result.output
+
+
+def test_verify_happy_and_failure_paths(monkeypatch: pytest.MonkeyPatch) -> None:
+    from npa.workbench.encord.schemas import RoundtripReport
+
+    def fake_verify(**kwargs):
+        return RoundtripReport(
+            generated_at="t",
+            receipt_uri=kwargs["receipt_uri"],
+            manifest_uri=kwargs["manifest_uri"],
+            report_uri="s3://bkt/verify/roundtrip_report.json",
+            status="passed",
+            expected=2,
+            matched=2,
+            checksum_verified=2,
+        )
+
+    monkeypatch.setattr("npa.sdk.workbench.encord.verify", fake_verify)
+    result = runner.invoke(
+        app,
+        [
+            "workbench", "encord", "verify",
+            "--receipt-uri", "s3://bkt/push/push_receipt.json",
+            "--manifest-uri", "s3://bkt/pull/manifest.json",
+            "--output-path", "s3://bkt/verify/",
+            "--output", "text",
+        ],
+    )
+    assert result.exit_code == 0, result.output
+    assert "roundtrip passed: 2/2 matched" in result.output
+
+    def failing_verify(**kwargs):
+        raise EncordToolError("Encord roundtrip verification failed: 1 missing")
+
+    monkeypatch.setattr("npa.sdk.workbench.encord.verify", failing_verify)
+    result = runner.invoke(
+        app,
+        [
+            "workbench", "encord", "verify",
+            "--receipt-uri", "s3://bkt/push/push_receipt.json",
+            "--manifest-uri", "s3://bkt/pull/manifest.json",
+            "--output-path", "s3://bkt/verify/",
+        ],
+    )
+    assert result.exit_code == 1 and "1 missing" in result.output
+    # local paths violate the contract
+    result = runner.invoke(
+        app,
+        [
+            "workbench", "encord", "verify",
+            "--receipt-uri", "/tmp/push_receipt.json",
+            "--manifest-uri", "s3://bkt/pull/manifest.json",
+            "--output-path", "s3://bkt/verify/",
+        ],
+    )
+    assert result.exit_code == 1
 
 
 def test_pull_happy_path_text(monkeypatch: pytest.MonkeyPatch) -> None:

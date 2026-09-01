@@ -42,40 +42,49 @@ items used a supported ingestion path.
 flowchart LR
     subgraph nebius["Your Nebius project"]
         SRC[("S3 media prefix<br/>*.mp4 · *.png · *.jpg")]
-        RCPT[("push_receipt.json")]
+        RCPT[("push_receipt.json<br/>write-ahead, then final:<br/>uuid · size · etag · checksum")]
         DEST[("S3 output prefix<br/>media/ · items/ · labels/ · manifest.json")]
+        RPT[("roundtrip_report.json")]
     end
 
     subgraph cli["npa workbench encord"]
         PUSH["push"]
+        CUR["curate<br/>(headless filters)"]
         PULL["pull"]
+        VER["verify"]
     end
 
     subgraph encord["Encord SaaS"]
         INT["Cloud integration<br/>one-time · read-only keys"]
-        FOLDER["Storage folder"]
+        FOLDER["Storage folder<br/>items carry npa.source_uri<br/>identity metadata"]
         DATASET["Dataset"]
-        CURATE{{"Human curation<br/>in the Encord app"}}
-        KEEP["Collection · Dataset · Project labels"]
+        HCUR{{"Human curation<br/>in the Encord app (optional)"}}
+        COLL["Collection · Dataset · Project labels"]
     end
 
     SRC -- "list prefix" --> PUSH
-    PUSH == "register (default):<br/>objectUrls only — bytes stay put" ==> FOLDER
+    PUSH == "register (default):<br/>objectUrls + identity metadata —<br/>bytes stay put" ==> FOLDER
     PUSH -. "--transfer upload:<br/>bytes copied into Encord storage" .-> FOLDER
     FOLDER -- "resolves registered media via" --> INT
     INT -- "read-only bucket access" --> SRC
     PUSH -- "durable receipt" --> RCPT
     FOLDER -- "link_items (explicit)" --> DATASET
-    DATASET --> CURATE
-    CURATE --> KEEP
-    KEEP -- "--source + --source-id" --> PULL
+    CUR == "quality-filter preset,<br/>evaluated server-side" ==> COLL
+    FOLDER --- CUR
+    DATASET -.-> HCUR
+    HCUR -.-> COLL
+    COLL -- "--source + --source-id" --> PULL
     PULL == "registered media:<br/>zero-egress server-side copy" ==> DEST
-    PULL -. "Encord-hosted media:<br/>signed-URL download" .-> DEST
+    PULL -. "Encord-hosted media:<br/>signed-URL download, hashed in-stream" .-> DEST
+    RCPT -- "receipt" --> VER
+    DEST -- "manifest" --> VER
+    VER -- "identity + size + checksum,<br/>fail-closed" --> RPT
 ```
 
-Solid heavy arrows are the default register-mode paths; dashed arrows are the
-upload-mode variants. Both `push` and `pull` authenticate with your Encord API
-key (`ENCORD_SSH_KEY*`); the cloud integration is a separate, Encord-side
+Solid heavy arrows are the default register-mode and headless-curation paths;
+dashed arrows are the upload-mode and optional human-curation variants. All
+verbs authenticate with your Encord API key (`ENCORD_SSH_KEY_B64` or
+`ENCORD_SSH_KEY_FILE`); the cloud integration is a separate, Encord-side
 credential that only ever grants *read* on the media bucket. The receipt and
 manifest are written before any failure exit, so lineage survives fail-closed
 runs.
@@ -114,15 +123,15 @@ tokens:
   ENCORD_SSH_KEY_FILE: /Users/<you>/.ssh/encord-private-key.ed25519
 ```
 
-Alternatives that also work:
+The only other accepted transport is `ENCORD_SSH_KEY_B64` — the base64 of the
+PEM, and the form you forward into workflow pods (see below):
 
-- `ENCORD_SSH_KEY` with the full PEM as a YAML literal block (`|`),
-- `ENCORD_SSH_KEY_B64` with the base64 of the PEM — this is also the form you
-  forward into workflow pods (see below):
+```bash
+base64 < ~/.ssh/encord-private-key.ed25519 | tr -d '\n'
+```
 
-  ```bash
-  base64 < ~/.ssh/encord-private-key.ed25519 | tr -d '\n'
-  ```
+(A raw multi-line PEM pasted into YAML or an env var is deliberately not
+accepted: truncated pastes were an observed live failure mode.)
 
 US-hosted Encord orgs: also `export ENCORD_DOMAIN=https://api.us.encord.com`.
 
@@ -157,13 +166,62 @@ npa workbench encord push \
 - A durable receipt (`push_receipt.json`, `npa.encord.push_receipt.v1`) records
   every file, its Encord item uuid, and per-file errors. The receipt is written
   **before** any failure exit, and any unit error fails the command closed. If a step throws after Encord was mutated, the receipt still lands with the exception recorded in its `error` field.
-- In register mode, re-pushing the same prefix is idempotent: duplicates are
-  skipped (`skip_duplicate_urls`) and already-registered items are re-linked
-  into the dataset. Upload mode creates new copies on re-push.
+- Re-pushing the same prefix is **idempotent in both modes, as our own
+  invariant**: before transferring anything, push resolves each object's exact
+  identity (`npa.source_uri` metadata / objectUrl) against the folder and
+  re-sends only what is absent. A retried stage registers nothing twice and —
+  in upload mode — copies no duplicate bytes. Every item is registered with
+  `npa.source_uri` clientMetadata; identity never rests on a filename.
+- The receipt lands twice: a write-ahead copy (`status: planned`) before the
+  first Encord mutation — so even an uncatchable kill leaves a record of
+  intent — then the final receipt with per-item uuids, sizes, ETags, and
+  checksums.
 
-## Curate in the Encord app
+## Curate headlessly: quality filters, no human in the app
 
-Work exactly as you normally do. When you're done, the pull source is one of:
+`curate` closes the push → curate → pull loop without anyone opening Encord.
+You declare filters over Encord's **built-in data quality metrics**; the tool
+creates a run-scoped Encord filter preset from them, creates (or reuses) the
+target Collection, and Encord evaluates the selection **server-side** into it.
+No media bytes move, and the transient preset is deleted once the selection
+lands (the receipt keeps its exact JSON).
+
+```bash
+npa workbench encord curate \
+  --folder my-batch \
+  --filter brightness:0.2:0.8 --filter width:640:4096 \
+  --collection my-batch-keepers \
+  --output-path s3://<bucket>/encord/curate/
+```
+
+- `--filter metric:min:max` is repeatable, and one value may carry several
+  filters comma-separated (`brightness:0.2:0.8,sharpness:0.3:1`) — that is the
+  workflow-template form.
+- Supported metrics (allowlisted; unknown names fail closed before any Encord
+  call): `width`, `height`, `area`, `aspect-ratio` are **intrinsic** and work
+  on any folder immediately; `brightness`, `sharpness`, `file-size` are
+  **computed** quality metrics and match nothing until quality metrics have
+  been computed for the folder — a one-time action in the Encord app (open the
+  folder → upgrade/compute metrics; Encord exposes no API for it). Filter
+  ranges use Encord's own metric scales.
+- `--folder` is never created by curate (an absent folder means there is
+  nothing to curate); a `--collection` title is created when absent.
+- Selection is asynchronous in Encord; curate polls until the Collection is
+  stable (`--poll-seconds`, default 300). **Zero selected items fails closed**
+  (exit 1) — an empty curated set silently feeding a training stage is a bug,
+  not a result.
+- A durable receipt (`curate_receipt.json`, `npa.encord.curate_receipt.v1`)
+  records the parsed filters, the exact preset JSON sent to Encord, the preset
+  and Collection uuids, and the selected count — written **before** any failure
+  exit, like push and pull.
+- Pull the result with `--source collection --source-id <collection>`.
+
+## Or curate in the Encord app
+
+Human judgment still beats a brightness threshold for some batches. Work
+exactly as you normally do; the two paths compose (start from an
+agent-curated Collection and refine it, or skip `curate` entirely). When
+you're done, the pull source is one of:
 
 | You curated with… | Pull with |
 |---|---|
@@ -189,9 +247,43 @@ manifest.json                 # npa.encord.pull_manifest.v1 lineage + counts
 ```
 
 Media registered from your own bucket returns as **zero-egress server-side
-copies**; Encord-hosted (uploaded) media streams back through signed URLs. The
-manifest is written before any failure exit; any failed item fails the command
-closed.
+copies**; Encord-hosted (uploaded) media streams back through signed URLs (the
+download is hashed in-stream, and its sha256 lands in the manifest). Transfers
+run in a bounded parallel pool, so pulling thousands of curated clips does not
+pay a serial round-trip each. The manifest is written before any failure exit;
+any failed item fails the command closed.
+
+## Cleanup: tear down run-scoped Encord state
+
+Everything the tool creates in Encord carries a run-scoped title whose run id
+embeds a UTC timestamp (`npa-e2e-*`, `npa-demo-src-*`, `npa-curate-*`), so
+nothing accumulates anonymously. Tear a namespace down with:
+
+```bash
+npa workbench encord cleanup --title-prefix npa-demo-src- [--dry-run]
+```
+
+This deletes matching storage folders (items first), Collections, and filter
+presets, and **reports** matching datasets — the Encord SDK exposes no dataset
+deletion, so those need one click in the app (the folder cleanup already
+removed their items).
+
+## Verify: prove the roundtrip
+
+```bash
+npa workbench encord verify \
+  --receipt-uri s3://<bucket>/encord/push/push_receipt.json \
+  --manifest-uri s3://<bucket>/encord/pull/manifest.json \
+  --output-path s3://<bucket>/encord/verify/
+```
+
+Joins the push receipt to the pull manifest by Encord item uuid (identity is
+exact — `npa.source_uri` clientMetadata or the normalized objectUrl, never a
+filename) and fails closed when any pushed item is missing from the pull, any
+size differs, or any comparable checksum differs. The report
+(`roundtrip_report.json`, `npa.encord.roundtrip_report.v1`) records per-item
+expected/observed sizes and checksums; incomparable checksum kinds (e.g. a
+multipart ETag against a sha256) are reported as unavailable, not failures.
 
 ## Python SDK
 
@@ -207,24 +299,30 @@ receipt = encord.push(
     dataset="my-batch",
     output_path="s3://<bucket>/encord/push/",
 )
+curated = encord.curate(
+    folder="my-batch",
+    filters=["brightness:0.2:0.8", "width:640:4096"],
+    collection="my-batch-keepers",
+    output_path="s3://<bucket>/encord/curate/",
+)
 manifest = encord.pull(
     source="collection",
-    source_id="keepers",
+    source_id="my-batch-keepers",
     output_path="s3://<bucket>/encord/pull/",
 )
 ```
 
-Both return the Pydantic models (`PushReceipt` / `PullManifest`) that are also
-persisted to S3, and raise `EncordToolError` on the same fail-closed conditions
-as the CLI.
+All three return the Pydantic models (`PushReceipt` / `CurateReceipt` /
+`PullManifest`) that are also persisted to S3, and raise `EncordToolError` on
+the same fail-closed conditions as the CLI.
 
 ## Workflows
 
-Three shipped specs wrap the same tool
+The shipped specs wrap the same tool
 (`npa/workflows/workbench/npa-workflows/`):
 
-- `encord-push.yaml` — production push, terminal at the receipt (curation is
-  human-in-the-loop between workflows).
+- `encord-push.yaml` — production push, terminal at the receipt (for the
+  human-curation path between workflows).
 - `encord-pull.yaml` — production pull, run after curation.
 - `encord-cosmos3-augment.yaml` — the curation-to-augmentation loop in one
   run: pull an Encord video, generate two distinct real Cosmos 3 video2video
@@ -235,10 +333,17 @@ Three shipped specs wrap the same tool
   `--var encord_source_id=<your-curated-id>` (seeding no-ops) and, for
   register-in-place, `--var encord_transfer=register
   --var encord_integration=<title>`; `encord_item_index` picks the video.
+- `encord-cosmos3-groot-finetune.yaml` — the fully unattended loop: push a
+  LeRobot camera stream, **curate it headlessly** into
+  `npa-groot-curated-<run-id>` (default filter is the intrinsic
+  `width:32:16384`; override `--var encord_curate_filters=...` for
+  brightness/sharpness once the folder's quality metrics are computed), pull
+  the curated Collection, augment with Cosmos 3, and fine-tune GR00T.
 - `encord-roundtrip-smoke.yaml` — live e2e proof: push fixture media into a
-  fresh `npa-e2e-<run-id>` folder + dataset, then pull that dataset straight
-  back, no human step. Add `--var encord_transfer=upload` for the
-  byte-copy variant.
+  fresh `npa-e2e-<run-id>` folder + dataset, curate a run-scoped Collection
+  headlessly through a filter preset, then pull both the dataset and the
+  Collection straight back, no human step. Add `--var encord_transfer=upload`
+  for the byte-copy variant.
 
 Forward the credential to pods **by name only** — the base64 form survives the
 secret transport:
@@ -264,6 +369,8 @@ environment.)
 | `No Encord cloud integration titled '...'` | Title mismatch — the error lists the titles your key can see. |
 | `.mcap` files land as `experimental_error` in the receipt | MCAP cloud registration has no supported upload format in the pinned SDK yet; the receipt-visible error is intentional. Push videos/images with the default `--media`. |
 | Pull error `item has no signed URL (composite items...)` | Image groups / DICOM series expose no single signed URL and are not supported by pull. |
+| `Encord curate selected 0 items` with brightness/sharpness/file-size filters | Those are computed quality metrics: they match nothing until metrics have been computed for the folder (one-time, in the Encord app). Use intrinsic metrics (width, height, area, aspect-ratio), or compute the folder's metrics once and re-run. |
+| `Unknown filter metric '...'` | Only allowlisted metrics with a live-verified Encord filter shape are accepted — an unverified shape would hang Encord's server-side evaluation. The error lists the supported names. |
 | US-hosted org, auth fails with a valid key | Set `ENCORD_DOMAIN` (the SDK default is the EU endpoint). |
 
 For the agent-facing summary and validation status see

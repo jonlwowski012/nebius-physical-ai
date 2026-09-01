@@ -8,6 +8,7 @@ The manifest is always written before a failure exit.
 
 from __future__ import annotations
 
+import logging
 import tempfile
 from datetime import datetime, timezone
 from pathlib import Path
@@ -29,10 +30,15 @@ from npa.workbench.encord.schemas import (
     PulledItem,
     PullManifest,
 )
-from npa.workbench.encord.storage import write_json
+from npa.workbench.encord.identity import metadata_identity
+from npa.workbench.encord.integrity import etag_checksum, write_hashed_stream
+from npa.workbench.encord.storage import error_text, finalize_artifact, write_json
 
 PULL_SOURCES = ("collection", "dataset", "project")
 LABEL_BUNDLE_SIZE = 100
+# Media transfers are independent I/O; a bounded pool keeps thousands of
+# curated clips from paying a serial round-trip each.
+PULL_TRANSFER_WORKERS = 8
 
 
 def pull_manifest_uri_for(output_path: str) -> str:
@@ -70,7 +76,7 @@ def enumerate_items(user_client: Any, *, source: str, source_id: str) -> PullSou
     """Resolve the source and list its storage items, signed in bulk."""
 
     if source == "collection":
-        collection, resolved_id, name = resolve_collection(user_client, source_id)
+        collection, resolved_id, name, _ = resolve_collection(user_client, source_id)
         uuids = [item.uuid for item in collection.list_items(page_size=1000)]
         items = user_client.get_storage_items(uuids, sign_url=True) if uuids else []
         return PullSource(resolved_id, name, list(items))
@@ -127,6 +133,7 @@ def transfer_item(
     pulled = PulledItem(
         item_uuid=str(item.uuid),
         name=str(item.name),
+        source_uri=metadata_identity(item),
         item_type=str(getattr(item, "item_type", "") or ""),
         mime_type=str(getattr(item, "mime_type", "") or ""),
         file_size=int(getattr(item, "file_size", 0) or 0),
@@ -146,16 +153,24 @@ def transfer_item(
     source = _same_endpoint_source(signed_url, endpoint_url)
     if source is not None:
         try:
-            storage_client.s3.copy_object(
+            response = storage_client.s3.copy_object(
                 Bucket=dest_bucket,
                 Key=dest_key,
                 CopySource={"Bucket": source[0], "Key": source[1]},
             )
             pulled.media_uri = dest_uri
             pulled.transfer = "copy"
+            # A server-side copy exposes no bytes to hash; the destination
+            # ETag (md5 when single-part) is the content evidence.
+            etag = str(((response or {}).get("CopyObjectResult") or {}).get("ETag") or "")
+            pulled.checksum, pulled.checksum_kind = etag_checksum(etag)
             return pulled
-        except Exception:  # noqa: BLE001 - fall back to the download path
-            pass
+        except Exception as exc:  # noqa: BLE001 - fall back to the download path
+            logging.getLogger(__name__).debug(
+                "server-side copy of %s failed (%s); falling back to download",
+                pulled.name,
+                exc,
+            )
 
     import httpx
 
@@ -164,10 +179,11 @@ def transfer_item(
             local = Path(tmp) / _sanitize_name(pulled.name)
             with httpx.stream("GET", url, timeout=600.0, follow_redirects=True) as response:
                 response.raise_for_status()
-                with local.open("wb") as handle:
-                    for chunk in response.iter_bytes(8 * 1024 * 1024):
-                        handle.write(chunk)
+                digest = write_hashed_stream(response.iter_bytes(8 * 1024 * 1024), local)
             storage_client.upload_file(str(local), dest_uri)
+            pulled.observed_size = digest.size
+            pulled.checksum = digest.sha256
+            pulled.checksum_kind = "sha256"
 
     try:
         try:
@@ -240,14 +256,14 @@ def run_pull(
     label_uris: list[str] = []
     run_error: Exception | None = None
     try:
-        for item in found.items:
+
+        def _transfer_and_record(item: Any) -> PulledItem:
             record = transfer_item(
                 item,
                 storage_client=active_storage,
                 output_uri=output_path,
                 endpoint_url=endpoint_url,
             )
-            pulled.append(record)
             write_json(
                 {
                     "item_uuid": record.item_uuid,
@@ -261,6 +277,27 @@ def run_pull(
                 filename=f"{record.item_uuid}.json",
                 storage_client=active_storage,
             )
+            return record
+
+        if found.items:
+            from concurrent.futures import ThreadPoolExecutor, as_completed
+
+            workers = min(PULL_TRANSFER_WORKERS, len(found.items))
+            results: list[PulledItem | None] = [None] * len(found.items)
+            first_error: Exception | None = None
+            with ThreadPoolExecutor(max_workers=workers) as pool:
+                futures = {
+                    pool.submit(_transfer_and_record, item): index
+                    for index, item in enumerate(found.items)
+                }
+                for future in as_completed(futures):
+                    try:
+                        results[futures[future]] = future.result()
+                    except Exception as exc:  # noqa: BLE001 - kept for the manifest
+                        first_error = first_error or exc
+            pulled = [record for record in results if record is not None]
+            if first_error is not None:
+                raise first_error
 
         if found.project is not None:
             label_rows, label_uris = export_labels(
@@ -292,21 +329,21 @@ def run_pull(
             for record in pulled
             if record.transfer in ("copy", "download")
         ),
-        error=f"{type(run_error).__name__}: {run_error}" if run_error else "",
+        error=error_text(run_error),
         label_uris=label_uris,
         items=pulled,
     )
-    write_json(
-        manifest.model_dump(by_alias=True),
+    finalize_artifact(
+        manifest,
         result_uri=manifest_uri,
         filename=PULL_MANIFEST_FILENAME,
         storage_client=active_storage,
+        run_error=run_error,
+        failure_prefix=(
+            f"Encord pull failed after {len(pulled)} of {len(found.items)} item(s)"
+        ),
+        artifact_noun="Manifest",
     )
-    if run_error is not None:
-        raise EncordToolError(
-            f"Encord pull failed after {len(pulled)} of {len(found.items)} "
-            f"item(s): {manifest.error}. Manifest written to {manifest_uri}."
-        ) from run_error
     if manifest.media_failed > 0:
         raise EncordToolError(
             f"Encord pull failed for {manifest.media_failed} of "

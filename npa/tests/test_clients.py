@@ -2072,17 +2072,17 @@ def test_load_credentials_hydrates_encord_tokens_env_over_file(
     from npa.clients import credentials
 
     path = tmp_path / "credentials.yaml"
-    path.write_text("tokens:\n  ENCORD_SSH_KEY: file-pem\n", encoding="utf-8")
+    path.write_text("tokens:\n  ENCORD_SSH_KEY_FILE: /keys/encord.pem\n", encoding="utf-8")
     path.chmod(0o600)
     monkeypatch.setattr(credentials, "CREDENTIALS_PATH", path)
 
     merged = credentials.load_credentials(environ={"ENCORD_SSH_KEY_B64": "env-b64"})
-    assert merged.tokens["ENCORD_SSH_KEY"] == "file-pem"
+    assert merged.tokens["ENCORD_SSH_KEY_FILE"] == "/keys/encord.pem"
     assert merged.tokens["ENCORD_SSH_KEY_B64"] == "env-b64"
 
-    env_wins = credentials.load_credentials(environ={"ENCORD_SSH_KEY": "env-pem"})
-    assert env_wins.tokens["ENCORD_SSH_KEY"] == "env-pem"
+    env_wins = credentials.load_credentials(environ={"ENCORD_SSH_KEY_B64": "env-wins"})
+    assert env_wins.tokens["ENCORD_SSH_KEY_B64"] == "env-wins"
 
     absent = credentials.load_credentials(environ={})
-    assert absent.tokens["ENCORD_SSH_KEY"] == "file-pem"
+    assert absent.tokens["ENCORD_SSH_KEY_FILE"] == "/keys/encord.pem"
     assert "ENCORD_SSH_KEY_B64" not in absent.tokens

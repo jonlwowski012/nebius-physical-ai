@@ -21,10 +21,12 @@ CREDENTIALS_PATH = NPA_CONFIG_DIR / "credentials.yaml"
 NGC_ENV_KEYS = ("NGC_API_KEY", "NGC_ORG", "NGC_TEAM")
 TOKEN_FACTORY_ENV_KEY = "NEBIUS_TOKEN_FACTORY_KEY"
 FOXGLOVE_API_TOKEN_KEY = "FOXGLOVE_API_TOKEN"
-# Encord SaaS auth (npa workbench encord): the SDK-native PEM env and its base64
-# transport form. Deliberately NOT in shared_credential_env — a single-tool SaaS
-# secret stays backend-only (Foxglove precedent).
-ENCORD_ENV_KEYS = ("ENCORD_SSH_KEY", "ENCORD_SSH_KEY_B64")
+# Encord SaaS auth (npa workbench encord): exactly one env transport, the
+# base64 form (a raw multi-line PEM in env/YAML is truncation-prone and was an
+# observed live failure; laptops use ENCORD_SSH_KEY_FILE instead). Deliberately
+# NOT in shared_credential_env — a single-tool SaaS secret stays backend-only
+# (Foxglove precedent).
+ENCORD_ENV_KEYS = ("ENCORD_SSH_KEY_B64",)
 # All names load_credentials hydrates into tokens (the FILE variant is a local
 # path, deliberately excluded from --save-env-credentials persistence above).
 ENCORD_TOKEN_KEYS = (*ENCORD_ENV_KEYS, "ENCORD_SSH_KEY_FILE")

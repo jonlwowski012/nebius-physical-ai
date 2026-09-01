@@ -12,11 +12,31 @@ import pytest
 
 from npa.workbench.encord.client import (
     _default_user_client,
+    resolve_collection,
     resolve_dataset,
     resolve_folder,
     resolve_integration,
     resolve_public_endpoint,
 )
+from npa.workbench.encord.curate import (
+    build_filter_preset_json,
+    curate_receipt_uri_for,
+    parse_filter_specs,
+    run_curate,
+)
+from npa.workbench.encord.identity import (
+    canonical_s3_uri,
+    normalize_object_url,
+    resolve_exact_identity,
+)
+from npa.workbench.encord.integrity import (
+    compare_checksums,
+    etag_checksum,
+    hash_file,
+    write_hashed_stream,
+)
+from npa.workbench.encord.cleanup import run_cleanup
+from npa.workbench.encord.verify import run_verify
 from npa.workbench.encord.pull import (
     _same_endpoint_source,
     enumerate_items,
@@ -112,9 +132,17 @@ class FakeFolder:
         self.start_calls: list[dict[str, Any]] = []
         self._result_index = 0
         self.folder_items: list[Any] = []
+        # Items that become visible only after a registration completes.
+        self.post_registration_items: list[Any] = []
 
     def list_items(self, page_size: int = 100):
         return iter(self.folder_items)
+
+    def delete_storage_items(self, item_uuids, remove_unused_frames=True):
+        self.deleted_item_uuids = [str(u) for u in item_uuids]
+
+    def delete(self):
+        self.deleted = True
 
     def add_private_data_to_folder_start(self, *, integration_id, private_files, ignore_errors):
         self.start_calls.append(
@@ -129,6 +157,9 @@ class FakeFolder:
     def add_private_data_to_folder_get_result(self, job_id, timeout_seconds):
         result = self.results[min(self._result_index, len(self.results) - 1)]
         self._result_index += 1
+        # Registration makes the new items visible in the folder inventory.
+        self.folder_items.extend(self.post_registration_items)
+        self.post_registration_items = []
         return result
 
 
@@ -169,9 +200,20 @@ class FakeCollection:
         self.uuid = uuid.UUID(int=9)
         self.name = "keepers"
         self._items = items
+        # Items revealed by add_preset_items (the async server-side selection).
+        # reveal_after_calls > 1 models metric-indexing lag: the one-shot
+        # evaluation finds nothing until it is re-issued.
+        self.pending: list[FakeItem] = []
+        self.preset_calls: list[str] = []
+        self.reveal_after_calls = 1
 
     def list_items(self, page_size: int | None = None):
         return iter(self._items)
+
+    def add_preset_items(self, filter_preset) -> None:
+        self.preset_calls.append(str(filter_preset))
+        if len(self.preset_calls) >= self.reveal_after_calls:
+            self._items = list(self.pending)
 
 
 class FakeUserClient:
@@ -193,6 +235,14 @@ class FakeUserClient:
         self.items = items or []
         self.created_folders: list[str] = []
         self.created_datasets: list[str] = []
+        self.created_collections: list[FakeCollection] = []
+        self.created_presets: list[Any] = []
+        self.deleted_presets: list[str] = []
+        self.deleted_collections: list[str] = []
+        # What a curate-created collection's add_preset_items should reveal,
+        # and after how many evaluation calls (metric-indexing lag).
+        self.pending_curate_items: list[FakeItem] = []
+        self.curate_reveal_after_calls = 1
 
     def get_cloud_integrations(self):
         return list(self.integrations)
@@ -219,7 +269,7 @@ class FakeUserClient:
         return [
             {"dataset": SimpleNamespace(dataset_hash=h, title=d.title)}
             for h, d in self.datasets.items()
-            if d.title == title_eq
+            if not title_eq or d.title == title_eq
         ]
 
     def create_dataset(self, title, storage_location, dataset_description="", create_backing_folder=True):
@@ -232,7 +282,36 @@ class FakeUserClient:
         return self.collection
 
     def list_collections(self, **kwargs):
-        return iter([self.collection] if self.collection else [])
+        existing = [self.collection] if self.collection else []
+        return iter(existing + self.created_collections)
+
+    def create_collection(self, *, top_level_folder_uuid, name, description=""):
+        collection = FakeCollection([])
+        collection.uuid = uuid.UUID(int=200 + len(self.created_collections))
+        collection.name = name
+        collection.top_level_folder_uuid = str(top_level_folder_uuid)
+        collection.pending = list(self.pending_curate_items)
+        collection.reveal_after_calls = self.curate_reveal_after_calls
+        self.created_collections.append(collection)
+        return collection
+
+    def create_preset(self, *, name, filter_preset_json, description=""):
+        preset = SimpleNamespace(
+            uuid=uuid.UUID(int=300 + len(self.created_presets)),
+            name=name,
+            filter_preset_json=filter_preset_json,
+        )
+        self.created_presets.append(preset)
+        return preset
+
+    def delete_preset(self, preset_uuid):
+        self.deleted_presets.append(str(preset_uuid))
+
+    def list_presets(self, page_size: int | None = None):
+        return iter(self.created_presets)
+
+    def delete_collection(self, collection_uuid):
+        self.deleted_collections.append(str(collection_uuid))
 
     def get_storage_items(self, item_uuids, sign_url=False):
         wanted = {str(u) for u in item_uuids}
@@ -257,16 +336,21 @@ def test_receipt_and_manifest_uri_helpers() -> None:
 def test_discover_objects_maps_suffixes_and_skips() -> None:
     storage = FakeStorage(["p/a.mp4", "p/b.PNG", "p/c.jpeg", "p/d.txt", "p/e.mcap"])
     entries, skipped = discover_objects(storage, "s3://bkt/p/", "videos-images")
-    assert entries == [("p/a.mp4", "videos"), ("p/b.PNG", "images"), ("p/c.jpeg", "images")]
+    assert [(key, category) for key, category, _, _ in entries] == [
+        ("p/a.mp4", "videos"),
+        ("p/b.PNG", "images"),
+        ("p/c.jpeg", "images"),
+    ]
     assert skipped == ["p/d.txt", "p/e.mcap"]
 
 
 def test_discover_objects_mcap_gating() -> None:
     storage = FakeStorage(["p/a.mp4", "p/e.mcap"])
     entries, _ = discover_objects(storage, "s3://bkt/p/", "mcap")
-    assert entries == [("p/e.mcap", "mcap")]
+    assert [(key, category) for key, category, _, _ in entries] == [("p/e.mcap", "mcap")]
     entries, skipped = discover_objects(storage, "s3://bkt/p/", "all")
-    assert ("p/e.mcap", "mcap") in entries and ("p/a.mp4", "videos") in entries
+    pairs = [(key, category) for key, category, _, _ in entries]
+    assert ("p/e.mcap", "mcap") in pairs and ("p/a.mp4", "videos") in pairs
     assert skipped == []
 
 
@@ -275,15 +359,23 @@ def test_discover_objects_empty_prefix_fails() -> None:
         discover_objects(FakeStorage(["p/readme.md"]), "s3://bkt/p/", "videos-images")
 
 
-def test_build_upload_json_shape() -> None:
+def test_build_upload_json_carries_identity_metadata() -> None:
     items = [
-        PushedItem(key="a.mp4", object_url="u1", category="videos"),
-        PushedItem(key="b.png", object_url="u2", category="images"),
+        PushedItem(key="a.mp4", source_uri="s3://bkt/a.mp4", object_url="u1", category="videos"),
+        PushedItem(key="b.png", source_uri="s3://bkt/b.png", object_url="u2", category="images"),
     ]
     payload = build_upload_json(items)
     assert payload["skip_duplicate_urls"] is True
-    assert payload["videos"] == [{"objectUrl": "u1"}]
-    assert payload["images"] == [{"objectUrl": "u2"}]
+    assert payload["videos"] == [
+        {
+            "objectUrl": "u1",
+            "title": "a.mp4",
+            "clientMetadata": {"npa": {"source_uri": "s3://bkt/a.mp4"}},
+        }
+    ]
+    assert payload["images"][0]["clientMetadata"] == {
+        "npa": {"source_uri": "s3://bkt/b.png"}
+    }
 
 
 # --- client resolution -------------------------------------------------------
@@ -348,6 +440,26 @@ def _push_kwargs(tmp_path: Path, storage: FakeStorage, client: FakeUserClient, *
     return kwargs
 
 
+@pytest.fixture(autouse=True)
+def _fast_identity_relist(monkeypatch: pytest.MonkeyPatch):
+    import npa.workbench.encord.push as push_module
+
+    monkeypatch.setattr(push_module, "IDENTITY_RELIST_DELAY_SECONDS", 0.0)
+
+
+def _folder_item(seed: int, key: str, *, metadata: bool = True, url: bool = True):
+    """A folder-inventory item carrying exact identity (metadata and/or url)."""
+
+    return SimpleNamespace(
+        uuid=_uuid(seed),
+        name=key,
+        client_metadata=(
+            {"npa": {"source_uri": f"s3://bkt/{key}"}} if metadata else {}
+        ),
+        url=f"{ENDPOINT}/bkt/{key}" if url else "",
+    )
+
+
 def test_run_push_happy_path_links_dataset(tmp_path: Path) -> None:
     storage = FakeStorage(["p/a.mp4", "p/b.png"])
     folder = FakeFolder(
@@ -359,6 +471,9 @@ def test_run_push_happy_path_links_dataset(tmp_path: Path) -> None:
             )
         ]
     )
+    # After registration the folder inventory exposes the items with their
+    # npa.source_uri clientMetadata — the only lineage signal besides the URL.
+    folder.post_registration_items = [_folder_item(21, "p/a.mp4"), _folder_item(22, "p/b.png")]
     client = FakeUserClient(folders=[])
     client.create_storage_folder = lambda name, description="": folder  # type: ignore[assignment]
     receipt = run_push(**_push_kwargs(tmp_path, storage, client, dataset="new-ds"))
@@ -367,10 +482,15 @@ def test_run_push_happy_path_links_dataset(tmp_path: Path) -> None:
     assert receipt.dataset_created is True and receipt.linked_count == 2
     dataset = next(iter(client.datasets.values()))
     assert dataset.linked == [[_uuid(21), _uuid(22)]]
-    # uuids attached to receipt rows by basename
+    # uuids attached to receipt rows by exact metadata identity, never names
     assert {item.item_uuid for item in receipt.items} == {_uuid(21), _uuid(22)}
+    assert {item.identity_signal for item in receipt.items} == {"metadata"}
+    assert receipt.items[0].source_uri == "s3://bkt/p/a.mp4"
     # objectUrls are path-style against the environ endpoint
     assert receipt.items[0].object_url == f"{ENDPOINT}/bkt/p/a.mp4"
+    # registration payload carried the identity metadata
+    first_entry = folder.start_calls[0]["private_files"]["videos"][0]
+    assert first_entry["clientMetadata"] == {"npa": {"source_uri": "s3://bkt/p/a.mp4"}}
     # receipt written locally
     payload = json.loads((tmp_path / "receipt.json").read_text())
     assert payload["schema"] == "npa.encord.push_receipt.v1"
@@ -652,40 +772,65 @@ def test_run_push_rejects_unknown_transfer(tmp_path: Path) -> None:
         )
 
 
-def test_run_push_repush_links_existing_items(tmp_path: Path) -> None:
-    """skip_duplicate_urls adds nothing on a re-push; linking must still happen."""
+def test_run_push_repush_links_existing_items_via_object_url(tmp_path: Path) -> None:
+    """skip_duplicate_urls adds nothing on a re-push; linking must still happen.
+
+    Items registered before identity metadata existed resolve through their
+    registered objectUrl — still exact, never a display name.
+    """
 
     storage = FakeStorage(["p/a.mp4", "p/b.png"])
     folder = FakeFolder(results=[FakePollResult(status="DONE", done=0, items=[])])
     folder.folder_items = [
-        SimpleNamespace(uuid=_uuid(61), name="p/a.mp4"),
-        SimpleNamespace(uuid=_uuid(62), name="p/b.png"),
+        _folder_item(61, "p/a.mp4", metadata=False),
+        _folder_item(62, "p/b.png", metadata=False),
     ]
     client = FakeUserClient(folders=[folder])
     receipt = run_push(**_push_kwargs(tmp_path, storage, client, folder=str(folder.uuid), dataset="new-ds"))
     dataset = next(iter(client.datasets.values()))
     assert sorted(dataset.linked[0]) == [_uuid(61), _uuid(62)]
     assert receipt.linked_count == 2
-    # receipt rows regain their uuids from the folder listing
     assert {item.item_uuid for item in receipt.items} == {_uuid(61), _uuid(62)}
+    assert {item.identity_signal for item in receipt.items} == {"object_url"}
 
 
-def test_run_push_does_not_assign_shared_basename_to_multiple_receipt_rows(
-    tmp_path: Path,
-) -> None:
-    """A basename-only SDK response cannot provide per-object receipt lineage."""
+def test_run_push_shared_basenames_resolve_to_distinct_items(tmp_path: Path) -> None:
+    """The identity-regression case: same basename, different objects.
+
+    Exact identity (metadata/objectUrl) attributes each receipt row to its own
+    Encord item; a name-based scheme could not tell these apart.
+    """
 
     storage = FakeStorage(["p/left/clip.mp4", "p/right/clip.mp4"])
-    folder = FakeFolder(
-        results=[FakePollResult(status="DONE", done=2, items=[(_uuid(64), "clip.mp4")])]
-    )
+    folder = FakeFolder(results=[FakePollResult(status="DONE", done=2, items=[])])
+    folder.post_registration_items = [
+        _folder_item(64, "p/left/clip.mp4"),
+        _folder_item(65, "p/right/clip.mp4"),
+    ]
     client = FakeUserClient(folders=[folder])
     receipt = run_push(
         **_push_kwargs(tmp_path, storage, client, folder=str(folder.uuid), dataset="new-ds")
     )
     dataset = next(iter(client.datasets.values()))
-    assert dataset.linked == [[_uuid(64)]]
-    assert [item.item_uuid for item in receipt.items] == ["", ""]
+    assert sorted(dataset.linked[0]) == [_uuid(64), _uuid(65)]
+    by_key = {item.key: item.item_uuid for item in receipt.items}
+    assert by_key == {"p/left/clip.mp4": _uuid(64), "p/right/clip.mp4": _uuid(65)}
+
+
+def test_run_push_identity_conflict_fails_the_item_closed(tmp_path: Path) -> None:
+    """Two folder items claiming one source is a conflict, never a guess."""
+
+    storage = FakeStorage(["p/a.mp4"])
+    folder = FakeFolder(results=[FakePollResult(status="DONE", done=1, items=[])])
+    duplicate = _folder_item(67, "p/a.mp4")
+    duplicate.uuid = _uuid(68)
+    folder.post_registration_items = [_folder_item(67, "p/a.mp4"), duplicate]
+    client = FakeUserClient(folders=[folder])
+    with pytest.raises(EncordToolError, match="unit error"):
+        run_push(**_push_kwargs(tmp_path, storage, client, folder=str(folder.uuid)))
+    payload = json.loads((tmp_path / "receipt.json").read_text())
+    assert payload["items"][0]["status"] == "error"
+    assert "identity signals conflict" in payload["items"][0]["error"]
 
 
 def test_run_push_writes_receipt_when_linking_crashes(tmp_path: Path) -> None:
@@ -695,6 +840,7 @@ def test_run_push_writes_receipt_when_linking_crashes(tmp_path: Path) -> None:
     folder = FakeFolder(
         results=[FakePollResult(status="DONE", done=1, items=[(_uuid(63), "p/a.mp4")])]
     )
+    folder.post_registration_items = [_folder_item(63, "p/a.mp4")]
     client = FakeUserClient(folders=[folder])
 
     class ExplodingDataset(FakeDataset):
@@ -842,3 +988,504 @@ def test_run_pull_empty_source_writes_manifest_then_raises() -> None:
             environ=dict(ENVIRON),
         )
     assert [uri for _, uri in storage.uploads] == ["s3://out/pull/manifest.json"]
+
+
+# --- curate --------------------------------------------------------------------
+
+
+def _curate_kwargs(tmp_path: Path, client: FakeUserClient, **overrides):
+    kwargs = dict(
+        folder="src",
+        filters=["width:1:100000"],
+        collection="keepers-new",
+        output_path=str(tmp_path / "curate_receipt.json"),
+        user_client=client,
+        storage_client=FakeStorage(),
+        environ=dict(ENVIRON),
+    )
+    kwargs.update(overrides)
+    return kwargs
+
+
+def _curate_client(**client_kwargs) -> tuple[FakeUserClient, FakeFolder]:
+    """A client whose 'src' folder holds one item (curate fails fast on empty)."""
+
+    folder = FakeFolder(name="src")
+    folder.folder_items = [FakeItem(_uuid(30), "seed.png", None)]
+    return FakeUserClient(folders=[folder], **client_kwargs), folder
+
+
+@pytest.fixture(autouse=False)
+def _fast_polling(monkeypatch: pytest.MonkeyPatch):
+    import npa.workbench.encord.curate as curate_module
+
+    monkeypatch.setattr(curate_module, "POLL_INTERVAL_SECONDS", 0.0)
+    monkeypatch.setattr(curate_module, "REISSUE_INTERVAL_SECONDS", 0.0)
+
+
+def test_curate_receipt_uri_helper() -> None:
+    assert curate_receipt_uri_for("s3://b/p/") == "s3://b/p/curate_receipt.json"
+    assert curate_receipt_uri_for("s3://b/p/r.json") == "s3://b/p/r.json"
+
+
+def test_parse_filter_specs_repeatable_and_comma_separated() -> None:
+    parsed = parse_filter_specs(["brightness:0.2:0.8,sharpness:0.3:1", "width:32:4096"])
+    assert [(f.metric, f.min, f.max) for f in parsed] == [
+        ("brightness", 0.2, 0.8),
+        ("sharpness", 0.3, 1.0),
+        ("width", 32.0, 4096.0),
+    ]
+    assert [f.encord_metric for f in parsed] == [
+        "metric_brightness",
+        "metric_sharpness",
+        "metric_width",
+    ]
+    # Computed vs intrinsic drives the zero-selection diagnostic.
+    assert [f.computed for f in parsed] == [True, True, False]
+
+
+@pytest.mark.parametrize(
+    ("specs", "match"),
+    [
+        ([], "At least one --filter"),
+        (["  ", ""], "At least one --filter"),
+        (["blur:0:1"], "Unknown filter metric 'blur'"),
+        (["brightness:0.2"], "expected metric:min:max"),
+        (["brightness:a:b"], "must be numbers"),
+        (["brightness:0.9:0.1"], "min exceeds max"),
+    ],
+)
+def test_parse_filter_specs_fails_closed(specs: list[str], match: str) -> None:
+    with pytest.raises(EncordToolError, match=match):
+        parse_filter_specs(specs)
+
+
+def test_build_filter_preset_json_pins_the_live_verified_shape() -> None:
+    payload = build_filter_preset_json(parse_filter_specs(["brightness:0.2:0.8"]))
+    assert payload == {
+        "global_filters": {
+            "filters": [
+                {
+                    "include": True,
+                    "values": [0.2, 0.8],
+                    "domain": "data",
+                    "metric": "metric_brightness",
+                    "type": "metric",
+                }
+            ]
+        }
+    }
+
+
+def test_run_curate_happy_path_creates_collection_and_preset(
+    tmp_path: Path, _fast_polling
+) -> None:
+    client, folder = _curate_client()
+    client.pending_curate_items = [
+        FakeItem(_uuid(31), "a.png", None),
+        FakeItem(_uuid(32), "b.png", None),
+    ]
+    receipt = run_curate(**_curate_kwargs(tmp_path, client, workflow_run="run-1"))
+
+    assert receipt.status == "done"
+    assert receipt.items_selected == 2
+    assert receipt.collection_created is True
+    assert receipt.collection_name == "keepers-new"
+    assert receipt.folder_uuid == str(folder.uuid)
+    assert receipt.preset_name == "npa-curate-run-1"
+    # The preset payload sent to Encord is the pinned shape, verbatim.
+    (preset,) = client.created_presets
+    assert preset.filter_preset_json["global_filters"]["filters"][0]["metric"] == "metric_width"
+    (collection,) = client.created_collections
+    assert collection.top_level_folder_uuid == str(folder.uuid)
+    assert collection.preset_calls == [str(preset.uuid)]
+    # The run-scoped preset is transient scaffolding, deleted once evaluated.
+    assert client.deleted_presets == [str(preset.uuid)]
+    # Curate never creates folders.
+    assert client.created_folders == []
+    payload = json.loads((tmp_path / "curate_receipt.json").read_text())
+    assert payload["schema"] == "npa.encord.curate_receipt.v1"
+    assert payload["items_selected"] == 2
+
+
+def test_run_curate_reuses_existing_collection(tmp_path: Path, _fast_polling) -> None:
+    existing = FakeCollection([])
+    existing.name = "keepers-new"
+    existing.pending = [FakeItem(_uuid(33), "c.png", None)]
+    client, _ = _curate_client(collection=existing)
+    receipt = run_curate(**_curate_kwargs(tmp_path, client))
+    assert receipt.collection_created is False
+    assert receipt.collection_uuid == str(existing.uuid)
+    assert receipt.items_selected == 1
+    assert client.created_collections == []
+
+
+def test_run_curate_reissues_evaluation_until_indexing_catches_up(
+    tmp_path: Path, _fast_polling
+) -> None:
+    # Observed live: add_preset_items evaluates once, and items pushed moments
+    # earlier are not metric-indexed yet — the re-issue loop must recover.
+    client, _ = _curate_client()
+    client.pending_curate_items = [FakeItem(_uuid(35), "late.png", None)]
+    client.curate_reveal_after_calls = 3
+    receipt = run_curate(**_curate_kwargs(tmp_path, client, poll_seconds=5.0))
+    assert receipt.items_selected == 1
+    (collection,) = client.created_collections
+    assert len(collection.preset_calls) >= 3
+
+
+def test_run_curate_zero_selection_fails_closed_with_receipt(
+    tmp_path: Path, _fast_polling
+) -> None:
+    client, _ = _curate_client()
+    client.pending_curate_items = []
+    with pytest.raises(EncordToolError) as excinfo:
+        run_curate(
+            **_curate_kwargs(
+                tmp_path,
+                client,
+                filters=["brightness:0.2:0.8"],
+                poll_seconds=0.05,
+            )
+        )
+    message = str(excinfo.value)
+    assert "selected 0 items" in message
+    # The diagnostic names the computed-metric cause when one is in play.
+    assert "quality metrics have been computed" in message
+    payload = json.loads((tmp_path / "curate_receipt.json").read_text())
+    assert payload["status"] == "empty"
+    assert payload["items_selected"] == 0
+
+
+def test_run_curate_empty_folder_fails_fast_before_any_scaffolding(
+    tmp_path: Path,
+) -> None:
+    client = FakeUserClient(folders=[FakeFolder(name="src")])  # no folder items
+    with pytest.raises(EncordToolError, match="contains no storage items"):
+        run_curate(**_curate_kwargs(tmp_path, client))
+    assert client.created_collections == []
+    assert client.created_presets == []
+    payload = json.loads((tmp_path / "curate_receipt.json").read_text())
+    assert payload["status"] == "failed"
+    assert "contains no storage items" in payload["error"]
+
+
+def test_run_curate_unknown_metric_fails_before_any_encord_call(tmp_path: Path) -> None:
+    client = FakeUserClient(folders=[FakeFolder(name="src")])
+    with pytest.raises(EncordToolError, match="Unknown filter metric"):
+        run_curate(**_curate_kwargs(tmp_path, client, filters=["blur:0:1"]))
+    assert client.created_presets == []
+    assert client.created_collections == []
+    assert not (tmp_path / "curate_receipt.json").exists()
+
+
+def test_run_curate_missing_folder_writes_receipt_then_raises(tmp_path: Path) -> None:
+    client = FakeUserClient(folders=[])
+    with pytest.raises(EncordToolError, match="No Encord storage folder"):
+        run_curate(**_curate_kwargs(tmp_path, client, folder="absent"))
+    payload = json.loads((tmp_path / "curate_receipt.json").read_text())
+    assert payload["status"] == "failed"
+    assert "No Encord storage folder" in payload["error"]
+    assert client.created_folders == []
+
+
+def test_resolve_folder_create_flag_fails_closed() -> None:
+    client = FakeUserClient(folders=[])
+    with pytest.raises(EncordToolError, match="No Encord storage folder"):
+        resolve_folder(client, "absent", create=False)
+    assert client.created_folders == []
+
+
+def test_resolve_collection_create_paths() -> None:
+    client = FakeUserClient()
+    with pytest.raises(EncordToolError, match="No Encord collection"):
+        resolve_collection(client, "fresh")
+    collection, collection_uuid, name, created = resolve_collection(
+        client, "fresh", create_in_folder_uuid=_uuid(1)
+    )
+    assert created is True and name == "fresh"
+    assert collection_uuid == str(collection.uuid)
+    # Idempotent re-resolution finds the created collection instead.
+    again, again_uuid, _, created = resolve_collection(client, "fresh")
+    assert created is False and again_uuid == collection_uuid
+
+
+# --- idempotency + isolation ---------------------------------------------------
+
+
+def test_run_push_repush_is_a_no_op_on_the_wire(tmp_path: Path) -> None:
+    """Retry-safety is our invariant: nothing already present is re-sent."""
+
+    storage = FakeStorage(["p/a.mp4"])
+    folder = FakeFolder()
+    folder.folder_items = [_folder_item(61, "p/a.mp4")]
+    client = FakeUserClient(folders=[folder])
+    receipt = run_push(**_push_kwargs(tmp_path, storage, client, folder=str(folder.uuid)))
+    assert receipt.status == "done"
+    assert receipt.units_done == 1
+    assert folder.start_calls == []  # no registration round-trip at all
+    assert receipt.items[0].item_uuid == _uuid(61)
+
+
+def test_run_push_upload_mode_repush_skips_duplicate_byte_copies(tmp_path: Path) -> None:
+    storage = FakeDownloadStorage(["p/a.mp4"])
+    folder = FakeUploadFolder()
+    folder.folder_items = [_folder_item(62, "p/a.mp4", url=False)]
+    client = FakeUserClient(folders=[folder])
+    receipt = run_push(
+        input_path="s3://bkt/p/",
+        integration="",
+        folder=str(folder.uuid),
+        transfer="upload",
+        output_path=str(tmp_path / "receipt.json"),
+        user_client=client,
+        storage_client=storage,
+        environ={},
+    )
+    assert receipt.status == "done" and receipt.units_done == 1
+    assert storage.downloads == []  # no bytes moved on re-push
+    assert folder.uploads == []
+    assert receipt.items[0].item_uuid == _uuid(62)
+    assert receipt.items[0].status == "uploaded"
+
+
+def test_register_mode_never_falls_through_to_upload(tmp_path: Path) -> None:
+    """Register failures must never copy customer bytes into the SaaS."""
+
+    storage = FakeStorage(["p/a.mp4"])
+    folder = FakeUploadFolder()  # records any upload_* call
+    folder.results = [FakePollResult(status="ERROR")]
+    client = FakeUserClient(folders=[folder])
+    with pytest.raises(EncordToolError):
+        run_push(**_push_kwargs(tmp_path, storage, client, folder=str(folder.uuid)))
+    assert folder.uploads == []
+
+
+# --- cleanup ---------------------------------------------------------------------
+
+
+def test_run_cleanup_deletes_prefix_scoped_state_and_reports_datasets() -> None:
+    folder = FakeFolder(name="npa-e2e-run1")
+    folder.folder_items = [_folder_item(71, "p/a.mp4")]
+    client = FakeUserClient(folders=[folder])
+    collection = client.create_collection(
+        top_level_folder_uuid=str(folder.uuid), name="npa-e2e-run1"
+    )
+    preset = client.create_preset(name="npa-curate-run1", filter_preset_json={})
+    client.create_preset(name="customer-preset", filter_preset_json={})
+    client.datasets[_uuid(72)] = FakeDataset(_uuid(72), "npa-e2e-run1")
+    client.datasets[_uuid(73)] = FakeDataset(_uuid(73), "customer-data")
+
+    summary = run_cleanup(title_prefix="npa-e2e-", user_client=client)
+    assert summary["folders_deleted"] == ["npa-e2e-run1"]
+    assert summary["items_deleted"] == 1
+    assert folder.deleted is True and folder.deleted_item_uuids == [_uuid(71)]
+    assert summary["collections_deleted"] == ["npa-e2e-run1"]
+    assert client.deleted_collections == [str(collection.uuid)]
+    assert summary["datasets_undeletable"] == ["npa-e2e-run1"]
+    assert "customer-preset" not in summary["presets_deleted"]
+
+    cleanup_preset_summary = run_cleanup(title_prefix="npa-curate-", user_client=client)
+    assert cleanup_preset_summary["presets_deleted"] == ["npa-curate-run1"]
+    assert client.deleted_presets == [str(preset.uuid)]
+
+
+def test_run_cleanup_dry_run_deletes_nothing() -> None:
+    folder = FakeFolder(name="npa-e2e-run2")
+    client = FakeUserClient(folders=[folder])
+    summary = run_cleanup(title_prefix="npa-e2e-", dry_run=True, user_client=client)
+    assert summary["folders_deleted"] == ["npa-e2e-run2"]
+    assert not getattr(folder, "deleted", False)
+
+
+def test_run_cleanup_rejects_dangerously_short_prefix() -> None:
+    with pytest.raises(EncordToolError, match="at least 4"):
+        run_cleanup(title_prefix="np", user_client=FakeUserClient())
+
+
+# --- exact identity ------------------------------------------------------------
+
+
+def test_canonical_s3_uri_never_aliases_keys() -> None:
+    # A literal percent triplet in a key must not alias the slash form.
+    assert canonical_s3_uri("bkt", "a%2Fb.png") != canonical_s3_uri("bkt", "a/b.png")
+    assert canonical_s3_uri("bkt", "runs/a b.png") == "s3://bkt/runs/a%20b.png"
+    for bad in ("", "a/", "/a", "a/../b", "a//b"):
+        with pytest.raises(EncordToolError):
+            canonical_s3_uri("bkt", bad)
+
+
+def test_normalize_object_url_is_identity_preserving() -> None:
+    a = normalize_object_url("HTTPS://Host.example/bkt/p/a%2eмp4")
+    b = normalize_object_url("https://host.example/bkt/p/a.мp4")
+    assert a == b  # unreserved escapes normalize
+    # reserved escapes are preserved: %2F is not a path separator
+    assert normalize_object_url("https://h/bkt/a%2Fb") != normalize_object_url(
+        "https://h/bkt/a/b"
+    )
+    with pytest.raises(EncordToolError):
+        normalize_object_url("https://user:pw@h/bkt/a")
+
+
+def test_resolve_exact_identity_prefers_metadata_and_detects_conflicts() -> None:
+    meta_item = SimpleNamespace(
+        uuid=_uuid(81),
+        client_metadata={"npa": {"source_uri": "s3://bkt/p/a.mp4"}},
+        url="",
+    )
+    url_item = SimpleNamespace(
+        uuid=_uuid(82), client_metadata={}, url=f"{ENDPOINT}/bkt/p/a.mp4"
+    )
+    resolution = resolve_exact_identity(
+        source_uri="s3://bkt/p/a.mp4",
+        submitted_object_url=f"{ENDPOINT}/bkt/p/a.mp4",
+        candidates=[meta_item, url_item],
+    )
+    # Two different uuids both claiming the source is a conflict, not a pick.
+    assert resolution.error_code == "identity_conflict"
+    resolution = resolve_exact_identity(
+        source_uri="s3://bkt/p/a.mp4",
+        submitted_object_url=f"{ENDPOINT}/bkt/p/a.mp4",
+        candidates=[meta_item],
+    )
+    assert resolution.resolved and resolution.signal == "metadata"
+    resolution = resolve_exact_identity(
+        source_uri="s3://bkt/p/other.mp4",
+        submitted_object_url="",
+        candidates=[meta_item, url_item],
+    )
+    assert resolution.error_code == "identity_unresolved"
+
+
+# --- integrity + verify ---------------------------------------------------------
+
+
+def test_etag_checksum_and_compare() -> None:
+    assert etag_checksum('"a" ') == ("", "none")
+    md5 = "d41d8cd98f00b204e9800998ecf8427e"
+    assert etag_checksum(f'"{md5}"') == (md5, "md5")
+    assert etag_checksum(f'"{md5}-3"') == ("", "none")  # multipart is not a digest
+    assert compare_checksums(md5, "md5", md5.upper(), "md5") is True
+    assert compare_checksums(md5, "md5", "deadbeef" * 4, "md5") is False
+    assert compare_checksums(md5, "md5", "abc", "sha256") is None
+    assert compare_checksums("", "none", md5, "md5") is None
+
+
+def test_write_hashed_stream_digest(tmp_path: Path) -> None:
+    import hashlib
+
+    dest = tmp_path / "out.bin"
+    digest = write_hashed_stream([b"abc", b"", b"def"], dest)
+    assert dest.read_bytes() == b"abcdef"
+    assert digest.size == 6
+    assert digest.sha256 == hashlib.sha256(b"abcdef").hexdigest()
+    assert hash_file(dest) == digest
+
+
+def _verify_fixtures(tmp_path: Path, *, pulled_overrides=None, drop_pulled=False):
+    sha = "a" * 64
+    receipt = {
+        "schema": "npa.encord.push_receipt.v1",
+        "generated_at": "t",
+        "input_uri": "s3://bkt/p/",
+        "endpoint_url": ENDPOINT,
+        "encord_domain": "https://api.encord.com",
+        "folder_name": "f",
+        "media_filter": "videos-images",
+        "status": "done",
+        "items": [
+            {
+                "key": "p/a.mp4",
+                "source_uri": "s3://bkt/p/a.mp4",
+                "category": "videos",
+                "item_uuid": _uuid(90),
+                "status": "uploaded",
+                "source_size": 6,
+                "source_checksum": sha,
+                "source_checksum_kind": "sha256",
+            }
+        ],
+    }
+    pulled = {
+        "item_uuid": _uuid(90),
+        "name": "p/a.mp4",
+        "transfer": "download",
+        "observed_size": 6,
+        "checksum": sha,
+        "checksum_kind": "sha256",
+    }
+    pulled.update(pulled_overrides or {})
+    manifest = {
+        "schema": "npa.encord.pull_manifest.v1",
+        "generated_at": "t",
+        "encord_domain": "https://api.encord.com",
+        "source_kind": "dataset",
+        "source_id": "d",
+        "output_uri": "s3://bkt/out/",
+        "items": [] if drop_pulled else [pulled],
+    }
+    receipt_uri = tmp_path / "push_receipt.json"
+    manifest_uri = tmp_path / "manifest.json"
+    receipt_uri.write_text(json.dumps(receipt))
+    manifest_uri.write_text(json.dumps(manifest))
+    return str(receipt_uri), str(manifest_uri)
+
+
+def test_run_verify_passes_on_exact_match(tmp_path: Path) -> None:
+    receipt_uri, manifest_uri = _verify_fixtures(tmp_path)
+    report = run_verify(
+        receipt_uri=receipt_uri,
+        manifest_uri=manifest_uri,
+        output_path=str(tmp_path / "roundtrip_report.json"),
+        storage_client=FakeStorage(),
+    )
+    assert report.status == "passed"
+    assert report.expected == report.matched == 1
+    assert report.checksum_verified == 1 and report.checksum_mismatched == 0
+    payload = json.loads((tmp_path / "roundtrip_report.json").read_text())
+    assert payload["schema"] == "npa.encord.roundtrip_report.v1"
+
+
+def test_run_verify_fails_closed_on_checksum_mismatch(tmp_path: Path) -> None:
+    receipt_uri, manifest_uri = _verify_fixtures(
+        tmp_path, pulled_overrides={"checksum": "b" * 64}
+    )
+    with pytest.raises(EncordToolError, match="1 checksum mismatched"):
+        run_verify(
+            receipt_uri=receipt_uri,
+            manifest_uri=manifest_uri,
+            output_path=str(tmp_path / "roundtrip_report.json"),
+            storage_client=FakeStorage(),
+        )
+    payload = json.loads((tmp_path / "roundtrip_report.json").read_text())
+    assert payload["status"] == "failed"
+    assert payload["items"][0]["checksum_state"] == "mismatched"
+
+
+def test_run_verify_fails_closed_on_missing_item(tmp_path: Path) -> None:
+    receipt_uri, manifest_uri = _verify_fixtures(tmp_path, drop_pulled=True)
+    with pytest.raises(EncordToolError, match="1 missing"):
+        run_verify(
+            receipt_uri=receipt_uri,
+            manifest_uri=manifest_uri,
+            output_path=str(tmp_path / "roundtrip_report.json"),
+            storage_client=FakeStorage(),
+        )
+
+
+def test_run_verify_incomparable_kinds_are_unavailable_not_failures(
+    tmp_path: Path,
+) -> None:
+    # A multipart-source object vs a sha256 download: no comparison exists.
+    receipt_uri, manifest_uri = _verify_fixtures(
+        tmp_path,
+        pulled_overrides={"checksum": "c" * 32, "checksum_kind": "md5"},
+    )
+    report = run_verify(
+        receipt_uri=receipt_uri,
+        manifest_uri=manifest_uri,
+        output_path=str(tmp_path / "roundtrip_report.json"),
+        storage_client=FakeStorage(),
+    )
+    assert report.status == "passed"
+    assert report.checksum_unavailable == 1

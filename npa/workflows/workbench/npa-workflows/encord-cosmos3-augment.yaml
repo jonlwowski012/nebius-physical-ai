@@ -107,10 +107,8 @@ states:
     run:
       argv:
         - python3
-        - -c
-        - >-
-          import sys; from npa.workflows.encord_loop import stage_media_for_augment;
-          stage_media_for_augment(*sys.argv[1:])
+        - -m
+        - npa.workflows.encord_loop
         - "{{config.encord_pull_uri}}manifest.json"
         - "{{config.cosmos3_input_path}}"
         - "{{config.encord_item_index}}"

@@ -11,7 +11,10 @@ Options
 --help  Show this message and exit.
 Commands
 push  Register S3 media in Encord and optionally link a dataset.
+curate  Headlessly curate a folder into a Collection via Encord quality filters.
 pull  Pull curated media + labels + lineage manifest back to S3.
+verify  Verify a push receipt against a pull manifest by exact identity.
+cleanup  Tear down run-scoped Encord state created by push/curate/seed-demo.
 seed-demo  Seed the demo source dataset for encord-cosmos3-augment, or no-op.
 ```
 
@@ -26,7 +29,10 @@ seed-demo  Seed the demo source dataset for encord-cosmos3-augment, or no-op.
 | Command | Description |
 | --- | --- |
 | `push` | Register S3 media in Encord and optionally link a dataset. |
+| `curate` | Headlessly curate a folder into a Collection via Encord quality filters. |
 | `pull` | Pull curated media + labels + lineage manifest back to S3. |
+| `verify` | Verify a push receipt against a pull manifest by exact identity. |
+| `cleanup` | Tear down run-scoped Encord state created by push/curate/seed-demo. |
 | `seed-demo` | Seed the demo source dataset for encord-cosmos3-augment, or no-op. |
 
 ## Examples

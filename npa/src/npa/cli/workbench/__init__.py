@@ -106,8 +106,27 @@ def _full_app() -> typer.Typer:
 
 
 if _LIGHT_IMPORT:
-    # Capability images need only this one command and deliberately omit the
-    # unrelated platform SDK dependency tree.
-    from npa.cli.workbench.cosmos2 import app
+    # Capability images need only their own commands and deliberately omit the
+    # unrelated platform SDK dependency tree. The GR00T image also bakes
+    # NPA_SKIP_EAGER_IMPORTS=1, and its toolRef argv is
+    # `npa workbench groot finetune`, so the light tree must register the
+    # import-light groot app too (stdlib + typer only) or that stage cannot
+    # resolve its own command. cosmos2 stage argv never dispatches through this
+    # app: `npa.cli.entry` intercepts ("workbench", "cosmos2", "transfer")
+    # before the command tree loads.
+    from npa.cli.workbench.cosmos2 import app as _cosmos2_app
+
+    app = typer.Typer(
+        name="workbench",
+        help="Physical AI workbench tools (capability image).",
+        no_args_is_help=True,
+    )
+    app.add_typer(_cosmos2_app, name="cosmos2")
+    try:
+        from npa.cli.groot import app as _groot_app
+    except ImportError:  # pragma: no cover - image without the groot CLI extras
+        pass
+    else:
+        app.add_typer(_groot_app, name="groot")
 else:
     app = _full_app()

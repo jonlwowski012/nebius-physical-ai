@@ -68,10 +68,9 @@ OPENPI_TERMS_ENV = "NPA_OPENPI_ACCEPT_GEMMA_TERMS"
 SECRET_ENV_HINTS: dict[str, tuple[str, ...]] = {
     "workbench.openpi": (OPENPI_TERMS_ENV,),
     "workbench.token_factory": ("NEBIUS_TOKEN_FACTORY_KEY",),
-    # Encord SaaS auth. Hint only the base64 transport form: it is the
-    # multi-line-safe way through --secret-env, and the live-matrix guard
-    # requires cases to declare every hinted secret (the stage guard itself
-    # accepts ENCORD_SSH_KEY too).
+    # Encord SaaS auth. The base64 form is the only pod transport: it is
+    # multi-line-safe through --secret-env (a raw PEM paste is a documented
+    # live failure mode and is no longer accepted).
     "workbench.encord": ("ENCORD_SSH_KEY_B64",),
     "workbench.vlm_eval": (),
     # Attribute verification generates and answers its questions on Token Factory.
@@ -1560,9 +1559,9 @@ def render_setup_for_tool(
     if tool_ref.startswith("workbench.encord"):
         # Avoid ${VAR:-} bash forms so SkyPilot placeholder lint stays clean.
         parts.append(
-            'if [[ -z "$ENCORD_SSH_KEY" && -z "$ENCORD_SSH_KEY_B64" ]]; then\n'
+            'if [[ -z "$ENCORD_SSH_KEY_B64" ]]; then\n'
             "  echo 'An Encord credential is required. Pass it with --secret-env "
-            "ENCORD_SSH_KEY_B64 (base64 of the PEM) or --secret-env ENCORD_SSH_KEY' >&2\n"
+            "ENCORD_SSH_KEY_B64 (base64 of the PEM)' >&2\n"
             "  exit 1\n"
             "fi\n"
         )

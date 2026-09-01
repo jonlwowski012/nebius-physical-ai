@@ -285,12 +285,13 @@ def check_encord(credentials: Any, probes: CredentialProbes) -> CheckResult:
         return CheckResult(
             name="encord",
             status=WARN,
-            summary="No Encord credential (ENCORD_SSH_KEY / ENCORD_SSH_KEY_B64) is set.",
+            summary="No Encord credential (ENCORD_SSH_KEY_B64 / ENCORD_SSH_KEY_FILE) is set.",
             remedy=(
-                "Required only for `npa workbench encord` push/pull. Generate a key "
-                "pair in the Encord app (public keys), store the PEM under "
-                "tokens: ENCORD_SSH_KEY in ~/.npa/credentials.yaml, or export "
-                "ENCORD_SSH_KEY_B64 (base64 of the PEM) for --secret-env forwarding."
+                "Required only for `npa workbench encord` push/curate/pull. "
+                "Generate a key pair in the Encord app (public keys), then set "
+                "tokens: ENCORD_SSH_KEY_B64 (base64 of the PEM) or "
+                "ENCORD_SSH_KEY_FILE (path to the key file) in "
+                "~/.npa/credentials.yaml."
             ),
         )
     if probes.encord_verifier is None:

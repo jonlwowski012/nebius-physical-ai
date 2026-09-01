@@ -85,6 +85,11 @@ class StorageClient:
             config=BotoConfig(
                 signature_version="s3v4",
                 retries={"max_attempts": 3, "mode": "adaptive"},
+                # A stalled TCP connection must not leave an NPA workflow
+                # preflight blocked indefinitely while staging source files.
+                connect_timeout=10,
+                read_timeout=60,
+                max_pool_connections=16,
             ),
         )
 

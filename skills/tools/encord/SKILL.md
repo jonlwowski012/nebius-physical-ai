@@ -1,16 +1,19 @@
 ---
 name: encord
-description: Use when pushing Nebius object-store media into the Encord curation SaaS (register-in-place, bytes stay in the bucket), pulling curated Collections/Datasets/Project labels back to S3, or wiring the encord-push / encord-pull / encord-roundtrip-smoke workflows.
+description: Use when pushing Nebius object-store media into the Encord curation SaaS (register-in-place, bytes stay in the bucket), curating headlessly with Encord quality-metric filter presets (no human in the app), pulling curated Collections/Datasets/Project labels back to S3, or wiring the encord-push / encord-curate / encord-pull / encord-roundtrip-smoke workflows.
 ---
 
-# Encord (curation SaaS push/pull)
+# Encord (curation SaaS push/curate/pull)
 
 Encord is a third-party labeling/curation platform. The workbench integration
 is a **register-in-place** loop: `push` lists an S3 prefix, registers public
 objectUrls with Encord through a cloud integration (bytes never leave the
-bucket), and links the items into an Encord dataset; a human curates in the
-Encord app; `pull` materializes the curated Collection, Dataset, or a Project's
-labels back to S3 as media + per-item JSON + a lineage manifest.
+bucket), and links the items into an Encord dataset; curation is either
+**headless** (`curate` — workbench-declared quality filters evaluated
+server-side by Encord into a Collection, no human in the app) or manual (a
+human curates in the Encord app); `pull` materializes the curated Collection,
+Dataset, or a Project's labels back to S3 as media + per-item JSON + a lineage
+manifest.
 
 ## Three-access pattern
 
@@ -39,24 +42,23 @@ Operator walkthrough (account setup through troubleshooting):
 
 ## Auth
 
-Generate a key pair in the Encord app (public keys) and store the PEM:
+Generate a key pair in the Encord app (public keys). Exactly **two** credential
+transports exist — a raw multi-line PEM pasted into YAML/env is
+truncation-prone (an observed live failure) and is not accepted:
 
 ```yaml
-# ~/.npa/credentials.yaml
+# ~/.npa/credentials.yaml — laptops: point at the key file
 tokens:
-  ENCORD_SSH_KEY: |
-    -----BEGIN OPENSSH PRIVATE KEY-----
-    ...
+  ENCORD_SSH_KEY_FILE: /Users/<you>/.ssh/encord-private-key.ed25519
 ```
 
-For workflow submits, forward the secret by name only. The base64 form is the
-multi-line-safe transport (`base64 < key.pem | tr -d '\n'`):
+For pods/workflow submits, the base64 form is the multi-line-safe transport
+(`base64 < key.pem | tr -d '\n'`), forwarded by name only:
 
 ```bash
 --secret-env ENCORD_SSH_KEY_B64
 ```
 
-`ENCORD_SSH_KEY_FILE` (a path) also works for local CLI runs, and
 `ENCORD_DOMAIN` selects a non-default (e.g. US) API domain. Verify before
 spending time:
 
@@ -74,7 +76,15 @@ npa workbench encord push \
   --folder my-batch --dataset my-batch \
   --output-path s3://<bucket>/encord/push/
 
-# After curating in the Encord app: materialize the keeper Collection.
+# Curate headlessly: Encord evaluates the filters server-side into a
+# Collection (no human in the app). Zero selected items fails closed.
+npa workbench encord curate \
+  --folder my-batch \
+  --filter brightness:0.2:0.8 --filter width:640:4096 \
+  --collection my-batch-keepers \
+  --output-path s3://<bucket>/encord/curate/
+
+# Or after curating in the Encord app: materialize the keeper Collection.
 npa workbench encord pull \
   --source collection --source-id <collection-uuid-or-name> \
   --output-path s3://<bucket>/encord/pull/
@@ -92,8 +102,28 @@ zero-egress server-side copies, uploaded items stream back through Encord
 signed URLs.
 
 Titles resolve wherever they are unique; UUID/hash-shaped values must exist.
-`push --folder/--dataset` titles are created when absent; `pull --source-id`
-never creates.
+`push --folder/--dataset` and `curate --collection` titles are created when
+absent; `curate --folder` and `pull --source-id` never create.
+
+## Headless curation (`curate`)
+
+`--filter metric:min:max` (repeatable; comma-separable in one value, which is
+the workflow-template form) maps onto a run-scoped Encord **filter preset**
+(`npa-curate-<run-id>`, deleted best-effort once the selection lands — the
+receipt's `filter_preset_json` is the reproducibility record) using the filter
+shape pinned by live spike:
+`{"include", "values": [min, max], "domain": "data", "metric": "<id>",
+"type": "metric"}`. The tool creates/reuses the Collection and calls
+`add_preset_items` — Encord evaluates the selection server-side (asynchronous;
+the tool polls until stable, `--poll-seconds` default 300).
+
+Metric allowlist (unknown names fail closed **before** any Encord call — an
+unpinned shape hangs Encord's evaluation request): intrinsic `width`,
+`height`, `area`, `aspect-ratio` evaluate on any folder immediately; computed
+`brightness`, `sharpness`, `file-size` match nothing until quality metrics
+have been computed for the folder — a one-time action in the Encord app with
+no public API. Zero selected items fails closed (exit 1) with a diagnostic
+that names this cause when a computed metric is in play.
 
 ## Supported formats in NPA
 
@@ -108,17 +138,39 @@ DICOM series because they lack one signed media URL.
 
 ## Data contract
 
+- **Exact identity** (adopted from PR #363): every pushed item is registered
+  with namespaced `npa.source_uri` clientMetadata, and receipt lineage resolves
+  through that metadata or the item's normalized objectUrl — display names,
+  and in particular basenames, are never identity. Conflicting signals fail
+  the item closed (`identity signals conflict`).
 - Push receipt: `push_receipt.json` (`npa.encord.push_receipt.v1`) — per-item
-  objectUrl/uuid/status, unit counts, folder/dataset lineage. Written **before**
-  any failure exit (crashes after Encord was mutated land in the artifact's
-  `error` field); any unit error fails the command closed (exit 1).
+  source_uri/objectUrl/uuid/status plus source size + checksum (single-part S3
+  ETag as md5 in register mode; sha256 of the bytes in upload mode), unit
+  counts, folder/dataset lineage. A **write-ahead** copy with `status: planned`
+  lands before the first Encord mutation, then the final receipt overwrites it
+  (crashes after Encord was mutated land in the artifact's `error` field); any
+  unit error fails the command closed (exit 1).
+- Roundtrip report: `roundtrip_report.json` (`npa.encord.roundtrip_report.v1`)
+  from `encord verify --receipt-uri ... --manifest-uri ...` — joins receipt to
+  manifest by Encord uuid and fails closed on missing/unexpected items, size
+  mismatches, or checksum mismatches (kinds that cannot be compared, e.g. a
+  multipart ETag, count as `checksum_unavailable`, not failures). This is the
+  machine-checkable checksum evidence; the roundtrip smoke ends with it.
+- Curate receipt: `curate_receipt.json` (`npa.encord.curate_receipt.v1`) — the
+  parsed filters, the exact preset JSON sent to Encord, preset + Collection
+  uuids/lineage, and the selected count. Same written-before-failure contract;
+  zero selected items fails closed.
 - Pull output under `--output-path`: `media/<item_uuid>__<name>`,
   `items/<item_uuid>.json`, `labels/<label_hash>.json` (project source only),
   and `manifest.json` (`npa.encord.pull_manifest.v1`) with copy/download/failed
   counts. Media registered from this bucket returns as zero-egress
   **server-side copies**; anything else streams through the Encord signed URL.
-- Register-mode re-push is idempotent (duplicates skipped, existing items
-  re-linked); upload-mode re-push creates new copies. Re-pull overwrites.
+- Re-push is idempotent in **both** modes as a caller-side invariant: push
+  resolves exact identity against the folder first and transfers only what is
+  absent, so a retried stage re-registers nothing and copies no duplicate
+  bytes. Re-pull overwrites. Run-scoped Encord state is torn down with
+  `npa workbench encord cleanup --title-prefix <npa-...->` (datasets are
+  reported, not deleted — the SDK has no dataset deletion).
 
 ## Workflows
 
@@ -136,19 +188,27 @@ DICOM series because they lack one signed media URL.
   `--var encord_source_id=<your curated id>` (the seed stage no-ops) and
   `encord_transfer=register` + `encord_integration=<title>` for real data;
   `encord_item_index` selects which pulled video to augment.
+- `npa/workflows/workbench/npa-workflows/encord-cosmos3-groot-finetune.yaml` —
+  the fully unattended loop: push a LeRobot camera stream, curate it
+  headlessly into `npa-groot-curated-<run-id>` (default filter is the
+  intrinsic `width:32:16384`; override `encord_curate_filters` for
+  brightness/sharpness on metric-computed folders), pull the curated
+  Collection, augment with Cosmos 3, materialize, and fine-tune GR00T.
 - `npa/workflows/workbench/npa-workflows/encord-roundtrip-smoke.yaml` — the
   live e2e test: push fixture media into a fresh `npa-e2e-<run-id>` folder +
-  dataset, then pull that dataset back by title in the same run. Submit with
+  dataset, curate a run-scoped Collection headlessly, then pull both the
+  dataset (by title) and the Collection in the same run. Submit with
   `--secret-env ENCORD_SSH_KEY_B64 --secret-env AWS_ACCESS_KEY_ID
-  --secret-env AWS_SECRET_ACCESS_KEY`. Clean up `npa-e2e-*` folders/datasets in
-  Encord afterwards.
+  --secret-env AWS_SECRET_ACCESS_KEY`. Clean up `npa-e2e-*` folders/datasets/
+  collections in Encord afterwards (curate deletes its own presets).
 
-toolRefs: workbench.encord.push, workbench.encord.pull
+toolRefs: workbench.encord.push, workbench.encord.curate, workbench.encord.pull,
+workbench.encord.verify
 
 ## GPU routing
 
-CPU-only, both verbs. No container image; stages run on the SkyPilot default
-image with the `npa[encord]` extra installed at setup.
+CPU-only, all three verbs. No container image; stages run on the SkyPilot
+default image with the `npa[encord]` extra installed at setup.
 
 ## Known issues and boundaries
 

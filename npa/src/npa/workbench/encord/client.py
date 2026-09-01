@@ -14,15 +14,18 @@ from typing import Any
 
 from npa.workbench.encord.schemas import EncordAuthError, EncordToolError
 
-ENCORD_SSH_KEY_ENV = "ENCORD_SSH_KEY"
+# Exactly two credential transports (a raw multi-line PEM pasted into YAML or
+# an env var is truncation-prone and was an observed live failure):
+# - ENCORD_SSH_KEY_B64: base64 of the PEM — survives env/secret transport (pods)
+# - ENCORD_SSH_KEY_FILE: path to the downloaded key file (laptops)
 ENCORD_SSH_KEY_B64_ENV = "ENCORD_SSH_KEY_B64"
 ENCORD_SSH_KEY_FILE_ENV = "ENCORD_SSH_KEY_FILE"
 ENCORD_DOMAIN_ENV = "ENCORD_DOMAIN"
 DEFAULT_ENCORD_DOMAIN = "https://api.encord.com"
 
 AUTH_REMEDY = (
-    "Set ENCORD_SSH_KEY (PEM content) or ENCORD_SSH_KEY_B64 (base64 of the PEM) in "
-    "the environment or under tokens: in ~/.npa/credentials.yaml, or point "
+    "Set ENCORD_SSH_KEY_B64 (base64 of the PEM: `base64 < key.pem | tr -d '\\n'`) "
+    "in the environment or under tokens: in ~/.npa/credentials.yaml, or point "
     "ENCORD_SSH_KEY_FILE at the key file. Generate the key pair in the Encord app "
     "under public keys, and pass the secret to workflow submits with "
     "--secret-env ENCORD_SSH_KEY_B64."
@@ -79,7 +82,7 @@ def _resolve_auth_env(environ: dict[str, str] | None = None) -> dict[str, str]:
     tokens = load_credentials().tokens
     return {
         name: tokens.get(name, "")
-        for name in (ENCORD_SSH_KEY_ENV, ENCORD_SSH_KEY_B64_ENV, ENCORD_SSH_KEY_FILE_ENV)
+        for name in (ENCORD_SSH_KEY_B64_ENV, ENCORD_SSH_KEY_FILE_ENV)
     }
 
 
@@ -87,12 +90,12 @@ def _default_user_client(environ: dict[str, str] | None = None) -> Any:
     """Build an authenticated EncordUserClient from env/NPA credentials."""
 
     env = _resolve_auth_env(environ)
-    ssh_key = env.get(ENCORD_SSH_KEY_ENV, "").strip()
+    ssh_key = ""
     ssh_key_b64 = env.get(ENCORD_SSH_KEY_B64_ENV, "").strip()
     ssh_key_file = env.get(ENCORD_SSH_KEY_FILE_ENV, "").strip()
-    if not (ssh_key or ssh_key_b64 or ssh_key_file):
+    if not (ssh_key_b64 or ssh_key_file):
         raise EncordAuthError(f"No Encord credential found. {AUTH_REMEDY}")
-    if not ssh_key and ssh_key_b64:
+    if ssh_key_b64:
         try:
             ssh_key = base64.b64decode(ssh_key_b64, validate=True).decode("utf-8")
         except (ValueError, UnicodeDecodeError) as exc:
@@ -157,7 +160,7 @@ def resolve_integration(user_client: Any, value: str) -> tuple[str, str]:
     )
 
 
-def resolve_folder(user_client: Any, value: str) -> tuple[Any, bool]:
+def resolve_folder(user_client: Any, value: str, *, create: bool = True) -> tuple[Any, bool]:
     """Resolve a storage folder by uuid or title -> (folder, created)."""
 
     value = value.strip()
@@ -177,6 +180,8 @@ def resolve_folder(user_client: Any, value: str) -> tuple[Any, bool]:
             f"Multiple Encord storage folders named {value!r}; pass the folder "
             "uuid instead."
         )
+    if not create:
+        raise EncordToolError(f"No Encord storage folder named {value!r}.")
     folder = user_client.create_storage_folder(
         value, description="Created by npa workbench encord push"
     )
@@ -251,26 +256,49 @@ def resolve_project(user_client: Any, value: str) -> tuple[Any, str, str]:
     raise EncordToolError(f"No Encord project titled {value!r}.")
 
 
-def resolve_collection(user_client: Any, value: str) -> tuple[Any, str, str]:
-    """Resolve a collection by uuid or name -> (collection, uuid, name)."""
+def resolve_collection(
+    user_client: Any,
+    value: str,
+    *,
+    create_in_folder_uuid: str = "",
+) -> tuple[Any, str, str, bool]:
+    """Resolve a collection by uuid or name -> (collection, uuid, name, created).
+
+    Index collections are scoped to a top-level storage folder, so a non-empty
+    ``create_in_folder_uuid`` (curate's collection-by-title path) both scopes
+    the title search to that folder server-side and is where a missing title is
+    created; without it a missing title is an error (pull's path).
+    """
 
     value = value.strip()
     if not value:
         raise EncordToolError("Collection reference must not be empty.")
     if looks_like_id(value):
         collection = user_client.get_collection(value)
-        return collection, value, str(getattr(collection, "name", ""))
+        return collection, value, str(getattr(collection, "name", "")), False
+    scope = (
+        {"top_level_folder_uuid": create_in_folder_uuid}
+        if create_in_folder_uuid
+        else {}
+    )
     matches = [
         collection
-        for collection in user_client.list_collections()
+        for collection in user_client.list_collections(**scope)
         if str(collection.name) == value
     ]
     if len(matches) == 1:
         collection = matches[0]
-        return collection, str(collection.uuid), value
+        return collection, str(collection.uuid), value, False
     if len(matches) > 1:
         raise EncordToolError(
             f"Multiple Encord collections named {value!r}; pass the collection "
             "uuid instead."
         )
-    raise EncordToolError(f"No Encord collection named {value!r}.")
+    if not create_in_folder_uuid:
+        raise EncordToolError(f"No Encord collection named {value!r}.")
+    collection = user_client.create_collection(
+        top_level_folder_uuid=create_in_folder_uuid,
+        name=value,
+        description="Created by npa workbench encord curate",
+    )
+    return collection, str(collection.uuid), value, True

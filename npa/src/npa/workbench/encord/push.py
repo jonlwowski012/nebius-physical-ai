@@ -6,11 +6,18 @@ through a cloud integration. In upload mode the bytes are copied into
 Encord-hosted storage instead. Either way, items are then explicitly linked to
 a dataset (Encord never links automatically), and the receipt is written before
 any failure exit so lineage survives fail-closed runs.
+
+Identity is exact (adopted from PR #363): every item is registered with
+namespaced ``npa.source_uri`` clientMetadata, and receipt lineage resolves
+through that metadata or the item's normalized objectUrl — never through
+display names. A write-ahead receipt lands before the first Encord mutation so
+even a crash mid-mutation leaves a durable record of intent.
 """
 
 from __future__ import annotations
 
 import tempfile
+import time
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
@@ -25,6 +32,12 @@ from npa.workbench.encord.client import (
     resolve_integration,
     resolve_public_endpoint,
 )
+from npa.workbench.encord.identity import (
+    canonical_s3_uri,
+    identity_metadata,
+    resolve_exact_identity,
+)
+from npa.workbench.encord.integrity import etag_checksum, hash_file
 from npa.workbench.encord.schemas import (
     DEFAULT_MEDIA_FILTER,
     DEFAULT_POLL_TIMEOUT_SECONDS,
@@ -34,7 +47,7 @@ from npa.workbench.encord.schemas import (
     PushedItem,
     PushReceipt,
 )
-from npa.workbench.encord.storage import write_json
+from npa.workbench.encord.storage import artifact_uri_for, error_text, finalize_artifact
 
 MEDIA_CATEGORIES: dict[str, str] = {
     ".mp4": "videos",
@@ -60,14 +73,14 @@ FILTER_CATEGORIES: dict[str, dict[str, str]] = {
 }
 TRANSFER_MODES = ("register", "upload")
 BATCH_SIZE = 500
+# One short re-list absorbs folder-listing lag right after registration.
+IDENTITY_RELIST_DELAY_SECONDS = 5.0
 
 
 def push_receipt_uri_for(output_path: str) -> str:
     """The exact receipt URI a given --output-path resolves to."""
 
-    if output_path.endswith(".json"):
-        return output_path
-    return output_path.rstrip("/") + f"/{PUSH_RECEIPT_FILENAME}"
+    return artifact_uri_for(output_path, PUSH_RECEIPT_FILENAME)
 
 
 def object_url_for(endpoint_url: str, bucket: str, key: str) -> str:
@@ -78,8 +91,8 @@ def object_url_for(endpoint_url: str, bucket: str, key: str) -> str:
 
 def discover_objects(
     storage_client: Any, input_uri: str, media: str
-) -> tuple[list[tuple[str, str]], list[str]]:
-    """List (key, category) pairs under the prefix plus skipped keys."""
+) -> tuple[list[tuple[str, str, int, str]], list[str]]:
+    """List (key, category, size, etag) rows under the prefix plus skipped keys."""
 
     allowed = FILTER_CATEGORIES.get(media)
     if allowed is None:
@@ -88,7 +101,7 @@ def discover_objects(
             f"{', '.join(FILTER_CATEGORIES)}."
         )
     bucket, prefix = _parse_bucket_uri(input_uri)
-    entries: list[tuple[str, str]] = []
+    entries: list[tuple[str, str, int, str]] = []
     skipped: list[str] = []
     paginator = storage_client.s3.get_paginator("list_objects_v2")
     for page in paginator.paginate(Bucket=bucket, Prefix=prefix):
@@ -98,7 +111,9 @@ def discover_objects(
                 continue
             category = allowed.get(Path(key).suffix.lower())
             if category:
-                entries.append((key, category))
+                entries.append(
+                    (key, category, int(obj.get("Size") or 0), str(obj.get("ETag") or ""))
+                )
             else:
                 skipped.append(key)
     if not entries:
@@ -109,11 +124,21 @@ def discover_objects(
 
 
 def build_upload_json(items: list[PushedItem]) -> dict[str, Any]:
-    """Encord upload-format JSON for one registration batch."""
+    """Encord upload-format JSON for one registration batch.
+
+    Every entry carries the namespaced npa.source_uri clientMetadata and the
+    full object key as title, so identity never rests on a display name.
+    """
 
     payload: dict[str, Any] = {"skip_duplicate_urls": True}
     for item in items:
-        payload.setdefault(item.category, []).append({"objectUrl": item.object_url})
+        payload.setdefault(item.category, []).append(
+            {
+                "objectUrl": item.object_url,
+                "title": item.key,
+                "clientMetadata": identity_metadata(item.source_uri),
+            }
+        )
     return payload
 
 
@@ -121,35 +146,51 @@ def _chunks(items: list[PushedItem], size: int) -> list[list[PushedItem]]:
     return [items[index : index + size] for index in range(0, len(items), size)]
 
 
-def _attach_item_uuid(items: list[PushedItem], item_uuid: str, name: str) -> None:
-    """Attach an Encord uuid only when its source item is unambiguous.
+def _folder_inventory(folder_obj: Any) -> list[Any]:
+    try:
+        return list(folder_obj.list_items(page_size=1000, include_client_metadata=True))
+    except TypeError:
+        return list(folder_obj.list_items(page_size=1000))
 
-    Encord normally returns the full object key, but some SDK responses contain
-    only a basename. A basename shared by multiple source keys must never be
-    used for receipt lineage: that would associate one Encord item with more
-    than one source object.
+
+def _resolve_identities(
+    folder_obj: Any, items: list[PushedItem], *, attempts: int = 2
+) -> int:
+    """Resolve each registered item's Encord uuid by exact identity only.
+
+    The folder inventory exposes each item's clientMetadata (npa.source_uri)
+    and registered objectUrl; resolution matches on those and nothing else —
+    display names, and in particular basenames, are never identity. Items the
+    old code registered without metadata still resolve through their
+    objectUrl. One short re-list absorbs listing lag right after registration.
     """
 
-    if any(item.item_uuid == item_uuid for item in items):
-        return
-    candidates = [
-        item
-        for item in items
-        if item.status == "registered" and not item.item_uuid and item.key == name
-    ]
-    if len(candidates) != 1:
-        basename = Path(name).name
-        candidates = [
+    conflicts = 0
+    for attempt in range(attempts):
+        pending = [
             item
             for item in items
-            if (
-                item.status == "registered"
-                and not item.item_uuid
-                and Path(item.key).name == basename
-            )
+            if item.status == "registered" and not item.item_uuid
         ]
-    if len(candidates) == 1:
-        candidates[0].item_uuid = item_uuid
+        if not pending:
+            break
+        if attempt:
+            time.sleep(IDENTITY_RELIST_DELAY_SECONDS)
+        inventory = _folder_inventory(folder_obj)
+        for item in pending:
+            resolution = resolve_exact_identity(
+                source_uri=item.source_uri,
+                submitted_object_url=item.object_url,
+                candidates=inventory,
+            )
+            if resolution.resolved:
+                item.item_uuid = resolution.item_uuid
+                item.identity_signal = resolution.signal
+            elif resolution.error_code == "identity_conflict":
+                item.status = "error"
+                item.error = resolution.error
+                conflicts += 1
+    return conflicts
 
 
 def _register_items(
@@ -192,10 +233,8 @@ def _register_items(
             status = "failed"
             break
 
-    # Attach receipt lineage only if Encord's returned name identifies exactly
-    # one source item. Linking always uses the uuid list directly.
-    for item_uuid, name in registered:
-        _attach_item_uuid(items, item_uuid, name)
+    # Lineage is resolved afterwards by exact identity (_resolve_identities);
+    # the (uuid, name) pairs only evidence what this run created.
     return registered, done, errors, status
 
 
@@ -220,11 +259,26 @@ def _upload_items(
             with tempfile.TemporaryDirectory(prefix="npa-encord-upload-") as tmp:
                 local = Path(tmp) / Path(item.key).name
                 storage_client.download_file(f"s3://{source_bucket}/{item.key}", str(local))
-                if item.category == "videos":
-                    item_uuid = folder_obj.upload_video(str(local), title=item.key)
-                else:
-                    item_uuid = folder_obj.upload_image(str(local), title=item.key)
+                # The bytes are local anyway: record their content digest so
+                # the roundtrip verifier can compare pulled bytes exactly.
+                digest = hash_file(local)
+                item.source_size = digest.size
+                item.source_checksum = digest.sha256
+                item.source_checksum_kind = "sha256"
+                metadata = identity_metadata(item.source_uri)
+                upload = (
+                    folder_obj.upload_video
+                    if item.category == "videos"
+                    else folder_obj.upload_image
+                )
+                try:
+                    item_uuid = upload(
+                        str(local), title=item.key, client_metadata=metadata
+                    )
+                except TypeError:
+                    item_uuid = upload(str(local), title=item.key)
             item.item_uuid = str(item_uuid)
+            item.identity_signal = "uploaded"
             item.status = "uploaded"
             uploaded.append((str(item_uuid), item.key))
             done += 1
@@ -235,39 +289,19 @@ def _upload_items(
     return uploaded, done, errors, "done"
 
 
-def _link_dataset(
-    dataset_obj: Any,
-    folder_obj: Any,
-    items: list[PushedItem],
-    registered: list[tuple[str, str]],
-    *,
-    transfer: str,
-) -> int:
-    """Link this push's items into the dataset; return how many were linked.
+def _link_dataset(dataset_obj: Any, items: list[PushedItem]) -> int:
+    """Link this push's identity-resolved items into the dataset.
 
-    Register mode with skip_duplicate_urls reports only newly added items, so a
-    re-push would otherwise link nothing. Resolve the folder's items by name
-    (Encord names registered items by the full object key) and link the union.
+    Register mode with skip_duplicate_urls reports only newly added items, so
+    a re-push would otherwise link nothing — but by link time every item
+    (fresh or pre-existing) carries the uuid exact identity resolved, and
     link_items skips already-linked uuids server-side, so this is idempotent.
     """
 
-    uuids = {item_uuid for item_uuid, _ in registered}
-    if transfer == "register":
-        wanted_keys = {item.key for item in items}
-        basename_counts: dict[str, int] = {}
-        for item in items:
-            basename = Path(item.key).name
-            basename_counts[basename] = basename_counts.get(basename, 0) + 1
-        for existing in folder_obj.list_items(page_size=1000):
-            name = str(existing.name)
-            if name not in wanted_keys and basename_counts.get(Path(name).name) != 1:
-                continue
-            item_uuid = str(existing.uuid)
-            uuids.add(item_uuid)
-            _attach_item_uuid(items, item_uuid, name)
+    uuids = sorted({item.item_uuid for item in items if item.item_uuid})
     if not uuids:
         return 0
-    dataset_obj.link_items(sorted(uuids))
+    dataset_obj.link_items(uuids)
     return len(uuids)
 
 
@@ -307,26 +341,62 @@ def run_push(
     endpoint_url = resolve_public_endpoint(environ) if transfer == "register" else ""
 
     entries, skipped = discover_objects(active_storage, input_path, media)
-    items = [
-        PushedItem(
-            key=key,
-            object_url=(
-                object_url_for(endpoint_url, bucket, key)
-                if transfer == "register" and category != "mcap"
-                else ""
-            ),
-            category=category,
-            status="experimental_error" if category == "mcap" else "registered",
-            error=MCAP_UNSUPPORTED_ERROR if category == "mcap" else "",
+    items = []
+    for key, category, size, etag in entries:
+        checksum, checksum_kind = etag_checksum(etag)
+        items.append(
+            PushedItem(
+                key=key,
+                source_etag=etag.strip().strip('"'),
+                source_uri=canonical_s3_uri(bucket, key),
+                object_url=(
+                    object_url_for(endpoint_url, bucket, key)
+                    if transfer == "register" and category != "mcap"
+                    else ""
+                ),
+                category=category,
+                source_size=size,
+                source_checksum=checksum,
+                source_checksum_kind=checksum_kind,
+                status="experimental_error" if category == "mcap" else "registered",
+                error=MCAP_UNSUPPORTED_ERROR if category == "mcap" else "",
+            )
         )
-        for key, category in entries
-    ]
     registrable = [item for item in items if item.status == "registered"]
 
     client = user_client if user_client is not None else _default_user_client(environ)
     integration_id = integration_title = ""
     if transfer == "register":
         integration_id, integration_title = resolve_integration(client, integration)
+
+    # Write-ahead receipt: land the plan before the first Encord mutation, so
+    # even a crash mid-mutation leaves a durable record of what was attempted.
+    receipt_uri = push_receipt_uri_for(output_path)
+    planned = PushReceipt(
+        generated_at=datetime.now(timezone.utc).isoformat(),
+        workflow_run=workflow_run,
+        input_uri=input_path,
+        endpoint_url=endpoint_url,
+        encord_domain=resolve_domain(environ),
+        transfer=transfer,
+        integration_id=integration_id,
+        integration_title=integration_title,
+        folder_name=folder.strip(),
+        media_filter=media,
+        status="planned",
+        files_discovered=len(items),
+        receipt_uri=receipt_uri,
+        items=items,
+        skipped_unsupported=skipped,
+    )
+    finalize_artifact(
+        planned,
+        result_uri=receipt_uri,
+        filename=PUSH_RECEIPT_FILENAME,
+        storage_client=active_storage,
+        run_error=None,
+        failure_prefix="Encord push failed",
+    )
     # From this point on Encord may be mutated (folder/dataset creation).  Keep
     # every such operation inside the receipt-finalization path below: a failed
     # dataset create must not strand a newly-created folder without lineage.
@@ -348,25 +418,46 @@ def run_push(
             dataset_obj, dataset_hash, dataset_title, dataset_created = resolve_dataset(
                 client, dataset
             )
+        # Caller-side idempotency: resolve exact identities BEFORE transferring
+        # anything, so a retried stage re-sends only what does not already
+        # exist. This is our invariant, not the SaaS's skip_duplicate_urls —
+        # and it makes upload-mode re-pushes no-ops instead of duplicate
+        # byte copies.
+        units_error += _resolve_identities(folder_obj, registrable, attempts=1)
+        pending = [
+            item
+            for item in registrable
+            if item.status == "registered" and not item.item_uuid
+        ]
+        preexisting = sum(1 for item in registrable if item.item_uuid)
         if transfer == "upload":
-            registered, units_done, units_error, status = _upload_items(
+            for item in registrable:
+                if item.item_uuid:
+                    item.status = "uploaded"
+            registered, units_done, units_error_new, status = _upload_items(
                 folder_obj,
-                registrable,
+                pending,
                 storage_client=active_storage,
                 source_bucket=bucket,
             )
-        else:
-            registered, units_done, units_error, status = _register_items(
+            units_error += units_error_new
+        elif pending:
+            registered, units_done, units_error_new, status = _register_items(
                 folder_obj,
-                registrable,
+                pending,
                 integration_id=integration_id,
                 poll_timeout_seconds=poll_timeout_seconds,
             )
+            units_error += units_error_new
+            # Exact identity resolution (metadata/objectUrl only) attaches the
+            # Encord uuid for the freshly registered items.
+            units_error += _resolve_identities(folder_obj, pending)
+        else:
+            status = "done"
+        units_done += preexisting
 
         if dataset_obj is not None:
-            linked_count = _link_dataset(
-                dataset_obj, folder_obj, items, registered, transfer=transfer
-            )
+            linked_count = _link_dataset(dataset_obj, items)
     except Exception as exc:  # noqa: BLE001 - recorded in the receipt, re-raised below
         run_error = exc
         status = "failed"
@@ -399,21 +490,19 @@ def run_push(
         files_discovered=len(items),
         units_done=units_done,
         units_error=units_error,
-        error=f"{type(run_error).__name__}: {run_error}" if run_error else "",
+        error=error_text(run_error),
         receipt_uri=receipt_uri,
         items=items,
         skipped_unsupported=skipped,
     )
-    write_json(
-        receipt.model_dump(by_alias=True),
+    finalize_artifact(
+        receipt,
         result_uri=receipt_uri,
         filename=PUSH_RECEIPT_FILENAME,
         storage_client=active_storage,
+        run_error=run_error,
+        failure_prefix="Encord push failed",
     )
-    if run_error is not None:
-        raise EncordToolError(
-            f"Encord push failed: {receipt.error}. Receipt written to {receipt_uri}."
-        ) from run_error
     if status != "done":
         raise EncordToolError(
             f"Encord push {status}: {units_error} unit error(s), {units_done} "

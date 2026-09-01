@@ -1452,6 +1452,59 @@ TOOL_CATALOG: dict[str, ToolEntry] = {
             "encord_poll_timeout_seconds": "1800",
         },
     ),
+    "workbench.encord.curate": ToolEntry(
+        name="workbench.encord.curate",
+        description=(
+            "Headless curation: evaluate workbench-declared Encord quality "
+            "filters (metric:min:max, comma-separated) server-side into a "
+            "Collection — no human in the Encord app."
+        ),
+        argv_template=[
+            "npa",
+            "workbench",
+            "encord",
+            "curate",
+            "--folder",
+            "{{config.encord_folder}}",
+            "--filter",
+            "{{config.encord_curate_filters}}",
+            "--collection",
+            "{{config.encord_collection}}",
+            "--poll-seconds",
+            "{{config.encord_curate_poll_seconds}}",
+            "--output-path",
+            "{{config.encord_curate_receipt_uri}}",
+            "--workflow-run",
+            "{{run.id}}",
+            "--output",
+            "json",
+        ],
+        config_defaults={"encord_curate_poll_seconds": "300"},
+    ),
+    "workbench.encord.verify": ToolEntry(
+        name="workbench.encord.verify",
+        description=(
+            "Verify an Encord push receipt against a pull manifest by exact "
+            "identity: every item present, sizes equal, checksums matching "
+            "wherever digests exist on both sides."
+        ),
+        argv_template=[
+            "npa",
+            "workbench",
+            "encord",
+            "verify",
+            "--receipt-uri",
+            "{{config.encord_receipt_uri}}push_receipt.json",
+            "--manifest-uri",
+            "{{config.encord_pull_uri}}manifest.json",
+            "--output-path",
+            "{{config.encord_verify_uri}}",
+            "--workflow-run",
+            "{{run.id}}",
+            "--output",
+            "json",
+        ],
+    ),
     "workbench.encord.seed_demo": ToolEntry(
         name="workbench.encord.seed_demo",
         description=(

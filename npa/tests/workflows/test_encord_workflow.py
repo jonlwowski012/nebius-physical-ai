@@ -11,6 +11,7 @@ PUSH = WORKFLOWS / "encord-push.yaml"
 PULL = WORKFLOWS / "encord-pull.yaml"
 ROUNDTRIP = WORKFLOWS / "encord-roundtrip-smoke.yaml"
 AUGMENT = WORKFLOWS / "encord-cosmos3-augment.yaml"
+GROOT = WORKFLOWS / "encord-cosmos3-groot-finetune.yaml"
 
 
 def test_push_spec_is_a_single_terminal_state() -> None:
@@ -37,19 +38,84 @@ def test_pull_spec_is_a_single_terminal_state() -> None:
     assert outputs[0].uri.endswith("manifest.json")
 
 
-def test_roundtrip_smoke_chains_push_then_pull() -> None:
+def test_roundtrip_smoke_chains_push_curate_then_both_pulls() -> None:
     spec = load_spec(ROUNDTRIP)
     validate_spec(spec)
     assert spec.name == "encord-roundtrip-smoke"
-    steps = [step.state for step in build_plan(spec, run_id="t").steps]
-    assert steps == ["push", "pull"]
-    assert spec.states["pull"].needs == ["push"]
-    # pull consumes the receipt schema push produces (schema-chaining contract).
-    assert spec.states["pull"].inputs[0].schema == "npa.encord.push_receipt.v1"
+    plan = build_plan(spec, run_id="t")
+    steps = [step.state for step in plan.steps]
+    assert steps == ["push", "curate", "pull", "pull-curated", "verify"]
+    assert spec.states["curate"].needs == ["push"]
+    assert spec.states["pull"].needs == ["curate"]
+    # needs states the true data dependency (the curate receipt), not the
+    # linear next-chain position.
+    assert spec.states["pull-curated"].needs == ["curate"]
+    # The terminal verifier joins the push receipt to the dataset pull.
+    assert spec.states["verify"].needs == ["pull"]
+    assert spec.states["verify"].outputs[0].schema == "npa.encord.roundtrip_report.v1"
+    # Schema chain: receipt -> curate receipt -> both pull manifests.
     assert spec.states["push"].outputs[0].schema == "npa.encord.push_receipt.v1"
+    assert spec.states["curate"].inputs[0].schema == "npa.encord.push_receipt.v1"
+    assert spec.states["curate"].outputs[0].schema == "npa.encord.curate_receipt.v1"
+    assert spec.states["pull"].inputs[0].schema == "npa.encord.push_receipt.v1"
+    assert spec.states["pull-curated"].inputs[0].schema == "npa.encord.curate_receipt.v1"
     # The e2e pulls the dataset push just created, resolved by run-scoped title.
     assert spec.config["encord_source"] == "dataset"
     assert spec.config["encord_source_id"] == spec.config["encord_dataset"]
+    # The curate stage uses an intrinsic metric so it evaluates on any folder
+    # without app-side quality-metric computation.
+    assert spec.config["encord_curate_filters"].startswith("width:")
+    # pull-curated pulls the headlessly curated Collection by run-scoped title.
+    curated_argv = next(s.argv for s in plan.steps if s.state == "pull-curated")
+    assert curated_argv[curated_argv.index("--source") + 1] == "collection"
+    assert curated_argv[curated_argv.index("--source-id") + 1] == "npa-e2e-t"
+
+
+def test_curate_argv_renders_every_flag() -> None:
+    argv = argv_for_tool("workbench.encord.curate")
+    assert argv[:4] == ["npa", "workbench", "encord", "curate"]
+    for flag in (
+        "--folder",
+        "--filter",
+        "--collection",
+        "--poll-seconds",
+        "--output-path",
+        "--workflow-run",
+        "--output",
+    ):
+        assert flag in argv, flag
+    assert "{{run.id}}" in argv
+
+
+def test_verify_argv_renders_every_flag() -> None:
+    argv = argv_for_tool("workbench.encord.verify")
+    assert argv[:4] == ["npa", "workbench", "encord", "verify"]
+    for flag in ("--receipt-uri", "--manifest-uri", "--output-path", "--workflow-run", "--output"):
+        assert flag in argv, flag
+    assert "{{run.id}}" in argv
+
+
+def test_groot_finetune_curates_between_push_and_pull() -> None:
+    spec = load_spec(GROOT)
+    validate_spec(spec)
+    plan = build_plan(spec, run_id="t")
+    steps = [step.state for step in plan.steps]
+    assert steps[:3] == ["push-original", "curate", "pull-curated"]
+    assert spec.states["curate"].inputs[0].schema == "npa.encord.push_receipt.v1"
+    assert spec.states["curate"].outputs[0].schema == "npa.encord.curate_receipt.v1"
+    assert spec.states["pull-curated"].inputs[0].schema == "npa.encord.curate_receipt.v1"
+    # The pull consumes the curated Collection, not the dataset push created —
+    # derived from the one collection-title config, not spelled out twice.
+    assert spec.config["encord_source"] == "collection"
+    assert spec.config["encord_source_id"] == "{{config.encord_collection}}"
+    pull_argv = next(s.argv for s in plan.steps if s.state == "pull-curated")
+    assert pull_argv[pull_argv.index("--source-id") + 1] == "npa-groot-curated-t"
+    curate_argv = next(s.argv for s in plan.steps if s.state == "curate")
+    assert curate_argv[curate_argv.index("--folder") + 1] == "npa-groot-original-t"
+    assert curate_argv[curate_argv.index("--collection") + 1] == "npa-groot-curated-t"
+    # The default filter is intrinsic so the demo works without app-side
+    # quality-metric computation.
+    assert curate_argv[curate_argv.index("--filter") + 1].startswith("width:")
 
 
 def test_specs_declare_cpu_resource_blocks() -> None:

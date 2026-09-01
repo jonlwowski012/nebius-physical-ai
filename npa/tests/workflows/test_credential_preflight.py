@@ -215,7 +215,7 @@ def test_encord_warns_when_missing() -> None:
 
 
 def test_encord_present_unverified_from_credentials_tokens() -> None:
-    creds = _Creds(tokens={"ENCORD_SSH_KEY": "-----BEGIN OPENSSH PRIVATE KEY-----"})
+    creds = _Creds(tokens={"ENCORD_SSH_KEY_FILE": "/keys/encord.pem"})
     result = check_encord(creds, CredentialProbes())
     assert result.status == PASS
     assert "not verified" in result.summary
@@ -232,6 +232,6 @@ def test_encord_fail_when_verifier_raises() -> None:
     probes = CredentialProbes(
         encord_verifier=lambda: (_ for _ in ()).throw(RuntimeError("401 unauthorized"))
     )
-    result = check_encord(_Creds(tokens={"ENCORD_SSH_KEY": "pem"}), probes)
+    result = check_encord(_Creds(tokens={"ENCORD_SSH_KEY_B64": "abc"}), probes)
     assert result.status == FAIL
     assert result.details == ("401 unauthorized",)

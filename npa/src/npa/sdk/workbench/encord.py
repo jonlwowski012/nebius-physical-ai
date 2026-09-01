@@ -5,11 +5,14 @@ from __future__ import annotations
 from typing import Any
 
 from npa.workbench.encord.schemas import (
+    DEFAULT_CURATE_POLL_SECONDS,
     DEFAULT_MEDIA_FILTER,
     DEFAULT_POLL_TIMEOUT_SECONDS,
     DEFAULT_TRANSFER,
+    CurateReceipt,
     PullManifest,
     PushReceipt,
+    RoundtripReport,
 )
 
 
@@ -46,6 +49,33 @@ def push(
     )
 
 
+def curate(
+    *,
+    folder: str,
+    filters: list[str],
+    collection: str,
+    output_path: str,
+    workflow_run: str = "",
+    poll_seconds: float = DEFAULT_CURATE_POLL_SECONDS,
+    user_client: Any = None,
+    storage_client: Any = None,
+) -> CurateReceipt:
+    """Headlessly curate a folder into a Collection; write a receipt."""
+
+    from npa.workbench.encord.curate import run_curate
+
+    return run_curate(
+        folder=folder,
+        filters=filters,
+        collection=collection,
+        output_path=output_path,
+        workflow_run=workflow_run,
+        poll_seconds=poll_seconds,
+        user_client=user_client,
+        storage_client=storage_client,
+    )
+
+
 def pull(
     *,
     source: str,
@@ -69,4 +99,52 @@ def pull(
     )
 
 
-__all__ = ["PullManifest", "PushReceipt", "pull", "push"]
+def cleanup(
+    *,
+    title_prefix: str,
+    dry_run: bool = False,
+    user_client: Any = None,
+) -> dict[str, Any]:
+    """Delete run-scoped Encord folders/collections/presets by title prefix."""
+
+    from npa.workbench.encord.cleanup import run_cleanup
+
+    return run_cleanup(
+        title_prefix=title_prefix,
+        dry_run=dry_run,
+        user_client=user_client,
+    )
+
+
+def verify(
+    *,
+    receipt_uri: str,
+    manifest_uri: str,
+    output_path: str,
+    workflow_run: str = "",
+    storage_client: Any = None,
+) -> RoundtripReport:
+    """Verify a push receipt against a pull manifest; write the report."""
+
+    from npa.workbench.encord.verify import run_verify
+
+    return run_verify(
+        receipt_uri=receipt_uri,
+        manifest_uri=manifest_uri,
+        output_path=output_path,
+        workflow_run=workflow_run,
+        storage_client=storage_client,
+    )
+
+
+__all__ = [
+    "CurateReceipt",
+    "PullManifest",
+    "PushReceipt",
+    "RoundtripReport",
+    "cleanup",
+    "curate",
+    "pull",
+    "push",
+    "verify",
+]
