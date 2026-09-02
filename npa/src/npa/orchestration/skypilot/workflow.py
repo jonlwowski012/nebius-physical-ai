@@ -235,12 +235,6 @@ def _probe_local_api_daemon_cwd(
     rsync, so every cwd in the local server process tree must remain resolvable.
     """
 
-    if not proc_root.exists():
-        # No procfs on this platform (macOS operator workstations): the
-        # poisoned-cwd inspection is Linux-only. Cannot-assess is not
-        # unhealthy — blocking here would fail every submit from Darwin, where
-        # this failure mode was never detectable in the first place.
-        return ApiDaemonCwdProbe(True, "procfs_unsupported")
     expected_uid = os.getuid() if uid is None else uid
     try:
         caller_mount_namespace = os.readlink(proc_root / "self" / "ns" / "mnt")
@@ -253,6 +247,13 @@ def _probe_local_api_daemon_cwd(
     # would put them in different parent directories and miss the real daemon.
     sky_bin_dir = Path(sky_executable).expanduser().absolute().parent
     records: dict[int, tuple[int, tuple[str, ...], Path]] = {}
+    if sys.platform == "darwin" and proc_root == Path("/proc"):
+        # macOS has no procfs, so the deleted-cwd poisoning this probe detects
+        # cannot be inspected here. Treat the daemon as healthy rather than
+        # failing closed on every macOS operator host; the Linux-specific
+        # cwd_deleted recovery below remains unchanged, as do hermetic
+        # non-/proc test fixtures on every platform.
+        return ApiDaemonCwdProbe(True, "procfs_unavailable_darwin")
     try:
         candidates = tuple(proc_root.iterdir())
     except OSError as exc:
