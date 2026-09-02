@@ -1,4 +1,8 @@
-"""SDK surface for the Encord workbench tool."""
+"""SDK surface for the Encord workbench tool.
+
+Every function is a thin, keyword-only wrapper over the implementation in
+``npa.workbench.encord``; the CLI calls these same functions.
+"""
 
 from __future__ import annotations
 
@@ -99,23 +103,6 @@ def pull(
     )
 
 
-def cleanup(
-    *,
-    title_prefix: str,
-    dry_run: bool = False,
-    user_client: Any = None,
-) -> dict[str, Any]:
-    """Delete run-scoped Encord folders/collections/presets by title prefix."""
-
-    from npa.workbench.encord.cleanup import run_cleanup
-
-    return run_cleanup(
-        title_prefix=title_prefix,
-        dry_run=dry_run,
-        user_client=user_client,
-    )
-
-
 def verify(
     *,
     receipt_uri: str,
@@ -137,6 +124,56 @@ def verify(
     )
 
 
+def cleanup(
+    *,
+    title_prefix: str,
+    dry_run: bool = False,
+    user_client: Any = None,
+) -> dict[str, Any]:
+    """Delete run-scoped Encord folders/collections/presets by title prefix."""
+
+    from npa.workbench.encord.cleanup import run_cleanup
+
+    return run_cleanup(
+        title_prefix=title_prefix,
+        dry_run=dry_run,
+        user_client=user_client,
+    )
+
+
+def seed_demo(
+    *,
+    media_uri: str,
+    dataset: str,
+    active_source_id: str,
+    transfer: str = DEFAULT_TRANSFER,
+    integration: str = "",
+    storage_client: Any = None,
+    user_client: Any = None,
+) -> dict[str, Any]:
+    """Seed the demo source dataset for encord-cosmos3-augment, or no-op."""
+
+    from npa.workbench.encord.seed_demo import run_seed_demo
+
+    return run_seed_demo(
+        media_uri=media_uri,
+        dataset=dataset,
+        active_source_id=active_source_id,
+        transfer=transfer,
+        integration=integration,
+        storage_client=storage_client,
+        user_client=user_client,
+    )
+
+
+def system_info() -> dict[str, Any]:
+    """Runtime information for the Encord tool; makes no Encord API call."""
+
+    from npa.workbench.encord.system_info import system_info_payload
+
+    return system_info_payload()
+
+
 __all__ = [
     "CurateReceipt",
     "PullManifest",
@@ -146,5 +183,7 @@ __all__ = [
     "curate",
     "pull",
     "push",
+    "seed_demo",
+    "system_info",
     "verify",
 ]

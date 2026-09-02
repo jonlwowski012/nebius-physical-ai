@@ -5,6 +5,11 @@ every pushed item came back — with matching size and, wherever a content
 digest exists on both sides, matching checksum. This is what makes checksum
 claims machine-checkable evidence rather than assertions (adopted from
 PR #363's verifier).
+
+The verifier fails closed on the receipt itself, too: a receipt that never
+reached ``done`` (a write-ahead ``planned`` copy, or a ``failed``/``timeout``
+push) or one with nothing attributable to verify is a defect, never a
+vacuous pass.
 """
 
 from __future__ import annotations
@@ -15,6 +20,7 @@ from typing import Any
 from npa.workbench.encord.integrity import compare_checksums
 from npa.workbench.encord.schemas import (
     ROUNDTRIP_REPORT_FILENAME,
+    ChecksumState,
     EncordToolError,
     PullManifest,
     PushReceipt,
@@ -43,13 +49,25 @@ def _compare(pushed: Any, pulled: Any) -> RoundtripItem:
         pulled.checksum,
         pulled.checksum_kind,
     )
-    checksum_state = {True: "verified", False: "mismatched", None: "unavailable"}[verdict]
+    states: dict[bool | None, ChecksumState] = {
+        True: "verified",
+        False: "mismatched",
+        None: "unavailable",
+    }
+    checksum_state = states[verdict]
     if verdict is False:
         reasons.append("checksum mismatch between source and pulled bytes")
     observed_size = pulled.observed_size or pulled.file_size
-    if pushed.source_size and observed_size and pushed.source_size != observed_size:
+    size_comparable = bool(pushed.source_size and observed_size)
+    if size_comparable and pushed.source_size != observed_size:
         reasons.append(
             f"size mismatch: pushed {pushed.source_size}, pulled {observed_size}"
+        )
+    if checksum_state == "unavailable" and not size_comparable:
+        # A multipart ETag on both sides and no size from Encord leaves nothing
+        # to compare; a green row here would be an unverified claim.
+        reasons.append(
+            "unverifiable: no comparable checksum and no size on both sides"
         )
     return RoundtripItem(
         source_uri=pushed.source_uri,
@@ -82,9 +100,11 @@ def run_verify(
     report_uri = roundtrip_report_uri_for(output_path)
 
     items: list[RoundtripItem] = []
+    defects: list[str] = []
     run_error: Exception | None = None
     expected = matched = missing = unexpected = 0
     size_mismatched = checksum_verified = checksum_mismatched = checksum_unavailable = 0
+    unverifiable = 0
     try:
         receipt = PushReceipt.model_validate(
             read_json(receipt_uri, storage_client=active_storage)
@@ -92,6 +112,11 @@ def run_verify(
         manifest = PullManifest.model_validate(
             read_json(manifest_uri, storage_client=active_storage)
         )
+        if receipt.status != "done":
+            defects.append(
+                f"push receipt status is {receipt.status!r}, not 'done': the push "
+                "never completed, so there is no roundtrip to verify"
+            )
         # Push fails closed on any successful item without an exact-identity
         # uuid, so every successful receipt row is attributable by uuid here.
         pushed_ok = [
@@ -105,6 +130,11 @@ def run_verify(
             if item.transfer in ("copy", "download")
         }
         expected = len(pushed_ok)
+        if expected == 0:
+            defects.append(
+                "push receipt has no attributable items; a roundtrip over zero "
+                "items proves nothing"
+            )
         for pushed in pushed_ok:
             pulled = pulled_ok.get(pushed.item_uuid)
             if pulled is None:
@@ -126,6 +156,8 @@ def run_verify(
             matched += 1
             if any(reason.startswith("size mismatch") for reason in row.reasons):
                 size_mismatched += 1
+            if any(reason.startswith("unverifiable") for reason in row.reasons):
+                unverifiable += 1
             checksum_verified += row.checksum_state == "verified"
             checksum_mismatched += row.checksum_state == "mismatched"
             checksum_unavailable += row.checksum_state == "unavailable"
@@ -143,11 +175,13 @@ def run_verify(
     except Exception as exc:  # noqa: BLE001 - recorded in the report, re-raised below
         run_error = exc
 
-    defects = bool(
-        missing
+    failed = bool(
+        defects
+        or missing
         or unexpected
         or size_mismatched
         or checksum_mismatched
+        or unverifiable
         or expected != matched
     )
     report = RoundtripReport(
@@ -156,7 +190,7 @@ def run_verify(
         receipt_uri=receipt_uri,
         manifest_uri=manifest_uri,
         report_uri=report_uri,
-        status="failed" if (defects or run_error is not None) else "passed",
+        status="failed" if (failed or run_error is not None) else "passed",
         expected=expected,
         matched=matched,
         missing=missing,
@@ -165,6 +199,8 @@ def run_verify(
         checksum_verified=checksum_verified,
         checksum_mismatched=checksum_mismatched,
         checksum_unavailable=checksum_unavailable,
+        unverifiable=unverifiable,
+        defects=defects,
         error=error_text(run_error),
         items=items,
     )
@@ -177,11 +213,13 @@ def run_verify(
         failure_prefix="Encord verify failed",
         artifact_noun="Report",
     )
-    if defects:
+    if failed:
+        detail = f" {'; '.join(defects)}." if defects else ""
         raise EncordToolError(
             f"Encord roundtrip verification failed: {matched}/{expected} matched, "
             f"{missing} missing, {unexpected} unexpected, {size_mismatched} size "
-            f"mismatched, {checksum_mismatched} checksum mismatched. Report "
+            f"mismatched, {checksum_mismatched} checksum mismatched, {unverifiable} "
+            f"unverifiable.{detail} Report "
             f"written to {report_uri}."
         )
     return report

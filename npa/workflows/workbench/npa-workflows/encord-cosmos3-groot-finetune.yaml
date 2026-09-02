@@ -22,7 +22,12 @@ config:
   # pull-curated consumes the Collection the curate stage populates headlessly.
   encord_source: collection
   encord_source_id: "{{config.encord_collection}}"
-  encord_transfer: upload
+  # This workflow handles your own LeRobot camera streams, so it keeps the
+  # tool's register default: bytes stay in your bucket and Encord references
+  # them through the cloud integration named here (required for register;
+  # pass --var encord_integration=<title>). Only an explicit
+  # --var encord_transfer=upload copies bytes into Encord-hosted storage.
+  encord_transfer: register
   encord_integration: ""
   encord_folder: "npa-groot-original-{{run.id}}"
   encord_dataset: "npa-groot-original-{{run.id}}"

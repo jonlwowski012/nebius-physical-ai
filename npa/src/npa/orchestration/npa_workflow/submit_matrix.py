@@ -103,6 +103,35 @@ SUBMIT_LIVE_MATRIX: tuple[SubmitLiveCase, ...] = (
         ),
     ),
     SubmitLiveCase(
+        "encord-cosmos3-groot-finetune.yaml",
+        "multi",
+        secret_envs=(
+            "ENCORD_SSH_KEY_B64",
+            "HF_TOKEN",
+            "AWS_ACCESS_KEY_ID",
+            "AWS_SECRET_ACCESS_KEY",
+        ),
+        image_tool="cosmos3",
+        image_overrides=(("workbench.groot.finetune", "groot"),),
+        runtime=True,
+        rotation_skip=True,
+        skip_reason=(
+            "Needs operator inputs no standalone submit can stage: a LeRobot v3 "
+            "dataset at config.lerobot_dataset_uri and (register mode, the tool "
+            "default) a cloud integration title that can read it. It also spans "
+            "two GPU images (Cosmos3 video2video, then GR00T fine-tune) and a "
+            "multi-hour fine-tune, so it stays a manual run; its Encord hops are "
+            "covered daily by encord-roundtrip-smoke.yaml and the Cosmos hop by "
+            "encord-cosmos3-augment.yaml."
+        ),
+        notes=(
+            "push -> headless curate -> pull-curated -> Cosmos3 augment loop -> "
+            "push-augmented -> materialize LeRobot episodes -> GR00T fine-tune. "
+            "Submit with --runtime, --var bucket=..., --var encord_integration=..., "
+            "and --var lerobot_dataset_uri=s3://.../ pointing at a LeRobot v3 tree."
+        ),
+    ),
+    SubmitLiveCase(
         "encord-roundtrip-smoke.yaml",
         "cpu",
         secret_envs=(

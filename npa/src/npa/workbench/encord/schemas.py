@@ -4,6 +4,9 @@ The Encord tool registers Nebius object-store media in place (bytes stay in the
 bucket; Encord references them through an S3-compatible cloud integration) and
 pulls curated data plus labels back to S3. These models are the durable receipt
 and manifest contracts other stages consume.
+
+Every enumerated field is a ``Literal`` so the vocabulary each artifact may
+carry is typed in one place rather than enumerated in comments.
 """
 
 from __future__ import annotations
@@ -24,8 +27,36 @@ ROUNDTRIP_REPORT_FILENAME = "roundtrip_report.json"
 # How a recorded checksum was produced. A single-part S3 ETag is an MD5 digest;
 # a multipart ETag is not a content digest and is recorded as "none".
 ChecksumKind = Literal["none", "md5", "sha256"]
-DEFAULT_MEDIA_FILTER = "videos-images"
-DEFAULT_TRANSFER = "register"
+# Push --transfer modes: register keeps the bytes in the bucket and Encord
+# references objectUrls; upload copies the bytes into Encord-hosted storage.
+TransferMode = Literal["register", "upload"]
+TRANSFER_MODES: tuple[TransferMode, ...] = ("register", "upload")
+# Push --media filters. mcap/all expose the experimental MCAP path.
+MediaFilter = Literal["videos-images", "mcap", "all"]
+# Pull --source containers.
+PullSourceKind = Literal["collection", "dataset", "project"]
+PULL_SOURCES: tuple[PullSourceKind, ...] = ("collection", "dataset", "project")
+# Per-item push outcome. experimental_error marks a discovered-but-unsupported
+# input (MCAP) that is recorded in the receipt rather than sent with a guessed
+# schema.
+PushedItemStatus = Literal["registered", "uploaded", "error", "experimental_error"]
+# The exact-identity signal that attributed an Encord uuid to a pushed item;
+# empty while unresolved.
+IdentitySignal = Literal["", "metadata", "object_url", "uploaded"]
+# Receipt lifecycle. planned is the write-ahead copy that lands before the
+# first Encord mutation; done/failed/timeout are terminal.
+PushStatus = Literal["planned", "done", "failed", "timeout"]
+# empty is a zero selection, timeout a selection still changing at the deadline.
+CurateStatus = Literal["planned", "done", "empty", "timeout", "failed"]
+# How a pulled item's bytes reached the output prefix; empty until attempted.
+PullTransfer = Literal["", "copy", "download", "error"]
+RoundtripRelation = Literal["matched", "missing", "unexpected"]
+# unavailable: the two checksum kinds cannot be compared (e.g. multipart ETag).
+ChecksumState = Literal["verified", "mismatched", "unavailable"]
+ReportStatus = Literal["passed", "failed"]
+
+DEFAULT_MEDIA_FILTER: MediaFilter = "videos-images"
+DEFAULT_TRANSFER: TransferMode = "register"
 DEFAULT_POLL_TIMEOUT_SECONDS = 1800
 # add_preset_items is async server-side with no job handle; curate polls the
 # collection until its item count is stable. Small folders settle in seconds.
@@ -33,11 +64,15 @@ DEFAULT_CURATE_POLL_SECONDS = 300
 
 
 class EncordToolError(RuntimeError):
-    """Raised when an Encord push/pull operation fails."""
+    """Raised when an Encord push/curate/pull/verify operation fails."""
 
 
 class EncordAuthError(EncordToolError):
     """Raised when no usable Encord credential can be resolved."""
+
+
+class EncordSdkMissingError(EncordToolError):
+    """Raised when the optional ``encord`` package is not installed."""
 
 
 class PushedItem(BaseModel):
@@ -52,17 +87,14 @@ class PushedItem(BaseModel):
     object_url: str = ""
     category: str
     item_uuid: str = ""
-    # The identity signal that resolved item_uuid (metadata | object_url |
-    # uploaded), empty when unresolved.
-    identity_signal: str = ""
+    identity_signal: IdentitySignal = ""
     source_size: int = 0
     # The raw S3 ETag at push time (verbatim), so overwrites between push and
     # pull are detectable even when the ETag is not a content digest.
     source_etag: str = ""
     source_checksum: str = ""
     source_checksum_kind: ChecksumKind = "none"
-    # registered | uploaded | error | experimental_error
-    status: str = "registered"
+    status: PushedItemStatus = "registered"
     error: str = ""
 
 
@@ -77,8 +109,7 @@ class PushReceipt(BaseModel):
     input_uri: str
     endpoint_url: str
     encord_domain: str
-    # register (in-place by objectUrl) | upload (bytes copied into Encord storage)
-    transfer: str = "register"
+    transfer: TransferMode = "register"
     integration_id: str = ""
     integration_title: str = ""
     # Empty in the write-ahead ("planned") receipt, resolved before mutation.
@@ -89,9 +120,8 @@ class PushReceipt(BaseModel):
     dataset_title: str = ""
     dataset_created: bool = False
     linked_count: int = 0
-    media_filter: str
-    # done | failed | timeout
-    status: str
+    media_filter: MediaFilter
+    status: PushStatus
     files_discovered: int = 0
     units_done: int = 0
     units_error: int = 0
@@ -134,12 +164,17 @@ class CurateReceipt(BaseModel):
     collection_created: bool = False
     preset_uuid: str = ""
     preset_name: str = ""
+    # The transient preset is deleted once the selection lands; False after a
+    # successful run means the delete failed and cleanup by prefix is owed.
+    preset_deleted: bool = False
     filters: list[CurateFilter] = Field(default_factory=list)
     # The exact payload sent to create_preset, for reproducibility in Encord.
     filter_preset_json: dict = Field(default_factory=dict)
+    # Storage items in the folder the filters were evaluated over, and how many
+    # of them the selection kept.
+    items_total: int = 0
     items_selected: int = 0
-    # done | empty (zero selection) | timeout (still changing) | failed (crash)
-    status: str
+    status: CurateStatus
     # Populated when the run failed partway (see PushReceipt.error).
     error: str = ""
     receipt_uri: str = ""
@@ -156,8 +191,10 @@ class PulledItem(BaseModel):
     mime_type: str = ""
     file_size: int = 0
     media_uri: str = ""
-    # copy | download | error
-    transfer: str = ""
+    transfer: PullTransfer = ""
+    # Why the zero-egress server-side copy was not used for a same-endpoint
+    # item (the run then fell back to a signed-URL download).
+    copy_error: str = ""
     # Content evidence for the transferred bytes: sha256 of the streamed
     # download, or the destination ETag (md5 when single-part) for a
     # server-side copy.
@@ -172,16 +209,14 @@ class RoundtripItem(BaseModel):
 
     source_uri: str = ""
     item_uuid: str = ""
-    # matched | missing | unexpected
-    relation: str
+    relation: RoundtripRelation
     expected_size: int = 0
     observed_size: int = 0
     expected_checksum: str = ""
     expected_checksum_kind: ChecksumKind = "none"
     observed_checksum: str = ""
     observed_checksum_kind: ChecksumKind = "none"
-    # verified | mismatched | unavailable (kinds not comparable)
-    checksum_state: str = "unavailable"
+    checksum_state: ChecksumState = "unavailable"
     reasons: list[str] = Field(default_factory=list)
 
 
@@ -203,8 +238,7 @@ class RoundtripReport(BaseModel):
     receipt_uri: str
     manifest_uri: str
     report_uri: str = ""
-    # passed | failed
-    status: str
+    status: ReportStatus
     expected: int = 0
     matched: int = 0
     missing: int = 0
@@ -213,6 +247,12 @@ class RoundtripReport(BaseModel):
     checksum_verified: int = 0
     checksum_mismatched: int = 0
     checksum_unavailable: int = 0
+    # Matched items that carried neither a comparable checksum nor a size on
+    # both sides: nothing verifies them, so they fail the roundtrip.
+    unverifiable: int = 0
+    # Report-level reasons the roundtrip failed that no single item explains:
+    # a receipt that never reached ``done``, or one with nothing to verify.
+    defects: list[str] = Field(default_factory=list)
     error: str = ""
     items: list[RoundtripItem] = Field(default_factory=list)
 
@@ -226,8 +266,7 @@ class PullManifest(BaseModel):
     generated_at: str
     workflow_run: str = ""
     encord_domain: str
-    # collection | dataset | project
-    source_kind: str
+    source_kind: PullSourceKind
     source_id: str
     source_name: str = ""
     output_uri: str

@@ -71,6 +71,23 @@ def test_roundtrip_smoke_chains_push_curate_then_both_pulls() -> None:
     assert curated_argv[curated_argv.index("--source-id") + 1] == "npa-e2e-t"
 
 
+def test_verify_stage_needs_no_encord_secret() -> None:
+    """verify compares two S3 artifacts; only the Encord-facing verbs need the key."""
+
+    from types import SimpleNamespace
+
+    from npa.orchestration.npa_workflow.skypilot_render import secret_env_hints_for_plan
+
+    step = lambda ref: SimpleNamespace(tool_ref=ref, argv=[])  # noqa: E731
+    assert secret_env_hints_for_plan([step("workbench.encord.verify")]) == ()
+    assert secret_env_hints_for_plan([step("workbench.encord.push")]) == (
+        "ENCORD_SSH_KEY_B64",
+    )
+    assert secret_env_hints_for_plan([step("workbench.encord.curate")]) == (
+        "ENCORD_SSH_KEY_B64",
+    )
+
+
 def test_curate_argv_renders_every_flag() -> None:
     argv = argv_for_tool("workbench.encord.curate")
     assert argv[:4] == ["npa", "workbench", "encord", "curate"]

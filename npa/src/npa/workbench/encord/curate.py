@@ -24,11 +24,13 @@ from __future__ import annotations
 
 import logging
 import time
+import uuid
 from datetime import datetime, timezone
 from typing import Any
 
 from npa.workbench.encord.client import (
-    _default_user_client,
+    ResolvedRef,
+    default_user_client,
     resolve_collection,
     resolve_domain,
     resolve_folder,
@@ -38,6 +40,7 @@ from npa.workbench.encord.schemas import (
     DEFAULT_CURATE_POLL_SECONDS,
     CurateFilter,
     CurateReceipt,
+    CurateStatus,
     EncordToolError,
 )
 from npa.workbench.encord.storage import artifact_uri_for, error_text, finalize_artifact
@@ -65,11 +68,29 @@ CONFIRM_INTERVAL_SECONDS = 1.0
 # evaluation is re-issued on this cadence until items appear or time runs out.
 REISSUE_INTERVAL_SECONDS = 15.0
 
+_LOG = logging.getLogger(__name__)
+
 
 def curate_receipt_uri_for(output_path: str) -> str:
     """The exact receipt URI a given --output-path resolves to."""
 
     return artifact_uri_for(output_path, CURATE_RECEIPT_FILENAME)
+
+
+def preset_name_for(workflow_run: str) -> str:
+    """The run-scoped title of the transient filter preset.
+
+    Every Encord object the tool creates embeds its run id so ``cleanup`` can
+    find it by prefix and its age reads from the name. An ad-hoc CLI run has
+    no workflow run id, so it gets a UTC timestamp plus a short random suffix
+    instead — two ad-hoc curates must never share (and race on) one title.
+    """
+
+    run = workflow_run.strip()
+    if not run:
+        stamp = datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%SZ")
+        run = f"adhoc-{stamp}-{uuid.uuid4().hex[:6]}"
+    return f"npa-curate-{run}"
 
 
 def parse_filter_specs(specs: list[str]) -> list[CurateFilter]:
@@ -140,7 +161,7 @@ def build_filter_preset_json(filters: list[CurateFilter]) -> dict[str, Any]:
 
 def _poll_selection(
     collection: Any, *, preset_uuid: str, poll_seconds: float
-) -> tuple[int, str]:
+) -> tuple[int, CurateStatus]:
     """Poll the async server-side evaluation -> (items_selected, status).
 
     add_preset_items returns before evaluation finishes and exposes no job
@@ -186,6 +207,22 @@ def _zero_selection_remedy(filters: list[CurateFilter]) -> str:
     return remedy + "."
 
 
+def _delete_preset(client: Any, preset_uuid: str) -> bool:
+    """Best-effort deletion of the transient preset; False means cleanup is owed."""
+
+    try:
+        client.delete_preset(preset_uuid)
+    except Exception as exc:  # noqa: BLE001 - recorded in the receipt, never fatal
+        _LOG.warning(
+            "Encord preset %s was not deleted (%s); remove it with "
+            "`npa workbench encord cleanup --title-prefix npa-curate-`.",
+            preset_uuid,
+            exc,
+        )
+        return False
+    return True
+
+
 def run_curate(
     *,
     folder: str,
@@ -210,17 +247,18 @@ def run_curate(
     from npa.clients.storage import StorageClient
 
     active_storage = storage_client or StorageClient.from_environment()
-    client = user_client if user_client is not None else _default_user_client(environ)
+    client = user_client if user_client is not None else default_user_client(environ)
 
     # Write-ahead receipt: land the plan before the first Encord mutation
     # (collection/preset creation), so an uncatchable kill mid-mutation still
     # leaves a durable record of intent.
     receipt_uri = curate_receipt_uri_for(output_path)
-    preset_name = f"npa-curate-{workflow_run.strip() or 'adhoc'}"
+    preset_name = preset_name_for(workflow_run)
+    encord_domain = resolve_domain(environ)
     planned = CurateReceipt(
         generated_at=datetime.now(timezone.utc).isoformat(),
         workflow_run=workflow_run,
-        encord_domain=resolve_domain(environ),
+        encord_domain=encord_domain,
         folder_name=folder.strip(),
         collection_name=collection.strip(),
         preset_name=preset_name,
@@ -240,64 +278,77 @@ def run_curate(
 
     # Everything below can mutate Encord (collection/preset creation); the
     # receipt must land even when a later step throws.
-    folder_obj: Any = None
-    collection_obj: Any = None
-    collection_uuid = collection_name = ""
-    collection_created = False
+    folder_ref: ResolvedRef | None = None
+    collection_ref: ResolvedRef | None = None
     preset_uuid = ""
-    items_selected = 0
-    status = "failed"
+    preset_deleted = False
+    items_total = items_selected = 0
+    status: CurateStatus = "failed"
     run_error: Exception | None = None
     try:
         # Curate never creates the folder: an absent folder means there is
         # nothing to curate, not a fresh namespace to make.
-        folder_obj, _ = resolve_folder(client, folder, create=False)
+        folder_ref = resolve_folder(client, folder, create=False)
         # An empty folder is a definitive fail-fast: no filter can select
         # anything, and burning the poll window would only blur the diagnosis.
-        if next(iter(folder_obj.list_items(page_size=1)), None) is None:
+        items_total = sum(1 for _ in folder_ref.obj.list_items(page_size=1000))
+        if items_total == 0:
             raise EncordToolError(
-                f"Encord folder {folder_obj.name!r} contains no storage items; "
+                f"Encord folder {folder_ref.title!r} contains no storage items; "
                 "nothing to curate."
             )
-        collection_obj, collection_uuid, collection_name, collection_created = (
-            resolve_collection(
-                client, collection, create_in_folder_uuid=str(folder_obj.uuid)
-            )
+        collection_ref = resolve_collection(
+            client, collection, create_in_folder_uuid=folder_ref.id
         )
+        # add_preset_items only ever adds, and completion is inferred from a
+        # stable non-zero count, so a Collection that already holds items would
+        # read as "done" on its old selection before this run's evaluation
+        # lands. Curate therefore populates only an empty (or freshly created)
+        # Collection: the receipt then describes exactly this run's filters.
+        if not collection_ref.created and (
+            next(iter(collection_ref.obj.list_items(page_size=1)), None) is not None
+        ):
+            raise EncordToolError(
+                f"Encord collection {collection_ref.title!r} already holds items; "
+                "curate never adds to a populated Collection because its selection "
+                "could not be told apart from this run's. Pass a fresh run-scoped "
+                "--collection title, or delete the stale one with `npa workbench "
+                "encord cleanup --title-prefix <prefix>`."
+            )
         preset = client.create_preset(
             name=preset_name,
             description="Created by npa workbench encord curate",
             filter_preset_json=preset_json,
         )
         preset_uuid = str(preset.uuid)
-        collection_obj.add_preset_items(preset_uuid)
+        collection_ref.obj.add_preset_items(preset_uuid)
         items_selected, status = _poll_selection(
-            collection_obj, preset_uuid=preset_uuid, poll_seconds=poll_seconds
+            collection_ref.obj, preset_uuid=preset_uuid, poll_seconds=poll_seconds
         )
-        # The preset is transient scaffolding: the receipt's filter_preset_json
-        # is the reproducibility record, so don't accumulate one per run.
-        try:
-            client.delete_preset(preset_uuid)
-        except Exception as exc:  # noqa: BLE001 - cleanup is best-effort
-            logging.getLogger(__name__).debug(
-                "preset %s cleanup failed: %s", preset_uuid, exc
-            )
     except Exception as exc:  # noqa: BLE001 - recorded in the receipt, re-raised below
         run_error = exc
+    finally:
+        # The preset is transient scaffolding: the receipt's filter_preset_json
+        # is the reproducibility record, so don't accumulate one per run —
+        # including runs that failed after the preset was created.
+        if preset_uuid:
+            preset_deleted = _delete_preset(client, preset_uuid)
 
     receipt = CurateReceipt(
         generated_at=datetime.now(timezone.utc).isoformat(),
         workflow_run=workflow_run,
-        encord_domain=resolve_domain(environ),
-        folder_uuid=str(getattr(folder_obj, "uuid", "")),
-        folder_name=str(getattr(folder_obj, "name", folder.strip())),
-        collection_uuid=collection_uuid,
-        collection_name=collection_name or collection.strip(),
-        collection_created=collection_created,
+        encord_domain=encord_domain,
+        folder_uuid=folder_ref.id if folder_ref else "",
+        folder_name=folder_ref.title if folder_ref else folder.strip(),
+        collection_uuid=collection_ref.id if collection_ref else "",
+        collection_name=collection_ref.title if collection_ref else collection.strip(),
+        collection_created=bool(collection_ref and collection_ref.created),
         preset_uuid=preset_uuid,
         preset_name=preset_name,
+        preset_deleted=preset_deleted,
         filters=parsed,
         filter_preset_json=preset_json,
+        items_total=items_total,
         items_selected=items_selected,
         status=status,
         error=error_text(run_error),

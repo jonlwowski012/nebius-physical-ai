@@ -16,6 +16,7 @@ pull  Pull curated media + labels + lineage manifest back to S3.
 verify  Verify a push receipt against a pull manifest by exact identity.
 cleanup  Tear down run-scoped Encord state created by push/curate/seed-demo.
 seed-demo  Seed the demo source dataset for encord-cosmos3-augment, or no-op.
+system-info  Show the Encord tool's SDK pin, API domain, and configured credentials.
 ```
 
 ## Options
@@ -34,6 +35,7 @@ seed-demo  Seed the demo source dataset for encord-cosmos3-augment, or no-op.
 | `verify` | Verify a push receipt against a pull manifest by exact identity. |
 | `cleanup` | Tear down run-scoped Encord state created by push/curate/seed-demo. |
 | `seed-demo` | Seed the demo source dataset for encord-cosmos3-augment, or no-op. |
+| `system-info` | Show the Encord tool's SDK pin, API domain, and configured credentials. |
 
 ## Examples
 

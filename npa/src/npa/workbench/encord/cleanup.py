@@ -11,7 +11,7 @@ from __future__ import annotations
 
 from typing import Any
 
-from npa.workbench.encord.client import _default_user_client
+from npa.workbench.encord.client import default_user_client
 from npa.workbench.encord.schemas import EncordToolError
 
 # A too-short prefix is a foot-gun: "n" would match every npa-* artifact and
@@ -34,7 +34,7 @@ def run_cleanup(
             f"--title-prefix must be at least {MIN_PREFIX_LENGTH} characters "
             "to avoid matching unrelated Encord artifacts."
         )
-    client = user_client if user_client is not None else _default_user_client(environ)
+    client = user_client if user_client is not None else default_user_client(environ)
 
     summary: dict[str, Any] = {
         "stage": "cleanup",

@@ -12,33 +12,36 @@ import logging
 import tempfile
 from datetime import datetime, timezone
 from pathlib import Path
-from typing import Any, NamedTuple
+from typing import Any, NamedTuple, cast
 from urllib.parse import unquote, urlparse
 
-from npa.clients.storage import _parse_bucket_uri
+from npa.clients.storage import parse_bucket_uri
 from npa.workbench.encord.client import (
-    _default_user_client,
+    default_user_client,
     resolve_collection,
     resolve_dataset,
     resolve_domain,
     resolve_project,
     resolve_public_endpoint,
 )
+from npa.workbench.encord.identity import metadata_identity
+from npa.workbench.encord.integrity import etag_checksum, write_hashed_stream
 from npa.workbench.encord.schemas import (
     PULL_MANIFEST_FILENAME,
+    PULL_SOURCES,
     EncordToolError,
     PulledItem,
     PullManifest,
+    PullSourceKind,
 )
-from npa.workbench.encord.identity import metadata_identity
-from npa.workbench.encord.integrity import etag_checksum, write_hashed_stream
 from npa.workbench.encord.storage import error_text, finalize_artifact, write_json
 
-PULL_SOURCES = ("collection", "dataset", "project")
 LABEL_BUNDLE_SIZE = 100
 # Media transfers are independent I/O; a bounded pool keeps thousands of
 # curated clips from paying a serial round-trip each.
 PULL_TRANSFER_WORKERS = 8
+
+_LOG = logging.getLogger(__name__)
 
 
 def pull_manifest_uri_for(output_path: str) -> str:
@@ -76,27 +79,27 @@ def enumerate_items(user_client: Any, *, source: str, source_id: str) -> PullSou
     """Resolve the source and list its storage items, signed in bulk."""
 
     if source == "collection":
-        collection, resolved_id, name, _ = resolve_collection(user_client, source_id)
-        uuids = [item.uuid for item in collection.list_items(page_size=1000)]
+        collection = resolve_collection(user_client, source_id)
+        uuids = [item.uuid for item in collection.obj.list_items(page_size=1000)]
         items = user_client.get_storage_items(uuids, sign_url=True) if uuids else []
-        return PullSource(resolved_id, name, list(items))
+        return PullSource(collection.id, collection.title, list(items))
     if source == "dataset":
-        dataset, dataset_hash, title, _ = resolve_dataset(
-            user_client, source_id, create=False
-        )
+        dataset = resolve_dataset(user_client, source_id, create=False)
         backing = [
-            uuid for row in dataset.data_rows if (uuid := _backing_item_uuid(row))
+            uuid for row in dataset.obj.data_rows if (uuid := _backing_item_uuid(row))
         ]
         items = user_client.get_storage_items(backing, sign_url=True) if backing else []
-        return PullSource(dataset_hash, title, list(items))
+        return PullSource(dataset.id, dataset.title, list(items))
     if source == "project":
-        project, project_hash, title = resolve_project(user_client, source_id)
-        label_rows = list(project.list_label_rows_v2())
+        project = resolve_project(user_client, source_id)
+        label_rows = list(project.obj.list_label_rows_v2())
         backing = [
             uuid for row in label_rows if (uuid := _backing_item_uuid(row))
         ]
         items = user_client.get_storage_items(backing, sign_url=True) if backing else []
-        return PullSource(project_hash, title, list(items), project, tuple(label_rows))
+        return PullSource(
+            project.id, project.title, list(items), project.obj, tuple(label_rows)
+        )
     raise EncordToolError(
         f"Unknown --source value {source!r}. Choices: {', '.join(PULL_SOURCES)}."
     )
@@ -142,9 +145,16 @@ def transfer_item(
         output_uri.rstrip("/")
         + f"/media/{pulled.item_uuid}__{_sanitize_name(pulled.name)}"
     )
-    dest_bucket, dest_key = _parse_bucket_uri(dest_uri)
+    dest_bucket, dest_key = parse_bucket_uri(dest_uri)
 
-    signed_url = item.get_signed_url()
+    try:
+        # The SDK refetches the item when its cached URL is missing: a real
+        # network call that must fail this item, not the whole pull.
+        signed_url = item.get_signed_url()
+    except Exception as exc:  # noqa: BLE001 - recorded per item, run fails closed
+        pulled.transfer = "error"
+        pulled.error = f"could not fetch a signed URL: {exc}"
+        return pulled
     if not signed_url:
         pulled.transfer = "error"
         pulled.error = "item has no signed URL (composite items are not supported)"
@@ -166,7 +176,10 @@ def transfer_item(
             pulled.checksum, pulled.checksum_kind = etag_checksum(etag)
             return pulled
         except Exception as exc:  # noqa: BLE001 - fall back to the download path
-            logging.getLogger(__name__).debug(
+            # The manifest carries the reason: an operator must be able to see
+            # why a same-bucket item paid for egress instead of a copy.
+            pulled.copy_error = f"{type(exc).__name__}: {exc}"
+            _LOG.warning(
                 "server-side copy of %s failed (%s); falling back to download",
                 pulled.name,
                 exc,
@@ -245,7 +258,7 @@ def run_pull(
 
     active_storage = storage_client or StorageClient.from_environment()
     endpoint_url = resolve_public_endpoint(environ)
-    client = user_client if user_client is not None else _default_user_client(environ)
+    client = user_client if user_client is not None else default_user_client(environ)
 
     found = enumerate_items(client, source=source, source_id=source_id)
 
@@ -258,12 +271,22 @@ def run_pull(
     try:
 
         def _transfer_and_record(item: Any) -> PulledItem:
-            record = transfer_item(
-                item,
-                storage_client=active_storage,
-                output_uri=output_path,
-                endpoint_url=endpoint_url,
-            )
+            try:
+                record = transfer_item(
+                    item,
+                    storage_client=active_storage,
+                    output_uri=output_path,
+                    endpoint_url=endpoint_url,
+                )
+            except Exception as exc:  # noqa: BLE001 - one item must not erase the others
+                # Anything transfer_item did not classify itself still becomes
+                # an error row, so the manifest keeps every item that landed.
+                return PulledItem(
+                    item_uuid=str(getattr(item, "uuid", "") or ""),
+                    name=str(getattr(item, "name", "") or ""),
+                    transfer="error",
+                    error=error_text(exc),
+                )
             try:
                 write_json(
                     {
@@ -305,7 +328,7 @@ def run_pull(
         generated_at=datetime.now(timezone.utc).isoformat(),
         workflow_run=workflow_run,
         encord_domain=resolve_domain(environ),
-        source_kind=source,
+        source_kind=cast(PullSourceKind, source),  # validated by enumerate_items
         source_id=found.source_id,
         source_name=found.source_name,
         output_uri=output_path,

@@ -107,11 +107,13 @@ def _token_factory_verifier() -> list[str]:
 def _encord_verifier() -> str:
     """Live Encord auth probe: authenticate and make the cheapest listed call."""
 
-    from npa.workbench.encord.client import _default_user_client
+    from npa.workbench.encord.client import default_user_client
 
-    user_client = _default_user_client()
+    user_client = default_user_client()
     next(iter(user_client.list_storage_folders(page_size=1)), None)
     return "storage folders listable"
+
+
 def _ngc_auth_verifier(api_key: str) -> str:
     """Authenticate through NGC token exchange without implying all entitlements."""
 

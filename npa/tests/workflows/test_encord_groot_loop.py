@@ -5,9 +5,10 @@ import shutil
 from pathlib import Path
 
 import pyarrow as pa
+import pytest
 import pyarrow.parquet as pq
 
-from npa.workflows.encord_groot_loop import materialize
+from npa.workflows.encord_groot_loop import MaterializeRequest, materialize
 
 
 class FakeStorage:
@@ -44,7 +45,17 @@ def test_materialize_preserves_original_and_adds_one_synthetic_episode(tmp_path:
     (generated / "variant-1").mkdir(parents=True)
     (generated / "variant-1" / "vision.mp4").write_bytes(b"synthetic")
     storage = FakeStorage(source, generated)
-    summary = materialize("s3://test/source/", "s3://test/generated/", "s3://test/output/", "observation.images.front", "0", "s3://test/output/materialization.json", storage_client=storage)
+    request = MaterializeRequest.from_argv(
+        [
+            "s3://test/source/",
+            "s3://test/generated/",
+            "s3://test/output/",
+            "observation.images.front",
+            "0",
+            "s3://test/output/materialization.json",
+        ]
+    )
+    summary = materialize(request, storage_client=storage)
     assert summary["original_episodes"] == 1 and summary["synthetic_episodes"] == 1
     assert storage.uploaded is not None
     data = pa.concat_tables(
@@ -61,3 +72,12 @@ def test_materialize_preserves_original_and_adds_one_synthetic_episode(tmp_path:
     modality_config = (storage.uploaded / "meta/npa_groot_modality_config.py").read_text()
     assert "ActionRepresentation.RELATIVE" not in modality_config
     assert "ActionRepresentation.ABSOLUTE" in modality_config
+
+
+def test_materialize_request_rejects_a_non_integer_episode() -> None:
+    from npa.workflows.encord_groot_loop import EncordGrootError
+
+    with pytest.raises(EncordGrootError, match="must be an integer"):
+        MaterializeRequest.from_argv(["s", "a", "o", "cam", "zero", "m"])
+    with pytest.raises(SystemExit):
+        MaterializeRequest.from_argv(["too", "few"])

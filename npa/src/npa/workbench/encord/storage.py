@@ -1,4 +1,10 @@
-"""Shared S3 JSON writer for the Encord tool's receipts, manifests, and labels."""
+"""Shared S3 JSON reader/writer for the Encord tool's receipts, manifests, labels.
+
+Every durable artifact lives in object storage: the CLI path contract rejects
+local paths, and workflow stages hand artifacts to each other by s3:// URI.
+There is deliberately no local-file branch here — tests inject a storage client
+that captures uploads instead.
+"""
 
 from __future__ import annotations
 
@@ -7,6 +13,7 @@ import tempfile
 from pathlib import Path
 from typing import Any
 
+from npa.clients.storage import StorageError, parse_bucket_uri
 from npa.workbench.encord.schemas import EncordToolError
 
 
@@ -59,16 +66,35 @@ def finalize_artifact(
         ) from run_error
 
 
+def object_location(
+    uri: str,
+    *,
+    error_type: type[Exception] = EncordToolError,
+    require_key: bool = False,
+) -> tuple[str, str]:
+    """(bucket, key) of an s3:// URI, or the caller's domain error.
+
+    ``require_key`` rejects a bare bucket or prefix when the caller needs one
+    exact object (a media file to copy), not a place to write under.
+    """
+
+    try:
+        bucket, key = parse_bucket_uri(uri)
+    except StorageError as exc:
+        raise error_type(
+            f"Encord artifacts live in object storage; expected an s3:// URI, got {uri!r}."
+        ) from exc
+    if require_key and not (bucket and key):
+        raise error_type(f"expected an exact s3:// object URI, got: {uri}")
+    return bucket, key
+
+
 def read_json(uri: str, *, storage_client: Any) -> dict[str, Any]:
-    """Read a JSON document from an s3:// URI or a local path."""
+    """Read a JSON document from an s3:// URI."""
 
-    if uri.startswith("s3://"):
-        from npa.clients.storage import _parse_bucket_uri
-
-        bucket, key = _parse_bucket_uri(uri)
-        body = storage_client.s3.get_object(Bucket=bucket, Key=key)["Body"].read()
-        return json.loads(body)
-    return json.loads(Path(uri).read_text(encoding="utf-8"))
+    bucket, key = object_location(uri)
+    body = storage_client.s3.get_object(Bucket=bucket, Key=key)["Body"].read()
+    return json.loads(body)
 
 
 def write_json(
@@ -78,18 +104,11 @@ def write_json(
     filename: str,
     storage_client: Any,
 ) -> str:
-    """Write ``payload`` to an s3:// URI or a local path; return the written URI."""
+    """Write ``payload`` to an s3:// URI; return the written URI."""
 
+    object_location(result_uri)
     body = json.dumps(payload, indent=2, sort_keys=True) + "\n"
-    if result_uri.startswith("s3://"):
-        with tempfile.TemporaryDirectory(prefix="npa-encord-") as tmp:
-            local_path = Path(tmp) / filename
-            local_path.write_text(body, encoding="utf-8")
-            return storage_client.upload_file(str(local_path), result_uri)
-
-    path = Path(result_uri)
-    if path.suffix != ".json":
-        path = path / filename
-    path.parent.mkdir(parents=True, exist_ok=True)
-    path.write_text(body, encoding="utf-8")
-    return str(path)
+    with tempfile.TemporaryDirectory(prefix="npa-encord-") as tmp:
+        local_path = Path(tmp) / filename
+        local_path.write_text(body, encoding="utf-8")
+        return storage_client.upload_file(str(local_path), result_uri)

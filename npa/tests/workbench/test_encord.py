@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import io
 import json
 import uuid
 from pathlib import Path
@@ -11,7 +12,8 @@ from typing import Any
 import pytest
 
 from npa.workbench.encord.client import (
-    _default_user_client,
+    CORD_STORAGE_LOCATION,
+    default_user_client,
     resolve_collection,
     resolve_dataset,
     resolve_folder,
@@ -22,6 +24,7 @@ from npa.workbench.encord.curate import (
     build_filter_preset_json,
     curate_receipt_uri_for,
     parse_filter_specs,
+    preset_name_for,
     run_curate,
 )
 from npa.workbench.encord.identity import (
@@ -57,9 +60,15 @@ from npa.workbench.encord.schemas import (
     EncordToolError,
     PushedItem,
 )
+from npa.workbench.encord.seed_demo import run_seed_demo
+from npa.workbench.encord.storage import write_json
 
 ENDPOINT = "https://storage.test.example"
 ENVIRON = {"AWS_ENDPOINT_URL": ENDPOINT}
+# Every durable artifact is an s3:// object; the fake storage captures the bytes.
+RECEIPT_URI = "s3://bkt/out/receipt.json"
+CURATE_RECEIPT_URI = "s3://bkt/out/curate_receipt.json"
+REPORT_URI = "s3://bkt/out/roundtrip_report.json"
 
 
 def _uuid(seed: int) -> str:
@@ -78,8 +87,9 @@ class FakePaginator:
 
 
 class FakeS3:
-    def __init__(self, keys: list[str] | None = None) -> None:
+    def __init__(self, keys: list[str] | None, objects: dict[str, bytes]) -> None:
         self.keys = keys or []
+        self.objects = objects
         self.copy_calls: list[dict[str, Any]] = []
 
     def get_paginator(self, name: str) -> FakePaginator:
@@ -89,17 +99,31 @@ class FakeS3:
     def copy_object(self, *, Bucket: str, Key: str, CopySource: dict[str, str]) -> None:
         self.copy_calls.append({"Bucket": Bucket, "Key": Key, "CopySource": CopySource})
 
+    def get_object(self, *, Bucket: str, Key: str) -> dict[str, Any]:
+        return {"Body": io.BytesIO(self.objects[f"s3://{Bucket}/{Key}"])}
+
 
 class FakeStorage:
-    """StorageClient stand-in: raw .s3 plus upload_file recording."""
+    """StorageClient stand-in: raw .s3 plus an in-memory object store.
+
+    ``upload_file`` captures the uploaded bytes by URI (the tool writes every
+    artifact through it), so tests read receipts back with ``written``.
+    """
 
     def __init__(self, keys: list[str] | None = None) -> None:
-        self.s3 = FakeS3(keys)
+        self.objects: dict[str, bytes] = {}
+        self.s3 = FakeS3(keys, self.objects)
         self.uploads: list[tuple[str, str]] = []
 
     def upload_file(self, local_file: str, bucket_uri: str) -> str:
         self.uploads.append((local_file, bucket_uri))
+        self.objects[bucket_uri] = Path(local_file).read_bytes()
         return bucket_uri
+
+    def written(self, uri: str) -> dict[str, Any]:
+        """The JSON document the tool wrote to ``uri``."""
+
+        return json.loads(self.objects[uri])
 
 
 class FakePollResult:
@@ -135,7 +159,7 @@ class FakeFolder:
         # Items that become visible only after a registration completes.
         self.post_registration_items: list[Any] = []
 
-    def list_items(self, page_size: int = 100):
+    def list_items(self, page_size: int = 100, include_client_metadata: bool = False):
         return iter(self.folder_items)
 
     def delete_storage_items(self, item_uuids, remove_unused_frames=True):
@@ -383,38 +407,70 @@ def test_build_upload_json_carries_identity_metadata() -> None:
 
 def test_resolve_integration_by_title_and_id() -> None:
     client = FakeUserClient()
-    integration_id, title = resolve_integration(client, "nebius-s3")
-    assert (integration_id, title) == (_uuid(3), "nebius-s3")
-    assert resolve_integration(client, _uuid(3)) == (_uuid(3), "nebius-s3")
+    ref = resolve_integration(client, "nebius-s3")
+    assert (ref.id, ref.title, ref.created) == (_uuid(3), "nebius-s3", False)
+    by_id = resolve_integration(client, _uuid(3))
+    assert (by_id.id, by_id.title) == (_uuid(3), "nebius-s3")
     with pytest.raises(EncordToolError, match="No Encord cloud integration titled"):
         resolve_integration(client, "missing")
+    with pytest.raises(EncordToolError, match="No Encord cloud integration with id"):
+        resolve_integration(client, _uuid(4))
+    with pytest.raises(EncordToolError, match="must not be empty"):
+        resolve_integration(client, "  ")
 
 
 def test_resolve_folder_creates_on_missing_title_only() -> None:
     client = FakeUserClient()
-    folder, created = resolve_folder(client, "fresh")
-    assert created is True and client.created_folders == ["fresh"]
-    again, created = resolve_folder(client, "fresh")
-    assert created is False and again is folder
+    ref = resolve_folder(client, "fresh")
+    assert ref.created is True and client.created_folders == ["fresh"]
+    assert ref.title == "fresh" and ref.id == str(ref.obj.uuid)
+    again = resolve_folder(client, "fresh")
+    assert again.created is False and again.obj is ref.obj
     with pytest.raises(KeyError):
         resolve_folder(client, _uuid(99))
 
 
+def test_resolvers_never_guess_between_same_titled_objects() -> None:
+    client = FakeUserClient(folders=[FakeFolder(name="dup"), FakeFolder(name="dup")])
+    with pytest.raises(EncordToolError, match="Multiple Encord storage folders"):
+        resolve_folder(client, "dup")
+    assert client.created_folders == []
+    client.datasets[_uuid(1)] = FakeDataset(_uuid(1), "dup-ds")
+    client.datasets[_uuid(2)] = FakeDataset(_uuid(2), "dup-ds")
+    with pytest.raises(EncordToolError, match="pass the dataset hash"):
+        resolve_dataset(client, "dup-ds")
+
+
 def test_resolve_dataset_title_create_and_pull_no_create() -> None:
     client = FakeUserClient()
-    _, dataset_hash, title, created = resolve_dataset(client, "new-ds")
-    assert created is True and title == "new-ds"
-    _, _, _, created = resolve_dataset(client, "new-ds")
-    assert created is False
+    ref = resolve_dataset(client, "new-ds")
+    assert ref.created is True and ref.title == "new-ds"
+    assert ref.id in client.datasets
+    assert resolve_dataset(client, "new-ds").created is False
     with pytest.raises(EncordToolError, match="No Encord dataset titled"):
         resolve_dataset(client, "absent", create=False)
 
 
+def test_cord_storage_location_matches_the_sdk_enum() -> None:
+    """The injected-client seam never imports the SDK; pin the value it stands for."""
+
+    dataset_orm = pytest.importorskip("encord.orm.dataset")
+    assert int(dataset_orm.StorageLocation.CORD_STORAGE) == CORD_STORAGE_LOCATION
+
+
 def test_default_user_client_requires_secret_and_decodes_b64() -> None:
     with pytest.raises(EncordAuthError, match="No Encord credential"):
-        _default_user_client({})
+        default_user_client({})
     with pytest.raises(EncordAuthError, match="not valid base64"):
-        _default_user_client({"ENCORD_SSH_KEY_B64": "!!!not-base64!!!"})
+        default_user_client({"ENCORD_SSH_KEY_B64": "!!!not-base64!!!"})
+
+
+def test_default_user_client_ignores_a_raw_pem_transport() -> None:
+    """Exactly two transports exist; the truncation-prone raw PEM is not one."""
+
+    raw_pem = "-----BEGIN OPENSSH PRIVATE KEY-----\nabc\n-----END OPENSSH PRIVATE KEY-----"
+    with pytest.raises(EncordAuthError, match="No Encord credential"):
+        default_user_client({"ENCORD_SSH_KEY": raw_pem})
 
 
 def test_resolve_public_endpoint_prefers_env() -> None:
@@ -426,12 +482,12 @@ def test_resolve_public_endpoint_prefers_env() -> None:
 # --- run_push ----------------------------------------------------------------
 
 
-def _push_kwargs(tmp_path: Path, storage: FakeStorage, client: FakeUserClient, **overrides):
+def _push_kwargs(storage: FakeStorage, client: FakeUserClient, **overrides):
     kwargs = dict(
         input_path="s3://bkt/p/",
         integration="nebius-s3",
         folder="fresh",
-        output_path=str(tmp_path / "receipt.json"),
+        output_path=RECEIPT_URI,
         user_client=client,
         storage_client=storage,
         environ=dict(ENVIRON),
@@ -460,7 +516,7 @@ def _folder_item(seed: int, key: str, *, metadata: bool = True, url: bool = True
     )
 
 
-def test_run_push_happy_path_links_dataset(tmp_path: Path) -> None:
+def test_run_push_happy_path_links_dataset() -> None:
     storage = FakeStorage(["p/a.mp4", "p/b.png"])
     folder = FakeFolder(
         results=[
@@ -476,7 +532,7 @@ def test_run_push_happy_path_links_dataset(tmp_path: Path) -> None:
     folder.post_registration_items = [_folder_item(21, "p/a.mp4"), _folder_item(22, "p/b.png")]
     client = FakeUserClient(folders=[])
     client.create_storage_folder = lambda name, description="": folder  # type: ignore[assignment]
-    receipt = run_push(**_push_kwargs(tmp_path, storage, client, dataset="new-ds"))
+    receipt = run_push(**_push_kwargs(storage, client, dataset="new-ds"))
     assert receipt.status == "done"
     assert receipt.units_done == 2 and receipt.units_error == 0
     assert receipt.dataset_created is True and receipt.linked_count == 2
@@ -492,12 +548,12 @@ def test_run_push_happy_path_links_dataset(tmp_path: Path) -> None:
     first_entry = folder.start_calls[0]["private_files"]["videos"][0]
     assert first_entry["clientMetadata"] == {"npa": {"source_uri": "s3://bkt/p/a.mp4"}}
     # receipt written locally
-    payload = json.loads((tmp_path / "receipt.json").read_text())
+    payload = storage.written(RECEIPT_URI)
     assert payload["schema"] == "npa.encord.push_receipt.v1"
     assert payload["status"] == "done"
 
 
-def test_run_push_unit_errors_write_receipt_then_raise(tmp_path: Path) -> None:
+def test_run_push_unit_errors_write_receipt_then_raise() -> None:
     storage = FakeStorage(["p/a.mp4"])
     bad_url = f"{ENDPOINT}/bkt/p/a.mp4"
     folder = FakeFolder(
@@ -505,35 +561,35 @@ def test_run_push_unit_errors_write_receipt_then_raise(tmp_path: Path) -> None:
     )
     client = FakeUserClient(folders=[folder])
     with pytest.raises(EncordToolError, match="1 unit error"):
-        run_push(**_push_kwargs(tmp_path, storage, client, folder=str(folder.uuid)))
-    payload = json.loads((tmp_path / "receipt.json").read_text())
+        run_push(**_push_kwargs(storage, client, folder=str(folder.uuid)))
+    payload = storage.written(RECEIPT_URI)
     assert payload["status"] == "failed"
     assert payload["items"][0]["status"] == "error"
     assert "403" in payload["items"][0]["error"]
 
 
-def test_run_push_timeout_is_fail_closed(tmp_path: Path) -> None:
+def test_run_push_timeout_is_fail_closed() -> None:
     storage = FakeStorage(["p/a.mp4"])
     folder = FakeFolder(results=[FakePollResult(status="PENDING")])
     client = FakeUserClient(folders=[folder])
     with pytest.raises(EncordToolError, match="timeout"):
-        run_push(**_push_kwargs(tmp_path, storage, client, folder=str(folder.uuid)))
-    payload = json.loads((tmp_path / "receipt.json").read_text())
+        run_push(**_push_kwargs(storage, client, folder=str(folder.uuid)))
+    payload = storage.written(RECEIPT_URI)
     assert payload["status"] == "timeout"
 
 
-def test_run_push_mcap_is_experimental_error(tmp_path: Path) -> None:
+def test_run_push_mcap_is_experimental_error() -> None:
     storage = FakeStorage(["p/e.mcap"])
     folder = FakeFolder()
     client = FakeUserClient(folders=[folder])
     with pytest.raises(EncordToolError):
-        run_push(**_push_kwargs(tmp_path, storage, client, folder=str(folder.uuid), media="mcap"))
-    payload = json.loads((tmp_path / "receipt.json").read_text())
+        run_push(**_push_kwargs(storage, client, folder=str(folder.uuid), media="mcap"))
+    payload = storage.written(RECEIPT_URI)
     assert payload["items"][0]["status"] == "experimental_error"
     assert folder.start_calls == []  # nothing guessed onto the wire
 
 
-def test_run_push_batches_at_500(tmp_path: Path) -> None:
+def test_run_push_batches_at_500() -> None:
     keys = [f"p/{index:04d}.png" for index in range(BATCH_SIZE + 1)]
     storage = FakeStorage(keys)
     folder = FakeFolder(results=[FakePollResult(status="DONE", done=BATCH_SIZE + 1)])
@@ -541,23 +597,53 @@ def test_run_push_batches_at_500(tmp_path: Path) -> None:
         _folder_item(1000 + index, key) for index, key in enumerate(keys)
     ]
     client = FakeUserClient(folders=[folder])
-    run_push(**_push_kwargs(tmp_path, storage, client, folder=str(folder.uuid)))
+    run_push(**_push_kwargs(storage, client, folder=str(folder.uuid)))
     assert len(folder.start_calls) == 2
     first = folder.start_calls[0]["private_files"]
     assert len(first["images"]) == BATCH_SIZE
 
 
-def test_run_push_unattributable_item_fails_closed(tmp_path: Path) -> None:
+def test_run_push_unattributable_item_fails_closed() -> None:
     """Encord accepted the batch but no exact identity matched: never silent."""
 
     storage = FakeStorage(["p/a.mp4"])
     folder = FakeFolder(results=[FakePollResult(status="DONE", done=1)])
     client = FakeUserClient(folders=[folder])  # inventory never shows the item
     with pytest.raises(EncordToolError, match="unit error"):
-        run_push(**_push_kwargs(tmp_path, storage, client, folder=str(folder.uuid)))
-    payload = json.loads((tmp_path / "receipt.json").read_text())
+        run_push(**_push_kwargs(storage, client, folder=str(folder.uuid)))
+    payload = storage.written(RECEIPT_URI)
     assert payload["items"][0]["status"] == "error"
     assert "no exact metadata or object URL identity" in payload["items"][0]["error"]
+
+
+def test_run_push_counts_a_failed_item_once_even_when_encord_names_it_differently() -> None:
+    """A unit error Encord attributes to a differently spelled URL is one error."""
+
+    storage = FakeStorage(["p/a.mp4"])
+    # Encord echoes the failing objectUrl with different percent-encoding, so
+    # the by-url match misses; the item then fails identity resolution instead.
+    folder = FakeFolder(
+        results=[
+            FakePollResult(
+                status="DONE", done=0, errors=1,
+                unit_errors=[([f"{ENDPOINT}/bkt/p/a%2Emp4"], "403 from integration")],
+            )
+        ]
+    )
+    client = FakeUserClient(folders=[folder])
+    with pytest.raises(EncordToolError, match="1 unit error"):
+        run_push(**_push_kwargs(storage, client, folder=str(folder.uuid)))
+    payload = storage.written(RECEIPT_URI)
+    assert payload["units_error"] == 1 and payload["units_done"] == 0
+    assert payload["units_done"] + payload["units_error"] == payload["files_discovered"]
+
+
+def test_run_push_register_mode_requires_an_integration_before_any_io() -> None:
+    storage = FakeStorage(["p/a.mp4"])
+    client = FakeUserClient()
+    with pytest.raises(EncordToolError, match="--integration is required"):
+        run_push(**_push_kwargs(storage, client, integration=""))
+    assert storage.uploads == [] and client.created_folders == []
 
 
 def test_run_push_rejects_local_input(tmp_path: Path) -> None:
@@ -566,11 +652,69 @@ def test_run_push_rejects_local_input(tmp_path: Path) -> None:
             input_path=str(tmp_path),
             integration="i",
             folder="f",
-            output_path=str(tmp_path / "r.json"),
+            output_path="s3://bkt/out/r.json",
             user_client=FakeUserClient(),
             storage_client=FakeStorage(),
             environ=dict(ENVIRON),
         )
+
+
+def test_run_push_planned_receipt_lands_before_the_first_mutation() -> None:
+    """The write-ahead receipt must exist before Encord is touched.
+
+    Folder creation is the first possible mutation; by then the planned
+    receipt — every discovered item, the requested folder, status planned —
+    is already durable, so an uncatchable kill leaves a record of intent.
+    """
+
+    storage = FakeStorage(["p/a.mp4"])
+    folder = FakeFolder(results=[FakePollResult(status="DONE", done=1)])
+    folder.post_registration_items = [_folder_item(21, "p/a.mp4")]
+
+    class MutationChecksReceipt(FakeUserClient):
+        def create_storage_folder(self, name, description=""):
+            planned = storage.written(RECEIPT_URI)
+            assert planned["status"] == "planned"
+            assert planned["folder_name"] == "fresh"
+            assert planned["files_discovered"] == 1
+            assert planned["items"][0]["source_uri"] == "s3://bkt/p/a.mp4"
+            assert planned["items"][0]["item_uuid"] == ""
+            self.created_folders.append(name)
+            return folder
+
+    receipt = run_push(**_push_kwargs(storage, MutationChecksReceipt(folders=[])))
+    assert receipt.status == "done"
+    # Exactly two writes: the write-ahead copy, then the final receipt.
+    assert [uri for _, uri in storage.uploads] == [RECEIPT_URI, RECEIPT_URI]
+    assert storage.written(RECEIPT_URI)["status"] == "done"
+
+
+def test_discover_objects_carries_listing_facts_by_name() -> None:
+    storage = FakeStorage(["p/a.mp4"])
+    (entry,), _ = discover_objects(storage, "s3://bkt/p/", "videos-images")
+    assert (entry.key, entry.category, entry.size, entry.etag) == ("p/a.mp4", "videos", 0, "")
+
+
+def _stub_httpx_stream(monkeypatch: pytest.MonkeyPatch, body: bytes = b"payload") -> None:
+    """Make httpx.stream yield one fixed body: the cross-origin download path."""
+
+    import httpx
+
+    class FakeResponse:
+        def raise_for_status(self) -> None: ...
+
+        def iter_bytes(self, chunk_size: int):
+            yield body
+
+    class FakeStream:
+        def __init__(self, *args, **kwargs) -> None: ...
+
+        def __enter__(self) -> FakeResponse:
+            return FakeResponse()
+
+        def __exit__(self, *args) -> None: ...
+
+    monkeypatch.setattr(httpx, "stream", FakeStream)
 
 
 # --- pull --------------------------------------------------------------------
@@ -611,20 +755,7 @@ def test_transfer_item_composite_without_signed_url_is_error() -> None:
 
 def test_transfer_item_downloads_cross_origin(monkeypatch: pytest.MonkeyPatch) -> None:
 
-    class FakeResponse:
-        def raise_for_status(self) -> None: ...
-        def iter_bytes(self, chunk_size: int):
-            yield b"payload"
-
-    class FakeStream:
-        def __init__(self, *args, **kwargs) -> None: ...
-        def __enter__(self) -> FakeResponse:
-            return FakeResponse()
-        def __exit__(self, *args) -> None: ...
-
-    import httpx
-
-    monkeypatch.setattr(httpx, "stream", FakeStream)
+    _stub_httpx_stream(monkeypatch)
     storage = FakeStorage()
     record = transfer_item(
         FakeItem(_uuid(33), "far.mp4", "https://cdn.encord.example/x?sig=1"),
@@ -634,6 +765,28 @@ def test_transfer_item_downloads_cross_origin(monkeypatch: pytest.MonkeyPatch) -
     )
     assert record.transfer == "download"
     assert storage.uploads and storage.uploads[0][1] == record.media_uri
+
+
+def test_transfer_item_records_why_the_copy_fast_path_was_skipped(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A same-endpoint copy that fails falls back to download, visibly."""
+
+    _stub_httpx_stream(monkeypatch)
+    storage = FakeStorage()
+
+    def failing_copy(**kwargs):
+        raise RuntimeError("AccessDenied on CopySource")
+
+    storage.s3.copy_object = failing_copy  # type: ignore[assignment]
+    record = transfer_item(
+        FakeItem(_uuid(34), "a.mp4", f"{ENDPOINT}/bkt/p/a.mp4?sig=1"),
+        storage_client=storage,
+        output_uri="s3://out/pull",
+        endpoint_url=ENDPOINT,
+    )
+    assert record.transfer == "download"
+    assert "AccessDenied" in record.copy_error
 
 
 def test_enumerate_items_per_source() -> None:
@@ -652,7 +805,7 @@ def test_enumerate_items_per_source() -> None:
     assert found.source_id == dataset.dataset_hash and found.items == items
 
 
-def test_run_pull_writes_manifest_and_fails_closed_on_errors(tmp_path: Path) -> None:
+def test_run_pull_writes_manifest_and_fails_closed_on_errors() -> None:
     good = FakeItem(_uuid(51), "a.mp4", f"{ENDPOINT}/bkt/p/a.mp4", file_size=7)
     bad = FakeItem(_uuid(52), "b.mp4", None)
     collection = FakeCollection([good, bad])
@@ -674,7 +827,32 @@ def test_run_pull_writes_manifest_and_fails_closed_on_errors(tmp_path: Path) -> 
     assert f"{out_uri}/items/{_uuid(51)}.json" in uploaded
 
 
-def test_run_pull_happy_path_counts(tmp_path: Path) -> None:
+def test_run_pull_keeps_every_record_when_one_signed_url_fetch_raises() -> None:
+    class UnsignableItem(FakeItem):
+        def get_signed_url(self, refetch: bool = False) -> str | None:
+            raise RuntimeError("502 from Encord while signing")
+
+    good = FakeItem(_uuid(54), "a.mp4", f"{ENDPOINT}/bkt/p/a.mp4", file_size=7)
+    bad = UnsignableItem(_uuid(55), "b.mp4", None)
+    collection = FakeCollection([good, bad])
+    client = FakeUserClient(collection=collection, items=[good, bad])
+    storage = FakeStorage()
+    with pytest.raises(EncordToolError, match="failed for 1 of 2"):
+        run_pull(
+            source="collection",
+            source_id=str(collection.uuid),
+            output_path="s3://out/pull",
+            user_client=client,
+            storage_client=storage,
+            environ=dict(ENVIRON),
+        )
+    manifest = storage.written("s3://out/pull/manifest.json")
+    assert manifest["items_total"] == 2 and manifest["media_copied"] == 1
+    failed = next(row for row in manifest["items"] if row["item_uuid"] == _uuid(55))
+    assert failed["transfer"] == "error" and "502" in failed["error"]
+
+
+def test_run_pull_happy_path_counts() -> None:
     good = FakeItem(_uuid(53), "a.mp4", f"{ENDPOINT}/bkt/p/a.mp4", file_size=7)
     collection = FakeCollection([good])
     client = FakeUserClient(collection=collection, items=[good])
@@ -718,7 +896,7 @@ class FakeDownloadStorage(FakeStorage):
         return local_path
 
 
-def test_run_push_upload_mode_copies_bytes_and_links(tmp_path: Path) -> None:
+def test_run_push_upload_mode_copies_bytes_and_links() -> None:
     storage = FakeDownloadStorage(["p/a.mp4", "p/b.png"])
     folder = FakeUploadFolder()
     client = FakeUserClient(folders=[folder])
@@ -728,7 +906,7 @@ def test_run_push_upload_mode_copies_bytes_and_links(tmp_path: Path) -> None:
         folder=str(folder.uuid),
         dataset="new-ds",
         transfer="upload",
-        output_path=str(tmp_path / "receipt.json"),
+        output_path=RECEIPT_URI,
         user_client=client,
         storage_client=storage,
         environ={},  # upload mode needs no public endpoint
@@ -749,7 +927,7 @@ def test_run_push_upload_mode_copies_bytes_and_links(tmp_path: Path) -> None:
     assert len(dataset.linked[0]) == 2
 
 
-def test_run_push_upload_mode_per_item_error_fails_closed(tmp_path: Path) -> None:
+def test_run_push_upload_mode_per_item_error_fails_closed() -> None:
     storage = FakeDownloadStorage(["p/a.mp4"])
 
     class BrokenFolder(FakeUploadFolder):
@@ -764,31 +942,31 @@ def test_run_push_upload_mode_per_item_error_fails_closed(tmp_path: Path) -> Non
             integration="",
             folder=str(folder.uuid),
             transfer="upload",
-            output_path=str(tmp_path / "receipt.json"),
+            output_path=RECEIPT_URI,
             user_client=client,
             storage_client=storage,
             environ={},
         )
-    payload = json.loads((tmp_path / "receipt.json").read_text())
+    payload = storage.written(RECEIPT_URI)
     assert payload["status"] == "failed"
     assert "507" in payload["items"][0]["error"]
 
 
-def test_run_push_rejects_unknown_transfer(tmp_path: Path) -> None:
+def test_run_push_rejects_unknown_transfer() -> None:
     with pytest.raises(EncordToolError, match="Unknown --transfer"):
         run_push(
             input_path="s3://bkt/p/",
             integration="i",
             folder="f",
             transfer="teleport",
-            output_path=str(tmp_path / "r.json"),
+            output_path="s3://bkt/out/r.json",
             user_client=FakeUserClient(),
             storage_client=FakeStorage(["p/a.mp4"]),
             environ=dict(ENVIRON),
         )
 
 
-def test_run_push_repush_links_existing_items_via_object_url(tmp_path: Path) -> None:
+def test_run_push_repush_links_existing_items_via_object_url() -> None:
     """skip_duplicate_urls adds nothing on a re-push; linking must still happen.
 
     Items registered before identity metadata existed resolve through their
@@ -802,7 +980,7 @@ def test_run_push_repush_links_existing_items_via_object_url(tmp_path: Path) -> 
         _folder_item(62, "p/b.png", metadata=False),
     ]
     client = FakeUserClient(folders=[folder])
-    receipt = run_push(**_push_kwargs(tmp_path, storage, client, folder=str(folder.uuid), dataset="new-ds"))
+    receipt = run_push(**_push_kwargs(storage, client, folder=str(folder.uuid), dataset="new-ds"))
     dataset = next(iter(client.datasets.values()))
     assert sorted(dataset.linked[0]) == [_uuid(61), _uuid(62)]
     assert receipt.linked_count == 2
@@ -810,7 +988,7 @@ def test_run_push_repush_links_existing_items_via_object_url(tmp_path: Path) -> 
     assert {item.identity_signal for item in receipt.items} == {"object_url"}
 
 
-def test_run_push_shared_basenames_resolve_to_distinct_items(tmp_path: Path) -> None:
+def test_run_push_shared_basenames_resolve_to_distinct_items() -> None:
     """The identity-regression case: same basename, different objects.
 
     Exact identity (metadata/objectUrl) attributes each receipt row to its own
@@ -825,7 +1003,7 @@ def test_run_push_shared_basenames_resolve_to_distinct_items(tmp_path: Path) -> 
     ]
     client = FakeUserClient(folders=[folder])
     receipt = run_push(
-        **_push_kwargs(tmp_path, storage, client, folder=str(folder.uuid), dataset="new-ds")
+        **_push_kwargs(storage, client, folder=str(folder.uuid), dataset="new-ds")
     )
     dataset = next(iter(client.datasets.values()))
     assert sorted(dataset.linked[0]) == [_uuid(64), _uuid(65)]
@@ -833,7 +1011,7 @@ def test_run_push_shared_basenames_resolve_to_distinct_items(tmp_path: Path) -> 
     assert by_key == {"p/left/clip.mp4": _uuid(64), "p/right/clip.mp4": _uuid(65)}
 
 
-def test_run_push_identity_conflict_fails_the_item_closed(tmp_path: Path) -> None:
+def test_run_push_identity_conflict_fails_the_item_closed() -> None:
     """Two folder items claiming one source is a conflict, never a guess."""
 
     storage = FakeStorage(["p/a.mp4"])
@@ -843,13 +1021,13 @@ def test_run_push_identity_conflict_fails_the_item_closed(tmp_path: Path) -> Non
     folder.post_registration_items = [_folder_item(67, "p/a.mp4"), duplicate]
     client = FakeUserClient(folders=[folder])
     with pytest.raises(EncordToolError, match="unit error"):
-        run_push(**_push_kwargs(tmp_path, storage, client, folder=str(folder.uuid)))
-    payload = json.loads((tmp_path / "receipt.json").read_text())
+        run_push(**_push_kwargs(storage, client, folder=str(folder.uuid)))
+    payload = storage.written(RECEIPT_URI)
     assert payload["items"][0]["status"] == "error"
     assert "identity signals conflict" in payload["items"][0]["error"]
 
 
-def test_run_push_writes_receipt_when_linking_crashes(tmp_path: Path) -> None:
+def test_run_push_writes_receipt_when_linking_crashes() -> None:
     """Post-mutation failures must still leave a receipt behind."""
 
     storage = FakeStorage(["p/a.mp4"])
@@ -868,17 +1046,17 @@ def test_run_push_writes_receipt_when_linking_crashes(tmp_path: Path) -> None:
     with pytest.raises(EncordToolError, match="503 from Encord"):
         run_push(
             **_push_kwargs(
-                tmp_path, storage, client,
+                storage, client,
                 folder=str(folder.uuid), dataset=exploding.dataset_hash,
             )
         )
-    payload = json.loads((tmp_path / "receipt.json").read_text())
+    payload = storage.written(RECEIPT_URI)
     assert payload["status"] == "failed"
     assert "503 from Encord" in payload["error"]
     assert payload["units_done"] == 1  # registration evidence preserved
 
 
-def test_run_push_writes_receipt_when_dataset_create_fails(tmp_path: Path) -> None:
+def test_run_push_writes_receipt_when_dataset_create_fails() -> None:
     """Folder creation is a mutation too, so setup failure must retain lineage."""
 
     class DatasetCreateFails(FakeUserClient):
@@ -889,16 +1067,16 @@ def test_run_push_writes_receipt_when_dataset_create_fails(tmp_path: Path) -> No
     client = DatasetCreateFails()
     with pytest.raises(EncordToolError, match="dataset create unavailable"):
         run_push(
-            **_push_kwargs(tmp_path, storage, client, folder="new-folder", dataset="new-dataset")
+            **_push_kwargs(storage, client, folder="new-folder", dataset="new-dataset")
         )
-    payload = json.loads((tmp_path / "receipt.json").read_text())
+    payload = storage.written(RECEIPT_URI)
     assert client.created_folders == ["new-folder"]
     assert payload["status"] == "failed"
     assert payload["folder_name"] == "new-folder"
     assert "dataset create unavailable" in payload["error"]
 
 
-def test_run_pull_writes_manifest_when_labels_crash(tmp_path: Path) -> None:
+def test_run_pull_writes_manifest_when_labels_crash() -> None:
     class ExplodingProject:
         title = "proj"
 
@@ -1009,14 +1187,14 @@ def test_run_pull_empty_source_writes_manifest_then_raises() -> None:
 # --- curate --------------------------------------------------------------------
 
 
-def _curate_kwargs(tmp_path: Path, client: FakeUserClient, **overrides):
+def _curate_kwargs(storage: FakeStorage, client: FakeUserClient, **overrides):
     kwargs = dict(
         folder="src",
         filters=["width:1:100000"],
         collection="keepers-new",
-        output_path=str(tmp_path / "curate_receipt.json"),
+        output_path=CURATE_RECEIPT_URI,
         user_client=client,
-        storage_client=FakeStorage(),
+        storage_client=storage,
         environ=dict(ENVIRON),
     )
     kwargs.update(overrides)
@@ -1042,6 +1220,13 @@ def _fast_polling(monkeypatch: pytest.MonkeyPatch):
 def test_curate_receipt_uri_helper() -> None:
     assert curate_receipt_uri_for("s3://b/p/") == "s3://b/p/curate_receipt.json"
     assert curate_receipt_uri_for("s3://b/p/r.json") == "s3://b/p/r.json"
+
+
+def test_preset_name_is_run_scoped_and_never_collides_ad_hoc() -> None:
+    assert preset_name_for("run-1") == "npa-curate-run-1"
+    first, second = preset_name_for(""), preset_name_for("   ")
+    assert first.startswith("npa-curate-adhoc-") and second.startswith("npa-curate-adhoc-")
+    assert first != second  # two ad-hoc curates must not race on one title
 
 
 def test_parse_filter_specs_repeatable_and_comma_separated() -> None:
@@ -1093,18 +1278,18 @@ def test_build_filter_preset_json_pins_the_live_verified_shape() -> None:
     }
 
 
-def test_run_curate_happy_path_creates_collection_and_preset(
-    tmp_path: Path, _fast_polling
-) -> None:
+def test_run_curate_happy_path_creates_collection_and_preset(_fast_polling) -> None:
     client, folder = _curate_client()
     client.pending_curate_items = [
         FakeItem(_uuid(31), "a.png", None),
         FakeItem(_uuid(32), "b.png", None),
     ]
-    receipt = run_curate(**_curate_kwargs(tmp_path, client, workflow_run="run-1"))
+    storage = FakeStorage()
+    receipt = run_curate(**_curate_kwargs(storage, client, workflow_run="run-1"))
 
     assert receipt.status == "done"
     assert receipt.items_selected == 2
+    assert receipt.items_total == 1  # the folder held one item when evaluated
     assert receipt.collection_created is True
     assert receipt.collection_name == "keepers-new"
     assert receipt.folder_uuid == str(folder.uuid)
@@ -1117,48 +1302,84 @@ def test_run_curate_happy_path_creates_collection_and_preset(
     assert collection.preset_calls == [str(preset.uuid)]
     # The run-scoped preset is transient scaffolding, deleted once evaluated.
     assert client.deleted_presets == [str(preset.uuid)]
+    assert receipt.preset_deleted is True
     # Curate never creates folders.
     assert client.created_folders == []
-    payload = json.loads((tmp_path / "curate_receipt.json").read_text())
+    payload = storage.written(CURATE_RECEIPT_URI)
     assert payload["schema"] == "npa.encord.curate_receipt.v1"
-    assert payload["items_selected"] == 2
+    assert payload["items_selected"] == 2 and payload["items_total"] == 1
 
 
-def test_run_curate_reuses_existing_collection(tmp_path: Path, _fast_polling) -> None:
+def test_run_curate_planned_receipt_lands_before_the_first_mutation(
+    _fast_polling,
+) -> None:
+    """The write-ahead receipt must exist before Encord is touched."""
+
+    storage = FakeStorage()
+
+    class MutationChecksReceipt(FakeUserClient):
+        def create_collection(self, **kwargs):
+            planned = storage.written(CURATE_RECEIPT_URI)
+            assert planned["status"] == "planned"
+            assert planned["preset_name"] == "npa-curate-run-2"
+            assert planned["filters"][0]["metric"] == "width"
+            return super().create_collection(**kwargs)
+
+    folder = FakeFolder(name="src")
+    folder.folder_items = [FakeItem(_uuid(30), "seed.png", None)]
+    client = MutationChecksReceipt(folders=[folder])
+    client.pending_curate_items = [FakeItem(_uuid(31), "a.png", None)]
+    receipt = run_curate(**_curate_kwargs(storage, client, workflow_run="run-2"))
+    assert receipt.status == "done"
+    assert [uri for _, uri in storage.uploads] == [CURATE_RECEIPT_URI, CURATE_RECEIPT_URI]
+
+
+def test_run_curate_reuses_existing_collection(_fast_polling) -> None:
     existing = FakeCollection([])
     existing.name = "keepers-new"
     existing.pending = [FakeItem(_uuid(33), "c.png", None)]
     client, _ = _curate_client(collection=existing)
-    receipt = run_curate(**_curate_kwargs(tmp_path, client))
+    receipt = run_curate(**_curate_kwargs(FakeStorage(), client))
     assert receipt.collection_created is False
     assert receipt.collection_uuid == str(existing.uuid)
     assert receipt.items_selected == 1
     assert client.created_collections == []
 
 
-def test_run_curate_reissues_evaluation_until_indexing_catches_up(
-    tmp_path: Path, _fast_polling
-) -> None:
+def test_run_curate_refuses_a_populated_collection(_fast_polling) -> None:
+    """A stale selection would read as this run's; fail closed instead."""
+
+    existing = FakeCollection([FakeItem(_uuid(36), "old.png", None)])
+    existing.name = "keepers-new"
+    client, _ = _curate_client(collection=existing)
+    storage = FakeStorage()
+    with pytest.raises(EncordToolError, match="already holds items"):
+        run_curate(**_curate_kwargs(storage, client))
+    assert client.created_presets == []
+    assert existing.preset_calls == []
+    assert storage.written(CURATE_RECEIPT_URI)["status"] == "failed"
+
+
+def test_run_curate_reissues_evaluation_until_indexing_catches_up(_fast_polling) -> None:
     # Observed live: add_preset_items evaluates once, and items pushed moments
     # earlier are not metric-indexed yet — the re-issue loop must recover.
     client, _ = _curate_client()
     client.pending_curate_items = [FakeItem(_uuid(35), "late.png", None)]
     client.curate_reveal_after_calls = 3
-    receipt = run_curate(**_curate_kwargs(tmp_path, client, poll_seconds=5.0))
+    receipt = run_curate(**_curate_kwargs(FakeStorage(), client, poll_seconds=5.0))
     assert receipt.items_selected == 1
     (collection,) = client.created_collections
     assert len(collection.preset_calls) >= 3
 
 
-def test_run_curate_zero_selection_fails_closed_with_receipt(
-    tmp_path: Path, _fast_polling
-) -> None:
+def test_run_curate_zero_selection_fails_closed_with_receipt(_fast_polling) -> None:
     client, _ = _curate_client()
     client.pending_curate_items = []
+    storage = FakeStorage()
     with pytest.raises(EncordToolError) as excinfo:
         run_curate(
             **_curate_kwargs(
-                tmp_path,
+                storage,
                 client,
                 filters=["brightness:0.2:0.8"],
                 poll_seconds=0.05,
@@ -1168,38 +1389,83 @@ def test_run_curate_zero_selection_fails_closed_with_receipt(
     assert "selected 0 items" in message
     # The diagnostic names the computed-metric cause when one is in play.
     assert "quality metrics have been computed" in message
-    payload = json.loads((tmp_path / "curate_receipt.json").read_text())
+    payload = storage.written(CURATE_RECEIPT_URI)
     assert payload["status"] == "empty"
-    assert payload["items_selected"] == 0
+    assert payload["items_selected"] == 0 and payload["items_total"] == 1
+    # The transient preset is gone even though the run failed.
+    assert payload["preset_deleted"] is True and len(client.deleted_presets) == 1
 
 
-def test_run_curate_empty_folder_fails_fast_before_any_scaffolding(
-    tmp_path: Path,
-) -> None:
+def test_run_curate_deletes_the_preset_when_evaluation_raises() -> None:
+    """A crash after create_preset must not leave the transient preset behind."""
+
+    class ExplodingCollection(FakeCollection):
+        def add_preset_items(self, filter_preset) -> None:
+            raise RuntimeError("502 from Encord")
+
+    class ExplodingClient(FakeUserClient):
+        def create_collection(self, *, top_level_folder_uuid, name, description=""):
+            collection = ExplodingCollection([])
+            collection.name = name
+            self.created_collections.append(collection)
+            return collection
+
+    folder = FakeFolder(name="src")
+    folder.folder_items = [FakeItem(_uuid(30), "seed.png", None)]
+    client = ExplodingClient(folders=[folder])
+    storage = FakeStorage()
+    with pytest.raises(EncordToolError, match="502 from Encord"):
+        run_curate(**_curate_kwargs(storage, client))
+    (preset,) = client.created_presets
+    assert client.deleted_presets == [str(preset.uuid)]
+    payload = storage.written(CURATE_RECEIPT_URI)
+    assert payload["status"] == "failed" and payload["preset_deleted"] is True
+    assert payload["preset_uuid"] == str(preset.uuid)
+
+
+def test_run_curate_records_a_failed_preset_delete(_fast_polling) -> None:
+    class StickyPresets(FakeUserClient):
+        def delete_preset(self, preset_uuid):
+            raise RuntimeError("403 preset delete")
+
+    folder = FakeFolder(name="src")
+    folder.folder_items = [FakeItem(_uuid(30), "seed.png", None)]
+    client = StickyPresets(folders=[folder])
+    client.pending_curate_items = [FakeItem(_uuid(31), "a.png", None)]
+    receipt = run_curate(**_curate_kwargs(FakeStorage(), client))
+    assert receipt.status == "done"
+    assert receipt.preset_deleted is False  # cleanup by prefix is owed
+
+
+def test_run_curate_empty_folder_fails_fast_before_any_scaffolding() -> None:
     client = FakeUserClient(folders=[FakeFolder(name="src")])  # no folder items
+    storage = FakeStorage()
     with pytest.raises(EncordToolError, match="contains no storage items"):
-        run_curate(**_curate_kwargs(tmp_path, client))
+        run_curate(**_curate_kwargs(storage, client))
     assert client.created_collections == []
     assert client.created_presets == []
-    payload = json.loads((tmp_path / "curate_receipt.json").read_text())
+    payload = storage.written(CURATE_RECEIPT_URI)
     assert payload["status"] == "failed"
+    assert payload["items_total"] == 0
     assert "contains no storage items" in payload["error"]
 
 
-def test_run_curate_unknown_metric_fails_before_any_encord_call(tmp_path: Path) -> None:
+def test_run_curate_unknown_metric_fails_before_any_encord_call() -> None:
     client = FakeUserClient(folders=[FakeFolder(name="src")])
+    storage = FakeStorage()
     with pytest.raises(EncordToolError, match="Unknown filter metric"):
-        run_curate(**_curate_kwargs(tmp_path, client, filters=["blur:0:1"]))
+        run_curate(**_curate_kwargs(storage, client, filters=["blur:0:1"]))
     assert client.created_presets == []
     assert client.created_collections == []
-    assert not (tmp_path / "curate_receipt.json").exists()
+    assert storage.objects == {}  # not even a planned receipt
 
 
-def test_run_curate_missing_folder_writes_receipt_then_raises(tmp_path: Path) -> None:
+def test_run_curate_missing_folder_writes_receipt_then_raises() -> None:
     client = FakeUserClient(folders=[])
+    storage = FakeStorage()
     with pytest.raises(EncordToolError, match="No Encord storage folder"):
-        run_curate(**_curate_kwargs(tmp_path, client, folder="absent"))
-    payload = json.loads((tmp_path / "curate_receipt.json").read_text())
+        run_curate(**_curate_kwargs(storage, client, folder="absent"))
+    payload = storage.written(CURATE_RECEIPT_URI)
     assert payload["status"] == "failed"
     assert "No Encord storage folder" in payload["error"]
     assert client.created_folders == []
@@ -1216,34 +1482,32 @@ def test_resolve_collection_create_paths() -> None:
     client = FakeUserClient()
     with pytest.raises(EncordToolError, match="No Encord collection"):
         resolve_collection(client, "fresh")
-    collection, collection_uuid, name, created = resolve_collection(
-        client, "fresh", create_in_folder_uuid=_uuid(1)
-    )
-    assert created is True and name == "fresh"
-    assert collection_uuid == str(collection.uuid)
+    ref = resolve_collection(client, "fresh", create_in_folder_uuid=_uuid(1))
+    assert ref.created is True and ref.title == "fresh"
+    assert ref.id == str(ref.obj.uuid)
     # Idempotent re-resolution finds the created collection instead.
-    again, again_uuid, _, created = resolve_collection(client, "fresh")
-    assert created is False and again_uuid == collection_uuid
+    again = resolve_collection(client, "fresh")
+    assert again.created is False and again.id == ref.id
 
 
 # --- idempotency + isolation ---------------------------------------------------
 
 
-def test_run_push_repush_is_a_no_op_on_the_wire(tmp_path: Path) -> None:
+def test_run_push_repush_is_a_no_op_on_the_wire() -> None:
     """Retry-safety is our invariant: nothing already present is re-sent."""
 
     storage = FakeStorage(["p/a.mp4"])
     folder = FakeFolder()
     folder.folder_items = [_folder_item(61, "p/a.mp4")]
     client = FakeUserClient(folders=[folder])
-    receipt = run_push(**_push_kwargs(tmp_path, storage, client, folder=str(folder.uuid)))
+    receipt = run_push(**_push_kwargs(storage, client, folder=str(folder.uuid)))
     assert receipt.status == "done"
     assert receipt.units_done == 1
     assert folder.start_calls == []  # no registration round-trip at all
     assert receipt.items[0].item_uuid == _uuid(61)
 
 
-def test_run_push_upload_mode_repush_skips_duplicate_byte_copies(tmp_path: Path) -> None:
+def test_run_push_upload_mode_repush_skips_duplicate_byte_copies() -> None:
     storage = FakeDownloadStorage(["p/a.mp4"])
     folder = FakeUploadFolder()
     folder.folder_items = [_folder_item(62, "p/a.mp4", url=False)]
@@ -1253,7 +1517,7 @@ def test_run_push_upload_mode_repush_skips_duplicate_byte_copies(tmp_path: Path)
         integration="",
         folder=str(folder.uuid),
         transfer="upload",
-        output_path=str(tmp_path / "receipt.json"),
+        output_path=RECEIPT_URI,
         user_client=client,
         storage_client=storage,
         environ={},
@@ -1265,7 +1529,7 @@ def test_run_push_upload_mode_repush_skips_duplicate_byte_copies(tmp_path: Path)
     assert receipt.items[0].status == "uploaded"
 
 
-def test_register_mode_never_falls_through_to_upload(tmp_path: Path) -> None:
+def test_register_mode_never_falls_through_to_upload() -> None:
     """Register failures must never copy customer bytes into the SaaS."""
 
     storage = FakeStorage(["p/a.mp4"])
@@ -1273,7 +1537,7 @@ def test_register_mode_never_falls_through_to_upload(tmp_path: Path) -> None:
     folder.results = [FakePollResult(status="ERROR")]
     client = FakeUserClient(folders=[folder])
     with pytest.raises(EncordToolError):
-        run_push(**_push_kwargs(tmp_path, storage, client, folder=str(folder.uuid)))
+        run_push(**_push_kwargs(storage, client, folder=str(folder.uuid)))
     assert folder.uploads == []
 
 
@@ -1398,7 +1662,16 @@ def test_write_hashed_stream_digest(tmp_path: Path) -> None:
     assert hash_file(dest) == digest
 
 
-def _verify_fixtures(tmp_path: Path, *, pulled_overrides=None, drop_pulled=False):
+def _verify_fixtures(
+    storage: FakeStorage,
+    *,
+    receipt_overrides=None,
+    pulled_overrides=None,
+    drop_pulled=False,
+    drop_pushed=False,
+) -> tuple[str, str]:
+    """Write a receipt + manifest pair into the fake object store; return URIs."""
+
     sha = "a" * 64
     receipt = {
         "schema": "npa.encord.push_receipt.v1",
@@ -1409,7 +1682,9 @@ def _verify_fixtures(tmp_path: Path, *, pulled_overrides=None, drop_pulled=False
         "folder_name": "f",
         "media_filter": "videos-images",
         "status": "done",
-        "items": [
+        "items": []
+        if drop_pushed
+        else [
             {
                 "key": "p/a.mp4",
                 "source_uri": "s3://bkt/p/a.mp4",
@@ -1422,6 +1697,7 @@ def _verify_fixtures(tmp_path: Path, *, pulled_overrides=None, drop_pulled=False
             }
         ],
     }
+    receipt.update(receipt_overrides or {})
     pulled = {
         "item_uuid": _uuid(90),
         "name": "p/a.mp4",
@@ -1440,68 +1716,214 @@ def _verify_fixtures(tmp_path: Path, *, pulled_overrides=None, drop_pulled=False
         "output_uri": "s3://bkt/out/",
         "items": [] if drop_pulled else [pulled],
     }
-    receipt_uri = tmp_path / "push_receipt.json"
-    manifest_uri = tmp_path / "manifest.json"
-    receipt_uri.write_text(json.dumps(receipt))
-    manifest_uri.write_text(json.dumps(manifest))
-    return str(receipt_uri), str(manifest_uri)
+    receipt_uri = "s3://bkt/push/push_receipt.json"
+    manifest_uri = "s3://bkt/pull/manifest.json"
+    write_json(receipt, result_uri=receipt_uri, filename="push_receipt.json", storage_client=storage)
+    write_json(manifest, result_uri=manifest_uri, filename="manifest.json", storage_client=storage)
+    return receipt_uri, manifest_uri
 
 
-def test_run_verify_passes_on_exact_match(tmp_path: Path) -> None:
-    receipt_uri, manifest_uri = _verify_fixtures(tmp_path)
-    report = run_verify(
+def _verify(storage: FakeStorage, receipt_uri: str, manifest_uri: str):
+    return run_verify(
         receipt_uri=receipt_uri,
         manifest_uri=manifest_uri,
-        output_path=str(tmp_path / "roundtrip_report.json"),
-        storage_client=FakeStorage(),
+        output_path=REPORT_URI,
+        storage_client=storage,
     )
+
+
+def test_run_verify_passes_on_exact_match() -> None:
+    storage = FakeStorage()
+    report = _verify(storage, *_verify_fixtures(storage))
     assert report.status == "passed"
     assert report.expected == report.matched == 1
     assert report.checksum_verified == 1 and report.checksum_mismatched == 0
-    payload = json.loads((tmp_path / "roundtrip_report.json").read_text())
+    assert report.defects == []
+    payload = storage.written(REPORT_URI)
     assert payload["schema"] == "npa.encord.roundtrip_report.v1"
 
 
-def test_run_verify_fails_closed_on_checksum_mismatch(tmp_path: Path) -> None:
-    receipt_uri, manifest_uri = _verify_fixtures(
-        tmp_path, pulled_overrides={"checksum": "b" * 64}
-    )
+def test_run_verify_fails_closed_on_checksum_mismatch() -> None:
+    storage = FakeStorage()
+    uris = _verify_fixtures(storage, pulled_overrides={"checksum": "b" * 64})
     with pytest.raises(EncordToolError, match="1 checksum mismatched"):
-        run_verify(
-            receipt_uri=receipt_uri,
-            manifest_uri=manifest_uri,
-            output_path=str(tmp_path / "roundtrip_report.json"),
-            storage_client=FakeStorage(),
-        )
-    payload = json.loads((tmp_path / "roundtrip_report.json").read_text())
+        _verify(storage, *uris)
+    payload = storage.written(REPORT_URI)
     assert payload["status"] == "failed"
     assert payload["items"][0]["checksum_state"] == "mismatched"
 
 
-def test_run_verify_fails_closed_on_missing_item(tmp_path: Path) -> None:
-    receipt_uri, manifest_uri = _verify_fixtures(tmp_path, drop_pulled=True)
+def test_run_verify_fails_closed_on_missing_item() -> None:
+    storage = FakeStorage()
+    uris = _verify_fixtures(storage, drop_pulled=True)
     with pytest.raises(EncordToolError, match="1 missing"):
-        run_verify(
-            receipt_uri=receipt_uri,
-            manifest_uri=manifest_uri,
-            output_path=str(tmp_path / "roundtrip_report.json"),
+        _verify(storage, *uris)
+
+
+@pytest.mark.parametrize("receipt_status", ["planned", "failed", "timeout"])
+def test_run_verify_fails_closed_when_the_push_never_completed(receipt_status: str) -> None:
+    """A write-ahead or failed receipt is not evidence of a roundtrip."""
+
+    storage = FakeStorage()
+    uris = _verify_fixtures(storage, receipt_overrides={"status": receipt_status})
+    with pytest.raises(EncordToolError, match=f"status is {receipt_status!r}, not 'done'"):
+        _verify(storage, *uris)
+    payload = storage.written(REPORT_URI)
+    assert payload["status"] == "failed"
+    assert any("never completed" in defect for defect in payload["defects"])
+    # The per-item join still ran and matched: the defect is receipt-level.
+    assert payload["matched"] == 1
+
+
+def test_run_verify_fails_closed_on_zero_attributable_items() -> None:
+    """0/0 matched must never read as passed."""
+
+    storage = FakeStorage()
+    uris = _verify_fixtures(storage, drop_pushed=True, drop_pulled=True)
+    with pytest.raises(EncordToolError, match="no attributable items"):
+        _verify(storage, *uris)
+    payload = storage.written(REPORT_URI)
+    assert payload["status"] == "failed"
+    assert payload["expected"] == payload["matched"] == 0
+
+
+def test_run_verify_fails_closed_when_an_item_has_no_evidence_at_all() -> None:
+    """Multipart ETags on both sides and no size from Encord verify nothing."""
+
+    storage = FakeStorage()
+    uris = _verify_fixtures(
+        storage,
+        receipt_overrides={
+            "items": [
+                {
+                    "key": "p/a.mp4",
+                    "source_uri": "s3://bkt/p/a.mp4",
+                    "category": "videos",
+                    "item_uuid": _uuid(90),
+                    "status": "registered",
+                    "source_size": 6,
+                    "source_checksum": "",
+                    "source_checksum_kind": "none",
+                }
+            ]
+        },
+        pulled_overrides={
+            "transfer": "copy",
+            "observed_size": 0,
+            "file_size": 0,
+            "checksum": "",
+            "checksum_kind": "none",
+        },
+    )
+    with pytest.raises(EncordToolError, match="1 unverifiable"):
+        _verify(storage, *uris)
+    payload = storage.written(REPORT_URI)
+    assert payload["status"] == "failed" and payload["unverifiable"] == 1
+    assert payload["items"][0]["reasons"] == [
+        "unverifiable: no comparable checksum and no size on both sides"
+    ]
+
+
+def test_run_verify_incomparable_kinds_are_unavailable_not_failures() -> None:
+    # A multipart-source object vs a sha256 download: no comparison exists.
+    storage = FakeStorage()
+    uris = _verify_fixtures(
+        storage, pulled_overrides={"checksum": "c" * 32, "checksum_kind": "md5"}
+    )
+    report = _verify(storage, *uris)
+    assert report.status == "passed"
+    assert report.checksum_unavailable == 1
+
+
+# --- artifact storage ------------------------------------------------------------
+
+
+def test_write_json_rejects_non_s3_destinations(tmp_path: Path) -> None:
+    with pytest.raises(EncordToolError, match="expected an s3:// URI"):
+        write_json(
+            {"a": 1},
+            result_uri=str(tmp_path / "receipt.json"),
+            filename="receipt.json",
             storage_client=FakeStorage(),
         )
 
 
-def test_run_verify_incomparable_kinds_are_unavailable_not_failures(
-    tmp_path: Path,
+# --- seed-demo ------------------------------------------------------------------
+
+
+def test_seed_demo_skips_when_operator_supplied_a_curated_source(
+    monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    # A multipart-source object vs a sha256 download: no comparison exists.
-    receipt_uri, manifest_uri = _verify_fixtures(
-        tmp_path,
-        pulled_overrides={"checksum": "c" * 32, "checksum_kind": "md5"},
-    )
-    report = run_verify(
-        receipt_uri=receipt_uri,
-        manifest_uri=manifest_uri,
-        output_path=str(tmp_path / "roundtrip_report.json"),
+    import npa.workflows.data_factory_input as dfi
+
+    def explode(*args, **kwargs):
+        raise AssertionError("seed must not fetch when skipping")
+
+    monkeypatch.setattr(dfi, "_fetch_starter", explode)
+    summary = run_seed_demo(
+        media_uri="s3://bkt/run/seed/",
+        dataset="npa-demo-src-run",
+        active_source_id="my-curated-collection",
         storage_client=FakeStorage(),
     )
-    assert report.status == "passed"
-    assert report.checksum_unavailable == 1
+    assert summary["skipped"]
+
+
+def test_seed_demo_requires_an_integration_before_fetching_anything(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    import npa.workflows.data_factory_input as dfi
+
+    def explode(*args, **kwargs):
+        raise AssertionError("seed must not fetch when its arguments are invalid")
+
+    monkeypatch.setattr(dfi, "_fetch_starter", explode)
+    storage = FakeStorage()
+    with pytest.raises(EncordToolError, match="--integration is required"):
+        run_seed_demo(
+            media_uri="s3://bkt/run/seed/",
+            dataset="npa-demo-src-run",
+            active_source_id="npa-demo-src-run",
+            storage_client=storage,
+        )
+    assert storage.uploads == []
+
+
+def test_seed_demo_fetches_uploads_and_pushes_the_starter_clip(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    import npa.workbench.encord.push as push_module
+    import npa.workflows.data_factory_input as dfi
+
+    clip = tmp_path / "starter.mp4"
+    clip.write_bytes(b"starter-bytes")
+    monkeypatch.setattr(dfi, "_fetch_starter", lambda contract, **kw: (clip, "verified_hit"))
+    monkeypatch.setattr(
+        dfi,
+        "load_starter_contract",
+        lambda: {"integrity": {"sha256": "a" * 64}, "license": {"name": "CC-BY-4.0"}},
+    )
+    pushed: dict = {}
+
+    def fake_run_push(**kwargs):
+        pushed.update(kwargs)
+        return SimpleNamespace(units_done=1)
+
+    monkeypatch.setattr(push_module, "run_push", fake_run_push)
+    storage = FakeStorage()
+    summary = run_seed_demo(
+        media_uri="s3://bkt/run/seed/",
+        dataset="npa-demo-src-run",
+        active_source_id="npa-demo-src-run",
+        integration="nebius-s3",
+        storage_client=storage,
+    )
+    assert storage.uploads[0][1] == "s3://bkt/run/seed/starter-clip.mp4"
+    assert pushed["dataset"] == pushed["folder"] == "npa-demo-src-run"
+    assert pushed["input_path"] == "s3://bkt/run/seed/"
+    assert pushed["output_path"] == "s3://bkt/run/seed/push/"
+    # The push default (register) holds here too: no bytes enter the SaaS
+    # unless the spec or operator asks for upload.
+    assert pushed["transfer"] == "register" and pushed["integration"] == "nebius-s3"
+    assert summary["units_done"] == 1 and summary["attribution"] == "CC-BY-4.0"
+    assert summary["transfer"] == "register"

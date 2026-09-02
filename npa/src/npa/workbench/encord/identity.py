@@ -9,11 +9,12 @@ closed rather than guessing.
 
 from __future__ import annotations
 
+from collections import defaultdict
 from dataclasses import dataclass
 from typing import Any, Iterable, Mapping
 from urllib.parse import quote, urlsplit, urlunsplit
 
-from npa.workbench.encord.schemas import EncordToolError
+from npa.workbench.encord.schemas import EncordToolError, IdentitySignal
 
 
 def canonical_s3_uri(bucket: str, key: str) -> str:
@@ -140,7 +141,7 @@ class IdentityCandidate:
 @dataclass(frozen=True)
 class IdentityResolution:
     item_uuid: str = ""
-    signal: str = ""
+    signal: IdentitySignal = ""
     error_code: str = ""
     error: str = ""
 
@@ -149,47 +150,77 @@ class IdentityResolution:
         return bool(self.item_uuid) and not self.error_code
 
 
+class IdentityIndex:
+    """A folder inventory indexed by its exact identity signals.
+
+    Building the views (including URL normalisation) once per inventory makes
+    resolving N pushed items O(N) instead of O(N x inventory) — the difference
+    between seconds and hours on folders with thousands of items.
+    """
+
+    def __init__(self, candidates: Iterable[Any]) -> None:
+        views = [IdentityCandidate.from_item(candidate) for candidate in candidates]
+        self.by_uuid: dict[str, list[IdentityCandidate]] = defaultdict(list)
+        self.by_source_uri: dict[str, list[IdentityCandidate]] = defaultdict(list)
+        self.by_object_url: dict[str, list[IdentityCandidate]] = defaultdict(list)
+        for view in views:
+            if not view.item_uuid:
+                continue
+            self.by_uuid[view.item_uuid].append(view)
+            if view.source_uri:
+                self.by_source_uri[view.source_uri].append(view)
+            if view.object_url:
+                self.by_object_url[view.object_url].append(view)
+
+    def resolve(self, *, source_uri: str, submitted_object_url: str) -> IdentityResolution:
+        """Resolve one source object to at most one Encord item, or fail closed."""
+
+        expected_url = (
+            normalize_object_url(submitted_object_url) if submitted_object_url else ""
+        )
+        matched: list[tuple[IdentityCandidate, str]] = []
+        if source_uri:
+            matched.extend((view, "metadata") for view in self.by_source_uri.get(source_uri, ()))
+        if expected_url:
+            matched.extend(
+                (view, "object_url")
+                for view in self.by_object_url.get(expected_url, ())
+                # A view already matched by metadata is not a second match.
+                if not (source_uri and view.source_uri == source_uri)
+            )
+
+        uuids = {view.item_uuid for view, _ in matched}
+        conflicts: list[str] = []
+        for item_uuid in uuids:
+            for view in self.by_uuid[item_uuid]:
+                if view.source_uri and view.source_uri != source_uri:
+                    conflicts.append(f"{view.item_uuid}:source_uri")
+                if expected_url and view.object_url and view.object_url != expected_url:
+                    conflicts.append(f"{view.item_uuid}:object_url")
+        if conflicts or len(uuids) > 1:
+            detail = ", ".join(sorted(conflicts)) or "multiple exact UUID candidates"
+            return IdentityResolution(
+                error_code="identity_conflict",
+                error=f"exact identity signals conflict: {detail}",
+            )
+        if not matched:
+            return IdentityResolution(
+                error_code="identity_unresolved",
+                error="no exact metadata or object URL identity matched",
+            )
+        order = {"metadata": 0, "object_url": 1}
+        view, signal = sorted(matched, key=lambda entry: order[entry[1]])[0]
+        return IdentityResolution(item_uuid=view.item_uuid, signal=signal)  # type: ignore[arg-type]
+
+
 def resolve_exact_identity(
     *,
     source_uri: str,
     submitted_object_url: str,
     candidates: Iterable[Any],
 ) -> IdentityResolution:
-    """Resolve one source object to at most one Encord item, or fail closed."""
+    """Resolve one source object against an inventory (one-off convenience)."""
 
-    expected_url = (
-        normalize_object_url(submitted_object_url) if submitted_object_url else ""
+    return IdentityIndex(candidates).resolve(
+        source_uri=source_uri, submitted_object_url=submitted_object_url
     )
-    views = [IdentityCandidate.from_item(candidate) for candidate in candidates]
-    views = [view for view in views if view.item_uuid]
-
-    matched: list[tuple[IdentityCandidate, str]] = []
-    for view in views:
-        if source_uri and view.source_uri == source_uri:
-            matched.append((view, "metadata"))
-        elif expected_url and view.object_url == expected_url:
-            matched.append((view, "object_url"))
-
-    uuids = {view.item_uuid for view, _ in matched}
-    conflicts: list[str] = []
-    for view in views:
-        if view.item_uuid not in uuids:
-            continue
-        if view.source_uri and view.source_uri != source_uri:
-            conflicts.append(f"{view.item_uuid}:source_uri")
-        if expected_url and view.object_url and view.object_url != expected_url:
-            conflicts.append(f"{view.item_uuid}:object_url")
-    if conflicts or len(uuids) > 1:
-        detail = ", ".join(sorted(conflicts)) or "multiple exact UUID candidates"
-        return IdentityResolution(
-            error_code="identity_conflict",
-            error=f"exact identity signals conflict: {detail}",
-        )
-    if not matched:
-        return IdentityResolution(
-            error_code="identity_unresolved",
-            error="no exact metadata or object URL identity matched",
-        )
-    order = {"metadata": 0, "object_url": 1}
-    view, signal = sorted(matched, key=lambda entry: order[entry[1]])[0]
-    return IdentityResolution(item_uuid=view.item_uuid, signal=signal)

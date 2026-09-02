@@ -19,7 +19,7 @@ class StoragePreconditionFailed(StorageError):
     """A conditional object write lost its compare-and-swap race."""
 
 
-def _parse_bucket_uri(uri: str) -> tuple[str, str]:
+def parse_bucket_uri(uri: str) -> tuple[str, str]:
     """Parse s3://bucket/prefix into (bucket, prefix)."""
     parsed = urlparse(uri)
     if parsed.scheme != "s3":
@@ -27,6 +27,7 @@ def _parse_bucket_uri(uri: str) -> tuple[str, str]:
     bucket = parsed.netloc
     prefix = parsed.path.lstrip("/")
     return bucket, prefix
+
 
 
 def safe_s3_tree_relative_path(key: str, prefix: str) -> Path:
@@ -142,7 +143,7 @@ class StorageClient:
 
     def list_checkpoints(self, bucket_uri: str) -> list[dict[str, str]]:
         """List checkpoint directories under the given S3 URI."""
-        bucket, prefix = _parse_bucket_uri(bucket_uri)
+        bucket, prefix = parse_bucket_uri(bucket_uri)
         if prefix and not prefix.endswith("/"):
             prefix += "/"
 
@@ -161,7 +162,7 @@ class StorageClient:
         """Upload a local directory to S3. Returns the destination URI."""
         import os
 
-        bucket, base_prefix = _parse_bucket_uri(bucket_uri)
+        bucket, base_prefix = parse_bucket_uri(bucket_uri)
         if remote_prefix:
             base_prefix = base_prefix.rstrip("/") + "/" + remote_prefix.strip("/")
         base_prefix = base_prefix.rstrip("/") + "/"
@@ -177,7 +178,7 @@ class StorageClient:
 
     def upload_file(self, local_file: str, bucket_uri: str) -> str:
         """Upload a local file to S3. Returns the destination URI."""
-        bucket, key = _parse_bucket_uri(bucket_uri)
+        bucket, key = parse_bucket_uri(bucket_uri)
         local_path = Path(local_file)
         if not key or key.endswith("/"):
             key = key + local_path.name
@@ -187,7 +188,7 @@ class StorageClient:
     def read_bytes_with_etag(self, bucket_uri: str) -> tuple[bytes, str] | None:
         """Read one object and its immutable version token, or ``None`` if absent."""
 
-        bucket, key = _parse_bucket_uri(bucket_uri)
+        bucket, key = parse_bucket_uri(bucket_uri)
         if not key or key.endswith("/"):
             raise StorageError(f"Expected an exact S3 object URI, got: {bucket_uri}")
         try:
@@ -226,7 +227,7 @@ class StorageClient:
 
         if bool(if_match) == bool(if_none_match):
             raise ValueError("choose exactly one conditional object-write guard")
-        bucket, key = _parse_bucket_uri(bucket_uri)
+        bucket, key = parse_bucket_uri(bucket_uri)
         if not key or key.endswith("/"):
             raise StorageError(f"Expected an exact S3 object URI, got: {bucket_uri}")
         kwargs: dict[str, object] = {
@@ -270,7 +271,7 @@ class StorageClient:
         """Download an S3 prefix to a local directory. Returns local path."""
         import os
 
-        bucket, prefix = _parse_bucket_uri(bucket_uri)
+        bucket, prefix = parse_bucket_uri(bucket_uri)
         if prefix and not prefix.endswith("/"):
             prefix += "/"
 
@@ -290,7 +291,7 @@ class StorageClient:
     def download_file(self, bucket_uri: str, local_path: str) -> str:
         """Download one exact S3 object without requiring ListBucket or HEAD."""
 
-        bucket, key = _parse_bucket_uri(bucket_uri)
+        bucket, key = parse_bucket_uri(bucket_uri)
         if not key or key.endswith("/"):
             raise StorageError(f"Expected an exact S3 object URI, got: {bucket_uri}")
         target = Path(local_path)
@@ -308,7 +309,7 @@ class StorageClient:
 
     def download_path(self, bucket_uri: str, local_path: str) -> str:
         """Download an S3 object or prefix to a local path. Returns local path."""
-        bucket, prefix = _parse_bucket_uri(bucket_uri)
+        bucket, prefix = parse_bucket_uri(bucket_uri)
         dest = Path(local_path)
 
         # Prefer a direct object fetch for file keys. Listing can lag briefly after

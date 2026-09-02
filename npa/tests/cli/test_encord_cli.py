@@ -22,9 +22,8 @@ runner = CliRunner()
 
 @pytest.fixture(autouse=True)
 def _isolated_credentials(monkeypatch: pytest.MonkeyPatch, tmp_path: Path):
+    # ENCORD_* env vars are scrubbed by the root conftest's ambient-credential list.
     monkeypatch.setattr(credentials_module, "CREDENTIALS_PATH", tmp_path / "missing.yaml")
-    for name in ("ENCORD_SSH_KEY", "ENCORD_SSH_KEY_B64", "ENCORD_SSH_KEY_FILE"):
-        monkeypatch.delenv(name, raising=False)
 
 
 def _receipt(**overrides) -> PushReceipt:
@@ -74,6 +73,7 @@ def _curate_receipt(**overrides) -> CurateReceipt:
         collection_created=True,
         preset_uuid="00000000-0000-0000-0000-00000000012c",
         preset_name="npa-curate-run-1",
+        items_total=3,
         items_selected=2,
         status="done",
         receipt_uri="s3://bkt/curate/curate_receipt.json",
@@ -219,7 +219,7 @@ def test_curate_text_output(monkeypatch: pytest.MonkeyPatch) -> None:
         ],
     )
     assert result.exit_code == 0, result.output
-    assert "curated 2 item(s)" in result.output
+    assert "curated 2 of 3 item(s)" in result.output
 
 
 def test_curate_rejects_local_output_path() -> None:
@@ -298,7 +298,7 @@ def test_verify_happy_and_failure_paths(monkeypatch: pytest.MonkeyPatch) -> None
         ],
     )
     assert result.exit_code == 1 and "1 missing" in result.output
-    # local paths violate the contract
+    # local paths violate the contract, and the error names the failing flag
     result = runner.invoke(
         app,
         [
@@ -309,6 +309,7 @@ def test_verify_happy_and_failure_paths(monkeypatch: pytest.MonkeyPatch) -> None
         ],
     )
     assert result.exit_code == 1
+    assert "--receipt-uri" in result.output and "--input-path" not in result.output
 
 
 def test_pull_happy_path_text(monkeypatch: pytest.MonkeyPatch) -> None:
@@ -376,29 +377,29 @@ def test_pull_missing_credential_message(monkeypatch: pytest.MonkeyPatch) -> Non
 
 
 def test_seed_demo_skips_and_seeds(monkeypatch: pytest.MonkeyPatch) -> None:
-    import npa.workflows.encord_loop as loop
-
     captured: dict = {}
 
-    def fake_seed(media_uri, dataset, active_source_id, *, transfer, integration):
-        captured.update(dict(media_uri=media_uri, dataset=dataset,
-                             active=active_source_id, transfer=transfer))
-        if active_source_id != dataset:
+    def fake_seed(**kwargs):
+        captured.update(kwargs)
+        if kwargs["active_source_id"] != kwargs["dataset"]:
             return {"stage": "seed_demo_source", "skipped": "operator supplied a curated source id"}
-        return {"stage": "seed_demo_source", "dataset": dataset, "units_done": 1}
+        return {"stage": "seed_demo_source", "dataset": kwargs["dataset"], "units_done": 1}
 
-    monkeypatch.setattr(loop, "seed_demo_source", fake_seed)
+    monkeypatch.setattr("npa.sdk.workbench.encord.seed_demo", fake_seed)
     result = runner.invoke(
         app,
         ["workbench", "encord", "seed-demo",
          "--media-uri", "s3://bkt/run/seed/",
          "--dataset", "npa-demo-src-run",
          "--active-source-id", "npa-demo-src-run",
+         "--integration", "nebius-s3",
          "--output", "text"],
     )
     assert result.exit_code == 0, result.output
     assert "seeded demo dataset" in result.output
-    assert captured["transfer"] == "upload"
+    # The CLI default matches push: register, never a silent byte upload.
+    assert captured["transfer"] == "register"
+    assert captured["integration"] == "nebius-s3"
     result = runner.invoke(
         app,
         ["workbench", "encord", "seed-demo",
@@ -413,3 +414,62 @@ def test_seed_demo_skips_and_seeds(monkeypatch: pytest.MonkeyPatch) -> None:
          "--media-uri", "/tmp/local", "--dataset", "d", "--active-source-id", "d"],
     )
     assert result.exit_code == 1  # path contract holds
+
+
+def test_system_info_reports_setup_without_touching_encord(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setenv("ENCORD_SSH_KEY_FILE", "/keys/encord.pem")
+    monkeypatch.setenv("ENCORD_DOMAIN", "https://api.us.encord.com")
+    result = runner.invoke(app, ["workbench", "encord", "system-info", "--output", "json"])
+    assert result.exit_code == 0, result.output
+    payload = json.loads(result.output)
+    assert payload["tool"] == "encord" and payload["status"] == "ok"
+    assert payload["encord_domain"] == "https://api.us.encord.com"
+    # Names only — never the credential value.
+    assert payload["credential_transports"] == ["ENCORD_SSH_KEY_FILE"]
+    assert "/keys/encord.pem" not in result.output
+    assert payload["schemas"]["push"] == "npa.encord.push_receipt.v1"
+    assert "width" in payload["curate_metrics"]
+    result = runner.invoke(app, ["workbench", "encord", "system-info"])
+    assert result.exit_code == 0
+    assert "credential_transports: ['ENCORD_SSH_KEY_FILE']" in result.output
+
+
+def test_unexpected_exceptions_are_not_rewritten_as_client_errors(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Only EncordToolError is exit 1; a bug propagates (exit 2 via app_entry)."""
+
+    def broken_pull(**kwargs):
+        raise RuntimeError("boom")
+
+    monkeypatch.setattr("npa.sdk.workbench.encord.pull", broken_pull)
+    result = runner.invoke(
+        app,
+        ["workbench", "encord", "pull",
+         "--source", "collection", "--source-id", "x",
+         "--output-path", "s3://bkt/pull/"],
+    )
+    assert isinstance(result.exception, RuntimeError)
+    assert "encord pull failed: boom" not in result.output
+
+
+def test_json_failure_still_emits_exactly_one_json_document(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    def fake_curate(**kwargs):
+        raise EncordToolError("Encord curate selected 0 items.")
+
+    monkeypatch.setattr("npa.sdk.workbench.encord.curate", fake_curate)
+    result = runner.invoke(
+        app,
+        ["workbench", "encord", "curate",
+         "--folder", "src", "--filter", "width:1:10",
+         "--collection", "keepers", "--output-path", "s3://bkt/curate/",
+         "--output", "json"],
+    )
+    assert result.exit_code == 1
+    document = json.loads(result.stdout)
+    assert document["result"] == "error" and document["mutated"] is False
+    assert "selected 0 items" in result.stderr

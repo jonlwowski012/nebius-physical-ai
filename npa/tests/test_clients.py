@@ -13,7 +13,7 @@ from npa.clients.http import HTTPClient, ServerError
 from npa.clients import nebius
 from npa.clients.nebius import NebiusError
 from npa.clients.ssh import SSHClient, SSHError, SSHTimeoutError, format_remote_failure
-from npa.clients.storage import StorageClient, StorageError, _parse_bucket_uri
+from npa.clients.storage import StorageClient, StorageError, parse_bucket_uri
 
 
 def test_http_client_builds_request_and_returns_json(mocker) -> None:
@@ -81,10 +81,10 @@ def test_http_client_wait_healthy_false_on_timeout(mocker) -> None:
 
 
 def test_storage_parse_bucket_uri() -> None:
-    assert _parse_bucket_uri("s3://bucket/prefix/path") == ("bucket", "prefix/path")
+    assert parse_bucket_uri("s3://bucket/prefix/path") == ("bucket", "prefix/path")
 
     with pytest.raises(StorageError, match="Expected s3://"):
-        _parse_bucket_uri("https://bucket/prefix")
+        parse_bucket_uri("https://bucket/prefix")
 
 
 def test_storage_client_requires_endpoint() -> None:
@@ -2182,3 +2182,18 @@ def test_load_credentials_hydrates_encord_tokens_env_over_file(
     absent = credentials.load_credentials(environ={})
     assert absent.tokens["ENCORD_SSH_KEY_FILE"] == "/keys/encord.pem"
     assert "ENCORD_SSH_KEY_B64" not in absent.tokens
+
+
+def test_storage_client_bounds_every_network_wait() -> None:
+    """A stalled TCP connection must not block a workflow preflight forever."""
+
+    client = StorageClient(
+        endpoint_url="https://storage.test",
+        aws_access_key_id="key",
+        aws_secret_access_key="secret",
+    )
+    config = client.s3.meta.config
+    assert config.connect_timeout == 10
+    assert config.read_timeout == 60
+    assert config.max_pool_connections == 16
+    assert config.retries["mode"] == "adaptive"  # botocore normalises the attempt count

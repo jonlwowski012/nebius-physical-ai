@@ -16,8 +16,15 @@ step:
 
 > **TL;DR:** create an Encord API key and an S3-compatible integration (both
 > one-time, in the Encord app), point `~/.npa/credentials.yaml` at the key,
-> run `npa workbench health preflight --checks encord`, then `push` → curate →
-> `pull`.
+> run `npa workbench health preflight --checks encord`, then `push` → `curate`
+> (or curate in the app) → `pull` → `verify`.
+
+Verbs: `push`, `curate`, `pull`, `verify`, `cleanup`, `seed-demo` (stages the
+packaged demo clip for the augment workflow), and `system-info` (SDK pin, API
+domain, configured credential names). Every verb takes `--output json` and then
+prints exactly one JSON document on stdout, including on failure; diagnostics go
+to stderr. Design rationale and the live evidence behind the headless-curation
+filter shape: [encord-headless-curation.md](encord-headless-curation.md).
 
 ## File-format support in this integration
 
@@ -143,7 +150,9 @@ npa workbench health preflight --checks encord
 
 `PASS ... Encord authenticated` means the key parses and the API accepts it.
 This gate catches a truncated key paste or an unregistered key in seconds
-instead of mid-push.
+instead of mid-push. `npa workbench encord system-info` shows, without calling
+Encord, which credential transport is configured (by name, never the value),
+the SDK version, the API domain, and the supported media and curate metrics.
 
 ## Push: S3 → Encord
 
@@ -162,7 +171,8 @@ npa workbench encord push \
   absent, so a fresh batch needs no clicking around first.
 - Items are registered in place and **explicitly linked** into the dataset.
 - `--transfer upload` copies bytes into Encord-hosted storage instead
-  (no integration needed).
+  (no integration needed). In the default register mode `--integration` is
+  required and checked before anything is listed, authenticated, or uploaded.
 - A durable receipt (`push_receipt.json`, `npa.encord.push_receipt.v1`) records
   every file, its Encord item uuid, and per-file errors. The receipt is written
   **before** any failure exit, and any unit error fails the command closed. If a step throws after Encord was mutated, the receipt still lands with the exception recorded in its `error` field.
@@ -205,15 +215,26 @@ npa workbench encord curate \
   folder → upgrade/compute metrics; Encord exposes no API for it). Filter
   ranges use Encord's own metric scales.
 - `--folder` is never created by curate (an absent folder means there is
-  nothing to curate); a `--collection` title is created when absent.
+  nothing to curate); a `--collection` title is created when absent. An
+  existing Collection is reused only while it is empty: Encord's evaluation
+  only ever adds items, so curate refuses a populated Collection rather than
+  report a stale selection as this run's. Use run-scoped titles (the shipped
+  specs do) or `cleanup` the old one first.
 - Selection is asynchronous in Encord; curate polls until the Collection is
   stable (`--poll-seconds`, default 300). **Zero selected items fails closed**
   (exit 1) — an empty curated set silently feeding a training stage is a bug,
   not a result.
+- The transient preset is titled `npa-curate-<run-id>` (an ad-hoc CLI run
+  without `--workflow-run` gets a UTC timestamp plus a random suffix) and is
+  deleted whether the run succeeded or crashed after creating it; the receipt's
+  `preset_deleted` flag records whether that delete went through, so a `false`
+  means `cleanup --title-prefix npa-curate-` is owed.
 - A durable receipt (`curate_receipt.json`, `npa.encord.curate_receipt.v1`)
   records the parsed filters, the exact preset JSON sent to Encord, the preset
-  and Collection uuids, and the selected count — written **before** any failure
-  exit, like push and pull.
+  and Collection uuids, `items_total` (storage items in the folder when the
+  filters were evaluated) and `items_selected` — a write-ahead `status:
+  planned` copy lands before the first Encord mutation, and the final receipt
+  is written **before** any failure exit, like push and pull.
 - Pull the result with `--source collection --source-id <collection>`.
 
 ## Or curate in the Encord app
@@ -248,10 +269,12 @@ manifest.json                 # npa.encord.pull_manifest.v1 lineage + counts
 
 Media registered from your own bucket returns as **zero-egress server-side
 copies**; Encord-hosted (uploaded) media streams back through signed URLs (the
-download is hashed in-stream, and its sha256 lands in the manifest). Transfers
-run in a bounded parallel pool, so pulling thousands of curated clips does not
-pay a serial round-trip each. The manifest is written before any failure exit;
-any failed item fails the command closed.
+download is hashed in-stream, and its sha256 lands in the manifest). If a
+same-bucket copy fails (an access-policy gap, say) the item falls back to the
+signed-URL download and the manifest row's `copy_error` says why egress was
+paid. Transfers run in a bounded parallel pool, so pulling thousands of curated
+clips does not pay a serial round-trip each. The manifest is written before any
+failure exit; any failed item fails the command closed.
 
 ## Cleanup: tear down run-scoped Encord state
 
@@ -280,10 +303,15 @@ npa workbench encord verify \
 Joins the push receipt to the pull manifest by Encord item uuid (identity is
 exact — `npa.source_uri` clientMetadata or the normalized objectUrl, never a
 filename) and fails closed when any pushed item is missing from the pull, any
-size differs, or any comparable checksum differs. The report
-(`roundtrip_report.json`, `npa.encord.roundtrip_report.v1`) records per-item
-expected/observed sizes and checksums; incomparable checksum kinds (e.g. a
-multipart ETag against a sha256) are reported as unavailable, not failures.
+size differs, or any comparable checksum differs. It also fails closed on the
+receipt itself: a receipt whose `status` is not `done` (the write-ahead
+`planned` copy, or a `failed`/`timeout` push) or one with zero attributable
+items can never produce a `passed` report — the report's `defects` list names
+the reason — and on any matched item that carries neither a comparable
+checksum nor a size on both sides (counted as `unverifiable`). The report (`roundtrip_report.json`,
+`npa.encord.roundtrip_report.v1`) records per-item expected/observed sizes and
+checksums; incomparable checksum kinds (e.g. a multipart ETag against a sha256)
+are reported as unavailable, not failures.
 
 ## Python SDK
 
@@ -328,13 +356,17 @@ The shipped specs wrap the same tool
   run: pull an Encord video, generate two distinct real Cosmos 3 video2video
   variants, and push all results back into Encord as `npa-aug-<run-id>`. **Runs out
   of the box**: the default seeds a run-scoped demo dataset from the packaged
-  pinned starter clip (public, CC-BY-4.0, SHA-256-verified) and uploads bytes,
-  so only the Encord API key is needed. For your real data pass
-  `--var encord_source_id=<your-curated-id>` (seeding no-ops) and, for
-  register-in-place, `--var encord_transfer=register
-  --var encord_integration=<title>`; `encord_item_index` picks the video.
+  pinned starter clip (public, CC-BY-4.0, SHA-256-verified). This is the **one
+  shipped spec that opts into `encord_transfer: upload`** — copying that public
+  clip's bytes into Encord storage is what lets the demo run with only an
+  Encord API key and no cloud integration. For your real data pass
+  `--var encord_source_id=<your-curated-id>` (seeding no-ops) **and**
+  `--var encord_transfer=register --var encord_integration=<title>` so your
+  bytes and the Cosmos variants derived from them stay in your bucket;
+  `encord_item_index` picks the video.
 - `encord-cosmos3-groot-finetune.yaml` — the fully unattended loop: push a
-  LeRobot camera stream, **curate it headlessly** into
+  LeRobot camera stream (register mode, the tool default — pass
+  `--var encord_integration=<title>`), **curate it headlessly** into
   `npa-groot-curated-<run-id>` (default filter is the intrinsic
   `width:32:16384`; override `--var encord_curate_filters=...` for
   brightness/sharpness once the folder's quality metrics are computed), pull
@@ -372,6 +404,12 @@ environment.)
 | `Encord curate selected 0 items` with brightness/sharpness/file-size filters | Those are computed quality metrics: they match nothing until metrics have been computed for the folder (one-time, in the Encord app). Use intrinsic metrics (width, height, area, aspect-ratio), or compute the folder's metrics once and re-run. |
 | `Unknown filter metric '...'` | Only allowlisted metrics with a live-verified Encord filter shape are accepted — an unverified shape would hang Encord's server-side evaluation. The error lists the supported names. |
 | US-hosted org, auth fails with a valid key | Set `ENCORD_DOMAIN` (the SDK default is the EU endpoint). |
+| `verify` fails with `push receipt status is 'planned', not 'done'` | The push never finished (killed mid-run, or `verify` was pointed at a write-ahead receipt). Re-run the push; a receipt that is not `done` is not roundtrip evidence. |
+| `verify` fails with `no attributable items` | The receipt has no `registered`/`uploaded` rows with an Encord uuid, so 0/0 would be a vacuous pass. Check the push receipt's per-item errors. |
+| `verify` reports `unverifiable` items | Both sides carry a multipart ETag (no content digest) and Encord returned no size, so nothing compares. Re-pull with `--transfer upload` sources (sha256 in-stream) or push single-part objects. |
+| `curate` fails with `already holds items` | The `--collection` title resolved to a populated Collection; curate never adds to one. Use a fresh run-scoped title or `cleanup --title-prefix`. |
+| `health preflight` warns `encord SDK is not installed` | An Encord credential is configured but the optional extra is missing; `pip install 'npa[encord]'` only if you use the tool. |
+| A `--output json` command printed diagnostics you expected on stdout | stdout carries exactly one JSON document per verb (also on failure: `{"result": "error", ...}`); human-readable errors and progress go to stderr. |
 
 For the agent-facing summary and validation status see
 [skills/tools/encord/SKILL.md](../../skills/tools/encord/SKILL.md); the CLI

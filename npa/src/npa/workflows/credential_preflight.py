@@ -291,8 +291,22 @@ def check_encord(credentials: Any, probes: CredentialProbes) -> CheckResult:
             status=PASS,
             summary=f"{present[0]} is set (not verified against Encord).",
         )
+    from npa.workbench.encord.schemas import EncordSdkMissingError
+
     try:
         summary = probes.encord_verifier()
+    except EncordSdkMissingError as exc:
+        # The credential may be fine; only the optional extra is absent.
+        return CheckResult(
+            name="encord",
+            status=WARN,
+            summary=f"{present[0]} is set but the encord SDK is not installed.",
+            remedy=(
+                "Install it with `pip install 'npa[encord]'` before using "
+                "`npa workbench encord`; other tools are unaffected."
+            ),
+            details=(str(exc),),
+        )
     except Exception as exc:  # noqa: BLE001 - surface any auth/connectivity error
         return CheckResult(
             name="encord",

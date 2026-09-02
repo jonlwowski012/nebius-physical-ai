@@ -1554,7 +1554,9 @@ TOOL_CATALOG: dict[str, ToolEntry] = {
             "json",
         ],
         omit_flags_when_empty=("--integration",),
-        config_defaults={"encord_integration": ""},
+        # Same default as push: bytes stay in the bucket unless a spec or
+        # operator explicitly asks for upload.
+        config_defaults={"encord_integration": "", "encord_transfer": "register"},
     ),
     "workbench.encord.pull": ToolEntry(
         name="workbench.encord.pull",

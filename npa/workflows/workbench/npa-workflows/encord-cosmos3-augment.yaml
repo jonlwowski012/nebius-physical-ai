@@ -47,9 +47,14 @@ config:
   # Where the augmented result goes back into Encord. encord_media_uri is the
   # push toolRef's input contract key: it points at the generated/ prefix, where
   # push discovers the augmented .mp4 (generate.json is skipped as non-media).
-  # The default transfer is upload (bytes copied into Encord storage) so the
-  # out-of-the-box run needs no cloud integration; set encord_transfer=register
-  # and encord_integration=<your integration title> for register-in-place.
+  #
+  # This spec is the ONE shipped workflow that opts into upload (the tool and
+  # every other spec default to register): its default source is the packaged
+  # public CC-BY-4.0 starter clip, so copying those bytes into Encord-hosted
+  # storage lets the demo run with only an Encord API key and no cloud
+  # integration. When you point encord_source_id at your own curated data, also
+  # pass --var encord_transfer=register --var encord_integration=<title> so
+  # your bytes (and the Cosmos variants derived from them) stay in your bucket.
   encord_transfer: "upload"
   encord_integration: ""
   encord_folder: "npa-aug-{{run.id}}"

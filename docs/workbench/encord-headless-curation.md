@@ -1,11 +1,16 @@
 # Encord Headless Curation
 
+Design note and live evidence for the `curate` verb of the Encord workbench
+tool. Operator usage lives in [encord.md](encord.md); this page records why the
+verb exists, the mechanism, and what the live spike against the real SaaS
+pinned. It is tool-specific by design, which is why it sits next to the tool's
+operator doc rather than under `docs/architecture/`.
+
 Status: **implemented** (follow-up to PR #339's push/pull foundation). The
 `npa workbench encord curate` verb, the `workbench.encord.curate` toolRef, the
 curate stages in `encord-roundtrip-smoke.yaml` and
 `encord-cosmos3-groot-finetune.yaml`, and the live spike that pinned the
-filter shape are all in the tree; operator usage is documented in
-`docs/workbench/encord.md`.
+filter shape are all in the tree.
 
 PR #339 review feedback:
 
@@ -81,13 +86,18 @@ npa workbench encord curate \
 
 All selection is evaluated server-side by Encord; no media bytes move.
 
-1. Map the `--filter` flags onto an `IndexFilterPresetDefinition` payload
-   (`{"local_filters": {"<folder-uuid>": {"filters": [...]}},
-   "global_filters": {"filters": [...]}}`).
+1. Map the `--filter` flags onto a filter-preset payload of the exact shape
+   the live spike pinned (see below): `{"global_filters": {"filters": [...]}}`,
+   one `{"include", "values": [min, max], "domain": "data", "metric",
+   "type": "metric"}` entry per filter. Evaluation is scoped by the Collection's
+   top-level folder, so no `local_filters` block is sent.
 2. `user_client.create_preset("npa-curate-<run-id>", filter_preset_json)` — a
-   run-scoped preset. The receipt records its uuid and exact JSON (the
-   reproducibility record); the server-side preset itself is transient
-   scaffolding, deleted best-effort once the selection lands.
+   run-scoped preset (an ad-hoc CLI run without a run id gets a UTC timestamp
+   plus a random suffix, so two ad-hoc curates never share a title). The receipt
+   records its uuid and exact JSON (the reproducibility record); the
+   server-side preset itself is transient scaffolding, deleted in a `finally`
+   block whether the selection landed or the run crashed after creation, and
+   the receipt's `preset_deleted` flag says whether that delete succeeded.
 3. Resolve or create the Collection
    (`user_client.create_collection(top_level_folder_uuid, name)`).
 4. `collection.add_preset_items(preset)` — Encord evaluates the preset and
@@ -96,10 +106,13 @@ All selection is evaluated server-side by Encord; no media bytes move.
    fails closed (exit 1)**, mirroring `workbench.dataset.curate`: an empty
    curated set silently feeding a finetune stage is a bug, not a result.
 6. Write `curate_receipt.json` (`npa.encord.curate_receipt.v1`): the full
-   filter definition as given, preset uuid, collection uuid/name/created flag,
-   folder lineage, selected/total item counts, and `workflow_run`. As with the
-   push receipt and pull manifest, the receipt is written before any failure
-   exit; crashes after Encord was mutated land in the artifact's `error` field.
+   filter definition as given, preset uuid and `preset_deleted`, collection
+   uuid/name/created flag, folder lineage, `items_total` (storage items in the
+   folder when evaluated) and `items_selected`, and `workflow_run`. As with the
+   push receipt and pull manifest, a write-ahead `status: planned` copy lands
+   before the first Encord mutation and the final receipt is written before any
+   failure exit; crashes after Encord was mutated land in the artifact's
+   `error` field.
 
 The existing `pull --source collection` consumes the result unchanged, so the
 loop closes with no new pull surface.
@@ -111,10 +124,13 @@ Follows the three-access pattern already in `npa/src/npa/workbench/encord/`:
 - `curate.py`: `run_curate(...) -> CurateReceipt` next to `run_push`/`run_pull`,
   with the pure filter-mapping function separated from SaaS glue (the
   `data_factory_curate.select_curated` shape).
-- `client.py`: `resolve_collection` gains `create=` (default `False`, matching
-  `resolve_dataset`); new thin wrappers for `create_preset` /
-  `get_filter_preset_json`. Injection stays `user_client=` only — the existing
-  `FakeUserClient` test harness extends naturally.
+- `client.py`: `resolve_collection(..., create_in_folder_uuid=)` — a
+  non-empty folder uuid both scopes the title search and is where a missing
+  title is created (pull passes none, so a missing title is an error). Every
+  resolver returns a `ResolvedRef(obj, id, title, created)` and shares one
+  0/1/many title contract: unique resolves, missing is the caller's decision,
+  several same-titled objects fail closed. Injection stays `user_client=` only —
+  the existing `FakeUserClient` test harness extends naturally.
 - `schemas.py`: `CurateReceipt` (`npa.encord.curate_receipt.v1`).
 - CLI `curate` command in `npa/src/npa/cli/workbench/encord.py`; SDK
   passthrough `curate(**kwargs)` in `npa/src/npa/sdk/workbench/encord.py`.
@@ -251,7 +267,7 @@ only with re-run live verification (`METRIC_FILTERS` in
 > Encord's SDK supports it fully server-side, so we don't need a human in the
 > loop for quality-based curation. Implemented as a follow-up on top of this
 > PR's push/pull foundation (design + evidence checked in at
-> `docs/architecture/encord-headless-curation.md`):
+> `docs/workbench/encord-headless-curation.md`):
 >
 > A third verb, `npa workbench encord curate`, maps workbench-declared filters
 > over Encord's built-in quality metrics

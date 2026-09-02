@@ -10,16 +10,25 @@ Encord labeling/curation SaaS integration:
   no human in the app.
 - ``pull``  materialize a curated Collection, a Dataset, or a Project's labels
   back to an S3 prefix as media + item JSON + a lineage manifest.
+- ``verify``  join a push receipt to a pull manifest by exact identity and
+  fail closed on anything missing, resized, or checksum-mismatched.
+- ``cleanup``  tear down run-scoped Encord state by title prefix.
+- ``seed-demo``  stage the packaged starter clip for the augment demo workflow.
+- ``system-info``  the tool's SDK pin, domain, and configured credentials.
+
+Every verb is a thin client of ``npa.sdk.workbench.encord``: the CLI validates
+the path contract, calls the SDK, and renders the returned model.
 """
 
 from __future__ import annotations
 
-import json
 from enum import Enum
-from typing import Any
+from typing import Callable, TypeVar
 
 import typer
 
+from npa.cli.workbench.lancedb.helpers import OutputFormat, emit, fail
+from npa.lifecycle_intent import json_stdout_contract
 from npa.workbench.encord.schemas import (
     DEFAULT_CURATE_POLL_SECONDS,
     DEFAULT_POLL_TIMEOUT_SECONDS,
@@ -31,10 +40,7 @@ app = typer.Typer(
     no_args_is_help=True,
 )
 
-
-class OutputFormat(str, Enum):
-    text = "text"
-    json = "json"
+T = TypeVar("T")
 
 
 class TransferMode(str, Enum):
@@ -54,19 +60,32 @@ class PullSource(str, Enum):
     project = "project"
 
 
-def _fail(message: str) -> None:
-    typer.echo(message, err=True)
-    raise typer.Exit(1)
+def _call(operation: Callable[[], T]) -> T:
+    """Run one path check or SDK call at the CLI boundary.
+
+    A domain error (``EncordToolError`` and subclasses, including auth) or a
+    path-contract violation is the user's problem to fix: print the remedy and
+    exit 1. Anything else is a bug and propagates to ``app_entry`` — exit 2,
+    with the ``NPA_DEBUG`` traceback path intact — instead of being reworded
+    into a client error.
+    """
+
+    from npa.cli.path_contract import PathContractError
+    from npa.workbench.encord.schemas import EncordToolError
+
+    try:
+        return operation()
+    except (EncordToolError, PathContractError) as exc:
+        fail(str(exc))
+        raise  # unreachable: fail() exits
 
 
-def _emit(payload: dict[str, Any], *, output: OutputFormat, text: str) -> None:
-    if output == OutputFormat.json:
-        typer.echo(json.dumps(payload, indent=2, sort_keys=True))
-    else:
-        typer.echo(text)
+OUTPUT_OPTION = typer.Option(OutputFormat.json, "--output", help="Output format.")
+WORKFLOW_RUN_HELP = "Run id recorded in the durable artifact."
 
 
 @app.command("push")
+@json_stdout_contract
 def push_cmd(
     input_path: str = typer.Option(
         ...,
@@ -112,28 +131,18 @@ def push_cmd(
         "--poll-timeout-seconds",
         help="Per-batch registration poll timeout.",
     ),
-    workflow_run: str = typer.Option(
-        "", "--workflow-run", help="Run id recorded in the receipt."
-    ),
-    output: OutputFormat = typer.Option(
-        OutputFormat.json, "--output", help="Output format."
-    ),
+    workflow_run: str = typer.Option("", "--workflow-run", help=WORKFLOW_RUN_HELP),
+    output_format: OutputFormat = OUTPUT_OPTION,
 ) -> None:
     """Register S3 media in Encord and optionally link a dataset."""
 
-    from npa.cli.path_contract import PathContractError, validate_read_path, validate_write_path
-
-    try:
-        validate_read_path(input_path, tool="encord push", allow_hf=False)
-        validate_write_path(output_path, tool="encord push", required=True)
-    except PathContractError as exc:
-        _fail(str(exc))
-
+    from npa.cli.path_contract import validate_read_path, validate_write_path
     from npa.sdk.workbench.encord import push as sdk_push
-    from npa.workbench.encord.schemas import EncordToolError
 
-    try:
-        receipt = sdk_push(
+    _call(lambda: validate_read_path(input_path, tool="encord push", allow_hf=False))
+    _call(lambda: validate_write_path(output_path, tool="encord push", required=True))
+    receipt = _call(
+        lambda: sdk_push(
             input_path=input_path,
             integration=integration,
             folder=folder,
@@ -144,15 +153,10 @@ def push_cmd(
             poll_timeout_seconds=poll_timeout_seconds,
             workflow_run=workflow_run,
         )
-    except EncordToolError as exc:
-        _fail(str(exc))
-    except Exception as exc:  # noqa: BLE001 - CLI boundary
-        _fail(f"encord push failed: {exc}")
-
-    payload = receipt.model_dump(by_alias=True)
-    _emit(
-        payload,
-        output=output,
+    )
+    emit(
+        receipt.model_dump(by_alias=True),
+        output=output_format,
         text=(
             f"pushed {receipt.units_done}/{receipt.files_discovered} item(s) to "
             f"Encord folder {receipt.folder_name!r} "
@@ -162,6 +166,7 @@ def push_cmd(
 
 
 @app.command("curate")
+@json_stdout_contract
 def curate_cmd(
     folder: str = typer.Option(
         ...,
@@ -191,27 +196,17 @@ def curate_cmd(
         "--poll-seconds",
         help="How long to wait for Encord's async server-side selection.",
     ),
-    workflow_run: str = typer.Option(
-        "", "--workflow-run", help="Run id recorded in the receipt."
-    ),
-    output: OutputFormat = typer.Option(
-        OutputFormat.json, "--output", help="Output format."
-    ),
+    workflow_run: str = typer.Option("", "--workflow-run", help=WORKFLOW_RUN_HELP),
+    output_format: OutputFormat = OUTPUT_OPTION,
 ) -> None:
     """Headlessly curate a folder into a Collection via Encord quality filters."""
 
-    from npa.cli.path_contract import PathContractError, validate_write_path
-
-    try:
-        validate_write_path(output_path, tool="encord curate", required=True)
-    except PathContractError as exc:
-        _fail(str(exc))
-
+    from npa.cli.path_contract import validate_write_path
     from npa.sdk.workbench.encord import curate as sdk_curate
-    from npa.workbench.encord.schemas import EncordToolError
 
-    try:
-        receipt = sdk_curate(
+    _call(lambda: validate_write_path(output_path, tool="encord curate", required=True))
+    receipt = _call(
+        lambda: sdk_curate(
             folder=folder,
             filters=filters,
             collection=collection,
@@ -219,24 +214,20 @@ def curate_cmd(
             workflow_run=workflow_run,
             poll_seconds=poll_seconds,
         )
-    except EncordToolError as exc:
-        _fail(str(exc))
-    except Exception as exc:  # noqa: BLE001 - CLI boundary
-        _fail(f"encord curate failed: {exc}")
-
-    payload = receipt.model_dump(by_alias=True)
-    _emit(
-        payload,
-        output=output,
+    )
+    emit(
+        receipt.model_dump(by_alias=True),
+        output=output_format,
         text=(
-            f"curated {receipt.items_selected} item(s) from folder "
-            f"{receipt.folder_name!r} into collection "
+            f"curated {receipt.items_selected} of {receipt.items_total} item(s) from "
+            f"folder {receipt.folder_name!r} into collection "
             f"{receipt.collection_name!r}; receipt: {receipt.receipt_uri}"
         ),
     )
 
 
 @app.command("pull")
+@json_stdout_contract
 def pull_cmd(
     source: PullSource = typer.Option(
         ...,
@@ -253,41 +244,26 @@ def pull_cmd(
         "--output-path",
         help="s3:// output prefix for media/, items/, labels/, and manifest.json.",
     ),
-    workflow_run: str = typer.Option(
-        "", "--workflow-run", help="Run id recorded in the manifest."
-    ),
-    output: OutputFormat = typer.Option(
-        OutputFormat.json, "--output", help="Output format."
-    ),
+    workflow_run: str = typer.Option("", "--workflow-run", help=WORKFLOW_RUN_HELP),
+    output_format: OutputFormat = OUTPUT_OPTION,
 ) -> None:
     """Pull curated media + labels + lineage manifest back to S3."""
 
-    from npa.cli.path_contract import PathContractError, validate_write_path
-
-    try:
-        validate_write_path(output_path, tool="encord pull", required=True)
-    except PathContractError as exc:
-        _fail(str(exc))
-
+    from npa.cli.path_contract import validate_write_path
     from npa.sdk.workbench.encord import pull as sdk_pull
-    from npa.workbench.encord.schemas import EncordToolError
 
-    try:
-        manifest = sdk_pull(
+    _call(lambda: validate_write_path(output_path, tool="encord pull", required=True))
+    manifest = _call(
+        lambda: sdk_pull(
             source=source.value,
             source_id=source_id,
             output_path=output_path,
             workflow_run=workflow_run,
         )
-    except EncordToolError as exc:
-        _fail(str(exc))
-    except Exception as exc:  # noqa: BLE001 - CLI boundary
-        _fail(f"encord pull failed: {exc}")
-
-    payload = manifest.model_dump(by_alias=True)
-    _emit(
-        payload,
-        output=output,
+    )
+    emit(
+        manifest.model_dump(by_alias=True),
+        output=output_format,
         text=(
             f"pulled {manifest.items_total} item(s) "
             f"({manifest.media_copied} copied, {manifest.media_downloaded} "
@@ -299,6 +275,7 @@ def pull_cmd(
 
 
 @app.command("verify")
+@json_stdout_contract
 def verify_cmd(
     receipt_uri: str = typer.Option(
         ...,
@@ -315,43 +292,36 @@ def verify_cmd(
         "--output-path",
         help="s3:// destination prefix (or .json URI) for the roundtrip report.",
     ),
-    workflow_run: str = typer.Option(
-        "", "--workflow-run", help="Run id recorded in the report."
-    ),
-    output: OutputFormat = typer.Option(
-        OutputFormat.json, "--output", help="Output format."
-    ),
+    workflow_run: str = typer.Option("", "--workflow-run", help=WORKFLOW_RUN_HELP),
+    output_format: OutputFormat = OUTPUT_OPTION,
 ) -> None:
     """Verify a push receipt against a pull manifest by exact identity."""
 
-    from npa.cli.path_contract import PathContractError, validate_read_path, validate_write_path
-
-    try:
-        validate_read_path(receipt_uri, tool="encord verify", allow_hf=False)
-        validate_read_path(manifest_uri, tool="encord verify", allow_hf=False)
-        validate_write_path(output_path, tool="encord verify", required=True)
-    except PathContractError as exc:
-        _fail(str(exc))
-
+    from npa.cli.path_contract import validate_read_path, validate_write_path
     from npa.sdk.workbench.encord import verify as sdk_verify
-    from npa.workbench.encord.schemas import EncordToolError
 
-    try:
-        report = sdk_verify(
+    _call(
+        lambda: validate_read_path(
+            receipt_uri, tool="encord verify", option="--receipt-uri", allow_hf=False
+        )
+    )
+    _call(
+        lambda: validate_read_path(
+            manifest_uri, tool="encord verify", option="--manifest-uri", allow_hf=False
+        )
+    )
+    _call(lambda: validate_write_path(output_path, tool="encord verify", required=True))
+    report = _call(
+        lambda: sdk_verify(
             receipt_uri=receipt_uri,
             manifest_uri=manifest_uri,
             output_path=output_path,
             workflow_run=workflow_run,
         )
-    except EncordToolError as exc:
-        _fail(str(exc))
-    except Exception as exc:  # noqa: BLE001 - CLI boundary
-        _fail(f"encord verify failed: {exc}")
-
-    payload = report.model_dump(by_alias=True)
-    _emit(
-        payload,
-        output=output,
+    )
+    emit(
+        report.model_dump(by_alias=True),
+        output=output_format,
         text=(
             f"roundtrip {report.status}: {report.matched}/{report.expected} matched, "
             f"{report.checksum_verified} checksum-verified, "
@@ -361,6 +331,7 @@ def verify_cmd(
 
 
 @app.command("cleanup")
+@json_stdout_contract
 def cleanup_cmd(
     title_prefix: str = typer.Option(
         ...,
@@ -372,26 +343,17 @@ def cleanup_cmd(
     dry_run: bool = typer.Option(
         False, "--dry-run", help="List what would be deleted without deleting."
     ),
-    output: OutputFormat = typer.Option(
-        OutputFormat.json, "--output", help="Output format."
-    ),
+    output_format: OutputFormat = OUTPUT_OPTION,
 ) -> None:
     """Tear down run-scoped Encord state created by push/curate/seed-demo."""
 
     from npa.sdk.workbench.encord import cleanup as sdk_cleanup
-    from npa.workbench.encord.schemas import EncordToolError
 
-    try:
-        summary = sdk_cleanup(title_prefix=title_prefix, dry_run=dry_run)
-    except EncordToolError as exc:
-        _fail(str(exc))
-    except Exception as exc:  # noqa: BLE001 - CLI boundary
-        _fail(f"encord cleanup failed: {exc}")
-
+    summary = _call(lambda: sdk_cleanup(title_prefix=title_prefix, dry_run=dry_run))
     verb = "would delete" if dry_run else "deleted"
-    _emit(
+    emit(
         summary,
-        output=output,
+        output=output_format,
         text=(
             f"{verb} {len(summary['folders_deleted'])} folder(s) "
             f"({summary['items_deleted']} item(s)), "
@@ -404,6 +366,7 @@ def cleanup_cmd(
 
 
 @app.command("seed-demo")
+@json_stdout_contract
 def seed_demo_cmd(
     media_uri: str = typer.Option(
         ...,
@@ -422,39 +385,56 @@ def seed_demo_cmd(
         "--dataset the operator supplied a curated source and seeding no-ops.",
     ),
     transfer: TransferMode = typer.Option(
-        TransferMode.upload, "--transfer", help="Push mode for the demo clip."
+        TransferMode.register,
+        "--transfer",
+        help="Push mode for the demo clip (same default as push: register).",
     ),
     integration: str = typer.Option(
         "", "--integration", help="Cloud integration title/uuid (register mode only)."
     ),
-    output: OutputFormat = typer.Option(
-        OutputFormat.json, "--output", help="Output format."
-    ),
+    output_format: OutputFormat = OUTPUT_OPTION,
 ) -> None:
     """Seed the demo source dataset for encord-cosmos3-augment, or no-op."""
 
-    from npa.cli.path_contract import PathContractError, validate_write_path
+    from npa.cli.path_contract import validate_write_path
+    from npa.sdk.workbench.encord import seed_demo as sdk_seed_demo
 
-    try:
-        validate_write_path(media_uri, tool="encord seed-demo", option="--media-uri", required=True)
-    except PathContractError as exc:
-        _fail(str(exc))
-
-    from npa.workflows.encord_loop import EncordLoopError, seed_demo_source
-    from npa.workbench.encord.schemas import EncordToolError
-
-    try:
-        summary = seed_demo_source(
-            media_uri, dataset, active_source_id,
-            transfer=transfer.value, integration=integration,
+    _call(
+        lambda: validate_write_path(
+            media_uri, tool="encord seed-demo", option="--media-uri", required=True
         )
-    except (EncordLoopError, EncordToolError) as exc:
-        _fail(str(exc))
-    except Exception as exc:  # noqa: BLE001 - CLI boundary
-        _fail(f"encord seed-demo failed: {exc}")
-    _emit(
-        summary,
-        output=output,
-        text=summary.get("skipped") and f"seed skipped: {summary['skipped']}"
-        or f"seeded demo dataset {summary.get('dataset')!r} from the packaged starter clip",
     )
+    summary = _call(
+        lambda: sdk_seed_demo(
+            media_uri=media_uri,
+            dataset=dataset,
+            active_source_id=active_source_id,
+            transfer=transfer.value,
+            integration=integration,
+        )
+    )
+    skipped = summary.get("skipped")
+    emit(
+        summary,
+        output=output_format,
+        text=(
+            f"seed skipped: {skipped}"
+            if skipped
+            else f"seeded demo dataset {summary.get('dataset')!r} from the packaged "
+            "starter clip"
+        ),
+    )
+
+
+@app.command("system-info")
+@json_stdout_contract
+def system_info_cmd(
+    output_format: OutputFormat = typer.Option(
+        OutputFormat.text, "--output", help="Output format."
+    ),
+) -> None:
+    """Show the Encord tool's SDK pin, API domain, and configured credentials."""
+
+    from npa.sdk.workbench.encord import system_info as sdk_system_info
+
+    emit(_call(sdk_system_info), output=output_format)

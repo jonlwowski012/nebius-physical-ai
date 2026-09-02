@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
+from types import SimpleNamespace
 
 import pytest
 
@@ -229,6 +230,19 @@ def test_encord_pass_when_verifier_ok() -> None:
     result = check_encord(_Creds(tokens={"ENCORD_SSH_KEY_B64": "abc"}), probes)
     assert result.status == PASS
     assert "storage folders listable" in result.summary
+
+
+def test_encord_missing_sdk_is_a_warning_not_a_bad_credential() -> None:
+    from npa.workbench.encord.schemas import EncordSdkMissingError
+
+    def verifier() -> str:
+        raise EncordSdkMissingError("The encord SDK is not installed.")
+
+    credentials = SimpleNamespace(tokens={"ENCORD_SSH_KEY_FILE": "/keys/encord.pem"})
+    result = check_encord(credentials, CredentialProbes(encord_verifier=verifier))
+    assert result.status == WARN
+    assert "not installed" in result.summary
+    assert "npa[encord]" in (result.remedy or "")
 
 
 def test_encord_fail_when_verifier_raises() -> None:

@@ -1,4 +1,4 @@
-"""Unit tests for the encord-cosmos3-augment glue stage."""
+"""Unit tests for the encord-cosmos3-augment glue stage (seeding is a tool verb)."""
 
 from __future__ import annotations
 
@@ -89,64 +89,3 @@ def test_index_out_of_range_fails_closed() -> None:
     storage = FakeStorage(_manifest([]))
     with pytest.raises(EncordLoopError, match="0 transferred media"):
         stage_media_for_augment(MANIFEST_URI, DEST_URI, "0", storage_client=storage)
-
-
-def test_seed_skips_when_operator_supplied_a_curated_source(
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    import npa.workflows.data_factory_input as dfi
-    from npa.workflows.encord_loop import seed_demo_source
-
-    def explode(*args, **kwargs):
-        raise AssertionError("seed must not fetch when skipping")
-
-    monkeypatch.setattr(dfi, "_fetch_starter", explode)
-    summary = seed_demo_source(
-        "s3://bkt/run/seed/", "npa-demo-src-run", "my-curated-collection",
-        storage_client=FakeStorage(None),
-    )
-    assert summary["skipped"]
-
-
-def test_seed_fetches_uploads_and_pushes_default_demo(
-    monkeypatch: pytest.MonkeyPatch, tmp_path
-) -> None:
-    import npa.sdk.workbench.encord as encord_sdk
-    import npa.workflows.data_factory_input as dfi
-    from npa.workflows.encord_loop import seed_demo_source
-
-    clip = tmp_path / "starter.mp4"
-    clip.write_bytes(b"starter-bytes")
-    monkeypatch.setattr(dfi, "_fetch_starter", lambda contract, **kw: (clip, "verified_hit"))
-    monkeypatch.setattr(
-        dfi, "load_starter_contract",
-        lambda: {"integrity": {"sha256": "a" * 64}, "license": {"name": "CC-BY-4.0"}},
-    )
-    pushed: dict = {}
-
-    class Receipt:
-        units_done = 1
-
-    def fake_push(**kwargs):
-        pushed.update(kwargs)
-        return Receipt()
-
-    monkeypatch.setattr(encord_sdk, "push", fake_push)
-
-    class UploadingStorage(FakeStorage):
-        def __init__(self) -> None:
-            super().__init__(None)
-            self.uploads: list[tuple[str, str]] = []
-
-        def upload_file(self, local_file: str, bucket_uri: str) -> str:
-            self.uploads.append((local_file, bucket_uri))
-            return bucket_uri
-
-    storage = UploadingStorage()
-    summary = seed_demo_source(
-        "s3://bkt/run/seed/", "npa-demo-src-run", "npa-demo-src-run",
-        transfer="upload", storage_client=storage,
-    )
-    assert storage.uploads[0][1] == "s3://bkt/run/seed/starter-clip.mp4"
-    assert pushed["dataset"] == "npa-demo-src-run" and pushed["transfer"] == "upload"
-    assert summary["units_done"] == 1 and summary["attribution"] == "CC-BY-4.0"

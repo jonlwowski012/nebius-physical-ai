@@ -1,7 +1,7 @@
 """Encord SaaS seam: auth, domain, public endpoint, and title-or-id resolution.
 
 Everything that talks to the Encord SDK funnels through this module so tests can
-monkeypatch ``_default_user_client`` (or inject ``user_client=``) and the
+monkeypatch ``default_user_client`` (or inject ``user_client=``) and the
 ``encord`` package stays a lazy, optional import.
 """
 
@@ -10,18 +10,33 @@ from __future__ import annotations
 import base64
 import os
 import re
-from typing import Any
+from dataclasses import dataclass
+from typing import Any, Sequence
 
-from npa.workbench.encord.schemas import EncordAuthError, EncordToolError
+from npa.clients.credentials import ENCORD_TOKEN_KEYS
+from npa.workbench.encord.schemas import (
+    EncordAuthError,
+    EncordSdkMissingError,
+    EncordToolError,
+)
 
 # Exactly two credential transports (a raw multi-line PEM pasted into YAML or
 # an env var is truncation-prone and was an observed live failure):
 # - ENCORD_SSH_KEY_B64: base64 of the PEM — survives env/secret transport (pods)
 # - ENCORD_SSH_KEY_FILE: path to the downloaded key file (laptops)
-ENCORD_SSH_KEY_B64_ENV = "ENCORD_SSH_KEY_B64"
-ENCORD_SSH_KEY_FILE_ENV = "ENCORD_SSH_KEY_FILE"
+# The names themselves are declared once, with the other tokens, in
+# npa.clients.credentials (ENCORD_TOKEN_KEYS).
+ENCORD_SSH_KEY_B64_ENV, ENCORD_SSH_KEY_FILE_ENV = ENCORD_TOKEN_KEYS
+ENCORD_CREDENTIAL_TRANSPORTS = ENCORD_TOKEN_KEYS
 ENCORD_DOMAIN_ENV = "ENCORD_DOMAIN"
 DEFAULT_ENCORD_DOMAIN = "https://api.encord.com"
+# encord.orm.dataset.StorageLocation.CORD_STORAGE, the dataset type for
+# link_items-driven datasets: items live in our own storage folder and are
+# linked explicitly, so the dataset needs no backing folder. Pinned as the
+# enum's integer value so resolving a dataset never imports the SDK — the
+# injected-client seam must work without it. test_encord checks this against
+# the real enum whenever the SDK is installed.
+CORD_STORAGE_LOCATION = 0
 
 AUTH_REMEDY = (
     "Set ENCORD_SSH_KEY_B64 (base64 of the PEM: `base64 < key.pem | tr -d '\\n'`) "
@@ -68,7 +83,7 @@ def resolve_public_endpoint(environ: dict[str, str] | None = None) -> str:
     return endpoint.rstrip("/")
 
 
-def _resolve_auth_env(environ: dict[str, str] | None = None) -> dict[str, str]:
+def resolve_auth_env(environ: dict[str, str] | None = None) -> dict[str, str]:
     """The Encord auth names, from an injected env or the resolved credentials.
 
     ``load_credentials`` merges the process environment over the ``tokens:``
@@ -80,16 +95,20 @@ def _resolve_auth_env(environ: dict[str, str] | None = None) -> dict[str, str]:
     from npa.clients.credentials import load_credentials
 
     tokens = load_credentials().tokens
-    return {
-        name: tokens.get(name, "")
-        for name in (ENCORD_SSH_KEY_B64_ENV, ENCORD_SSH_KEY_FILE_ENV)
-    }
+    return {name: tokens.get(name, "") for name in ENCORD_CREDENTIAL_TRANSPORTS}
 
 
-def _default_user_client(environ: dict[str, str] | None = None) -> Any:
+def configured_credential_transports(environ: dict[str, str] | None = None) -> list[str]:
+    """Names (never values) of the Encord credential transports that are set."""
+
+    env = resolve_auth_env(environ)
+    return [name for name in ENCORD_CREDENTIAL_TRANSPORTS if env.get(name, "").strip()]
+
+
+def default_user_client(environ: dict[str, str] | None = None) -> Any:
     """Build an authenticated EncordUserClient from env/NPA credentials."""
 
-    env = _resolve_auth_env(environ)
+    env = resolve_auth_env(environ)
     ssh_key = ""
     ssh_key_b64 = env.get(ENCORD_SSH_KEY_B64_ENV, "").strip()
     ssh_key_file = env.get(ENCORD_SSH_KEY_FILE_ENV, "").strip()
@@ -106,7 +125,7 @@ def _default_user_client(environ: dict[str, str] | None = None) -> Any:
     try:
         from encord.user_client import EncordUserClient
     except ModuleNotFoundError as exc:
-        raise EncordToolError(
+        raise EncordSdkMissingError(
             "The encord SDK is not installed. Install it with "
             "`pip install 'npa[encord]'` or `pip install encord`."
         ) from exc
@@ -126,134 +145,133 @@ def _default_user_client(environ: dict[str, str] | None = None) -> Any:
         ) from exc
 
 
-def resolve_integration(user_client: Any, value: str) -> tuple[str, str]:
-    """Resolve an Encord cloud integration by uuid or exact title -> (id, title).
+@dataclass(frozen=True)
+class ResolvedRef:
+    """One Encord object resolved by uuid/hash or by exact, unique title."""
+
+    obj: Any
+    id: str
+    title: str
+    created: bool = False
+
+
+def _require_reference(value: str, what: str) -> str:
+    value = value.strip()
+    if not value:
+        raise EncordToolError(f"{what} must not be empty.")
+    return value
+
+
+def _unique_title_match(
+    kind: str, value: str, matches: Sequence[Any], *, id_hint: str
+) -> Any | None:
+    """The single exact-title match, or None when absent; ambiguity fails closed.
+
+    Every resolver shares this 0/1/many contract: a unique title resolves, a
+    missing title is the caller's decision (create it, or fail with the
+    caller's remedy), and several same-titled objects are never disambiguated
+    by guess — the caller must pass the id.
+    """
+
+    if len(matches) > 1:
+        raise EncordToolError(
+            f"Multiple Encord {kind}s titled {value!r}; pass the {id_hint} instead."
+        )
+    return matches[0] if matches else None
+
+
+def resolve_integration(user_client: Any, value: str) -> ResolvedRef:
+    """Resolve an Encord cloud integration by uuid or exact title.
 
     Integrations are never created here: they hold cloud credentials and must be
     created once in the Encord app (S3-compatible/MinIO pattern for Nebius).
     """
 
-    value = value.strip()
-    if not value:
-        raise EncordToolError("--integration must not be empty.")
+    value = _require_reference(value, "--integration")
     integrations = list(user_client.get_cloud_integrations())
     if looks_like_id(value):
-        for integration in integrations:
-            if str(integration.id).lower() == value.lower():
-                return str(integration.id), str(integration.title)
-        raise EncordToolError(
-            f"No Encord cloud integration with id {value!r}. Available titles: "
-            f"{sorted(str(i.title) for i in integrations)}"
-        )
-    matches = [i for i in integrations if str(i.title) == value]
-    if len(matches) == 1:
-        return str(matches[0].id), str(matches[0].title)
-    if not matches:
+        matches = [i for i in integrations if str(i.id).lower() == value.lower()]
+        if not matches:
+            raise EncordToolError(
+                f"No Encord cloud integration with id {value!r}. Available titles: "
+                f"{sorted(str(i.title) for i in integrations)}"
+            )
+    else:
+        matches = [i for i in integrations if str(i.title) == value]
+    found = _unique_title_match(
+        "cloud integration", value, matches, id_hint="integration id"
+    )
+    if found is None:
         raise EncordToolError(
             f"No Encord cloud integration titled {value!r}. Available: "
             f"{sorted(str(i.title) for i in integrations)}. Create an "
             "S3-compatible integration in the Encord app first."
         )
-    raise EncordToolError(
-        f"Multiple Encord cloud integrations titled {value!r}; pass the "
-        "integration id instead."
-    )
+    return ResolvedRef(found, str(found.id), str(found.title))
 
 
-def resolve_folder(user_client: Any, value: str, *, create: bool = True) -> tuple[Any, bool]:
-    """Resolve a storage folder by uuid or title -> (folder, created)."""
+def resolve_folder(user_client: Any, value: str, *, create: bool = True) -> ResolvedRef:
+    """Resolve a storage folder by uuid or exact title; create the title if asked."""
 
-    value = value.strip()
-    if not value:
-        raise EncordToolError("--folder must not be empty.")
+    value = _require_reference(value, "--folder")
     if looks_like_id(value):
-        return user_client.get_storage_folder(value), False
+        folder = user_client.get_storage_folder(value)
+        return ResolvedRef(folder, str(folder.uuid), str(folder.name))
     matches = [
         folder
         for folder in user_client.list_storage_folders(search=value, page_size=1000)
         if str(folder.name) == value
     ]
-    if len(matches) == 1:
-        return matches[0], False
-    if len(matches) > 1:
-        raise EncordToolError(
-            f"Multiple Encord storage folders named {value!r}; pass the folder "
-            "uuid instead."
-        )
+    found = _unique_title_match("storage folder", value, matches, id_hint="folder uuid")
+    if found is not None:
+        return ResolvedRef(found, str(found.uuid), str(found.name))
     if not create:
         raise EncordToolError(f"No Encord storage folder named {value!r}.")
     folder = user_client.create_storage_folder(
         value, description="Created by npa workbench encord push"
     )
-    return folder, True
+    return ResolvedRef(folder, str(folder.uuid), str(folder.name), created=True)
 
 
-def resolve_dataset(
-    user_client: Any, value: str, *, create: bool = True
-) -> tuple[Any, str, str, bool]:
-    """Resolve a dataset by hash or title -> (dataset, hash, title, created)."""
+def resolve_dataset(user_client: Any, value: str, *, create: bool = True) -> ResolvedRef:
+    """Resolve a dataset by hash or exact title; create the title if asked."""
 
-    value = value.strip()
-    if not value:
-        raise EncordToolError("Dataset reference must not be empty.")
+    value = _require_reference(value, "Dataset reference")
     if looks_like_id(value):
         dataset = user_client.get_dataset(value)
-        return dataset, value, str(getattr(dataset, "title", "")), False
+        return ResolvedRef(dataset, value, str(getattr(dataset, "title", "")))
     rows = list(user_client.get_datasets(title_eq=value))
-    if len(rows) == 1:
-        info = rows[0]["dataset"]
-        dataset_hash = str(info.dataset_hash)
-        return user_client.get_dataset(dataset_hash), dataset_hash, value, False
-    if len(rows) > 1:
-        raise EncordToolError(
-            f"Multiple Encord datasets titled {value!r}; pass the dataset hash "
-            "instead."
-        )
+    found = _unique_title_match("dataset", value, rows, id_hint="dataset hash")
+    if found is not None:
+        dataset_hash = str(found["dataset"].dataset_hash)
+        return ResolvedRef(user_client.get_dataset(dataset_hash), dataset_hash, value)
     if not create:
         raise EncordToolError(f"No Encord dataset titled {value!r}.")
-
-    # Items are registered into our own storage folder and linked explicitly, so
-    # the dataset needs no backing folder of its own. CORD_STORAGE is the
-    # documented type for link_items-driven datasets; the live e2e smoke is the
-    # gate that would surface a mismatch.
-    try:
-        from encord.orm.dataset import StorageLocation
-
-        storage_location: Any = StorageLocation.CORD_STORAGE
-    except ModuleNotFoundError:
-        # Only reachable with an injected (fake) user client: a real client was
-        # constructed by _default_user_client, which already imported the SDK.
-        storage_location = "CORD_STORAGE"
     response = user_client.create_dataset(
         value,
-        storage_location,
+        CORD_STORAGE_LOCATION,
         dataset_description="Created by npa workbench encord push",
         create_backing_folder=False,
     )
     dataset_hash = str(response["dataset_hash"])
-    return user_client.get_dataset(dataset_hash), dataset_hash, value, True
+    return ResolvedRef(
+        user_client.get_dataset(dataset_hash), dataset_hash, value, created=True
+    )
 
 
-def resolve_project(user_client: Any, value: str) -> tuple[Any, str, str]:
-    """Resolve a project by hash or title -> (project, hash, title)."""
+def resolve_project(user_client: Any, value: str) -> ResolvedRef:
+    """Resolve a project by hash or exact title (never created)."""
 
-    value = value.strip()
-    if not value:
-        raise EncordToolError("Project reference must not be empty.")
+    value = _require_reference(value, "Project reference")
     if looks_like_id(value):
         project = user_client.get_project(value)
-        return project, value, str(getattr(project, "title", ""))
+        return ResolvedRef(project, value, str(getattr(project, "title", "")))
     rows = list(user_client.get_projects(title_eq=value))
-    if len(rows) == 1:
-        info = rows[0]["project"]
-        project_hash = str(info.project_hash)
-        return user_client.get_project(project_hash), project_hash, value
-    if len(rows) > 1:
-        raise EncordToolError(
-            f"Multiple Encord projects titled {value!r}; pass the project hash "
-            "instead."
-        )
-    raise EncordToolError(f"No Encord project titled {value!r}.")
+    found = _unique_title_match("project", value, rows, id_hint="project hash")
+    if found is None:
+        raise EncordToolError(f"No Encord project titled {value!r}.")
+    project_hash = str(found["project"].project_hash)
+    return ResolvedRef(user_client.get_project(project_hash), project_hash, value)
 
 
 def resolve_collection(
@@ -261,8 +279,8 @@ def resolve_collection(
     value: str,
     *,
     create_in_folder_uuid: str = "",
-) -> tuple[Any, str, str, bool]:
-    """Resolve a collection by uuid or name -> (collection, uuid, name, created).
+) -> ResolvedRef:
+    """Resolve a collection by uuid or exact name.
 
     Index collections are scoped to a top-level storage folder, so a non-empty
     ``create_in_folder_uuid`` (curate's collection-by-title path) both scopes
@@ -270,12 +288,10 @@ def resolve_collection(
     created; without it a missing title is an error (pull's path).
     """
 
-    value = value.strip()
-    if not value:
-        raise EncordToolError("Collection reference must not be empty.")
+    value = _require_reference(value, "Collection reference")
     if looks_like_id(value):
         collection = user_client.get_collection(value)
-        return collection, value, str(getattr(collection, "name", "")), False
+        return ResolvedRef(collection, value, str(getattr(collection, "name", "")))
     scope = (
         {"top_level_folder_uuid": create_in_folder_uuid}
         if create_in_folder_uuid
@@ -286,14 +302,9 @@ def resolve_collection(
         for collection in user_client.list_collections(**scope)
         if str(collection.name) == value
     ]
-    if len(matches) == 1:
-        collection = matches[0]
-        return collection, str(collection.uuid), value, False
-    if len(matches) > 1:
-        raise EncordToolError(
-            f"Multiple Encord collections named {value!r}; pass the collection "
-            "uuid instead."
-        )
+    found = _unique_title_match("collection", value, matches, id_hint="collection uuid")
+    if found is not None:
+        return ResolvedRef(found, str(found.uuid), value)
     if not create_in_folder_uuid:
         raise EncordToolError(f"No Encord collection named {value!r}.")
     collection = user_client.create_collection(
@@ -301,4 +312,4 @@ def resolve_collection(
         name=value,
         description="Created by npa workbench encord curate",
     )
-    return collection, str(collection.uuid), value, True
+    return ResolvedRef(collection, str(collection.uuid), value, created=True)

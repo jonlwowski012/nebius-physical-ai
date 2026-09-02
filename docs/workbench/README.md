@@ -16,6 +16,7 @@ workflows, and operational runbooks.
 | [cosmos3-ray-serve.md](cosmos3-ray-serve.md) | Persistent Cosmos3-Nano serving through native Ray Serve batching with durable S3 outputs |
 | [leisaac-teleoperation.md](leisaac-teleoperation.md) | Capability-gated LeIsaac agent tab, RT-core launch, keyboard teleoperation, and cleanup |
 | [encord.md](encord.md) | Encord curation SaaS setup, register/upload push, in-app curation, and curated pull back to S3 |
+| [encord-headless-curation.md](encord-headless-curation.md) | Design and live evidence for headless Encord curation: filter presets, the pinned filter shape, and the agent-driven push → curate → pull → verify loop |
 | [../architecture/oss-onboarding-ladder.md](../architecture/oss-onboarding-ladder.md) | OSS → BYOF → workflow → first-class tool promotion ladder |
 | [npa-workflow-tool-catalog.md](npa-workflow-tool-catalog.md) | `toolRef` catalog for declarative `npa.workflow` specs |
 | [agent-workflow-operations.md](agent-workflow-operations.md) | Provider-neutral, bounded NPA operations for agents authoring and running Workbench workflows |
