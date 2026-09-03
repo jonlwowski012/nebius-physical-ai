@@ -10,7 +10,7 @@ from typer.testing import CliRunner
 
 import npa.clients.credentials as credentials_module
 from npa.cli.main import app
-from npa.workbench.encord.schemas import EncordToolError, PushReceipt
+from npa.workbench.encord.schemas import EncordToolError, PullManifest, PushReceipt
 
 runner = CliRunner()
 
@@ -49,6 +49,22 @@ def _receipt(**overrides) -> PushReceipt:
     return PushReceipt(**payload)
 
 
+def _manifest(**overrides) -> PullManifest:
+    payload = dict(
+        generated_at="2026-08-24T00:00:00+00:00",
+        encord_domain="https://api.encord.com",
+        source_kind="collection",
+        source_id="00000000-0000-0000-0000-000000000009",
+        source_name="keepers",
+        output_uri="s3://bkt/pull",
+        manifest_uri="s3://bkt/pull/manifest.json",
+        items_total=1,
+        media_copied=1,
+    )
+    payload.update(overrides)
+    return PullManifest(**payload)
+
+
 def _cleanup_summary(**overrides) -> dict:
     summary = {
         "folders_deleted": ["npa-e2e-run1"],
@@ -64,7 +80,8 @@ def _cleanup_summary(**overrides) -> dict:
 def test_encord_group_registered() -> None:
     result = runner.invoke(app, ["workbench", "encord", "--help"])
     assert result.exit_code == 0
-    assert "push" in result.output and "cleanup" in result.output
+    assert "push" in result.output and "pull" in result.output
+    assert "cleanup" in result.output
 
 
 def test_push_help_contains_contract_options() -> None:
@@ -157,6 +174,101 @@ def test_push_missing_credential_message(monkeypatch: pytest.MonkeyPatch) -> Non
     result = runner.invoke(app, PUSH_ARGS)
     assert result.exit_code == 1
     assert "ENCORD_SSH_KEY" in result.output or "credential" in result.output.lower()
+
+
+def test_pull_help_contains_source_options() -> None:
+    result = runner.invoke(app, ["workbench", "encord", "pull", "--help"])
+    assert result.exit_code == 0
+    for option in ("source", "source-id", "output-path"):
+        assert option in result.output
+
+
+def test_pull_happy_path_text(monkeypatch: pytest.MonkeyPatch) -> None:
+    captured: dict = {}
+
+    def fake_pull(**kwargs):
+        captured.update(kwargs)
+        return _manifest()
+
+    monkeypatch.setattr("npa.sdk.workbench.encord.pull", fake_pull)
+    result = runner.invoke(
+        app,
+        [
+            "workbench", "encord", "pull",
+            "--source", "collection",
+            "--source-id", "keepers",
+            "--output-path", "s3://bkt/pull/",
+            "--output", "text",
+        ],
+    )
+    assert result.exit_code == 0, result.output
+    assert "pulled 1 item(s)" in result.output
+    assert captured["source"] == "collection"
+    assert captured["source_id"] == "keepers"
+
+
+def test_pull_happy_path_json(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setattr("npa.sdk.workbench.encord.pull", lambda **kwargs: _manifest())
+    result = runner.invoke(
+        app,
+        ["workbench", "encord", "pull", "--source", "dataset", "--source-id", "ds",
+         "--output-path", "s3://bkt/pull/", "--output", "json"],
+    )
+    assert result.exit_code == 0, result.output
+    assert json.loads(result.output)["schema"] == "npa.encord.pull_manifest.v1"
+
+
+def test_pull_rejects_local_output_and_bad_source() -> None:
+    result = runner.invoke(
+        app,
+        [
+            "workbench", "encord", "pull",
+            "--source", "collection",
+            "--source-id", "x",
+            "--output-path", "/tmp/out",
+        ],
+    )
+    assert result.exit_code == 1
+    result = runner.invoke(
+        app,
+        [
+            "workbench", "encord", "pull",
+            "--source", "everything",
+            "--source-id", "x",
+            "--output-path", "s3://bkt/pull/",
+        ],
+    )
+    assert result.exit_code != 0
+
+
+def test_pull_missing_credential_message(monkeypatch: pytest.MonkeyPatch) -> None:
+    # No monkeypatched SDK: run_pull resolves the endpoint from environ then
+    # fails on auth; both are acceptable fail-closed messages, never a traceback.
+    monkeypatch.setenv("AWS_ENDPOINT_URL", "https://storage.test")
+    result = runner.invoke(
+        app,
+        [
+            "workbench", "encord", "pull",
+            "--source", "collection",
+            "--source-id", "00000000-0000-0000-0000-000000000009",
+            "--output-path", "s3://bkt/pull/",
+        ],
+    )
+    assert result.exit_code == 1
+    assert "ENCORD_SSH_KEY" in result.output or "credential" in result.output.lower()
+
+
+def test_pull_tool_error_exits_nonzero(monkeypatch: pytest.MonkeyPatch) -> None:
+    def fake_pull(**kwargs):
+        raise EncordToolError("Encord pull failed: 1 item error(s)")
+
+    monkeypatch.setattr("npa.sdk.workbench.encord.pull", fake_pull)
+    result = runner.invoke(
+        app,
+        ["workbench", "encord", "pull", "--source", "collection", "--source-id", "x",
+         "--output-path", "s3://bkt/pull/"],
+    )
+    assert result.exit_code == 1 and "item error" in result.output
 
 
 def test_cleanup_help_and_dry_run_text(monkeypatch: pytest.MonkeyPatch) -> None:

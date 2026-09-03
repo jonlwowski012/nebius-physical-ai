@@ -10,6 +10,7 @@ from npa.orchestration.npa_workflow.skypilot_render import secret_env_hints_for_
 ROOT = Path(__file__).resolve().parents[3]
 WORKFLOWS = ROOT / "npa" / "workflows" / "workbench" / "npa-workflows"
 PUSH = WORKFLOWS / "encord-push.yaml"
+PULL = WORKFLOWS / "encord-pull.yaml"
 
 
 def test_push_spec_is_a_single_terminal_state() -> None:
@@ -25,15 +26,27 @@ def test_push_spec_is_a_single_terminal_state() -> None:
     assert not spec.states["push"].inputs
 
 
+def test_pull_spec_is_a_single_terminal_state() -> None:
+    spec = load_spec(PULL)
+    validate_spec(spec)
+    assert spec.name == "encord-pull"
+    steps = [step.state for step in build_plan(spec, run_id="t").steps]
+    assert steps == ["pull"]
+    outputs = spec.states["pull"].outputs
+    assert outputs and outputs[0].schema == "npa.encord.pull_manifest.v1"
+    assert outputs[0].uri.endswith("manifest.json")
+
+
 def test_push_stage_hints_the_encord_secret() -> None:
     """Every Encord-facing verb needs the base64 key; the renderer says so."""
 
-    step = SimpleNamespace(tool_ref="workbench.encord.push", argv=[])
-    assert secret_env_hints_for_plan([step]) == ("ENCORD_SSH_KEY_B64",)
+    for ref in ("workbench.encord.push", "workbench.encord.pull"):
+        step = SimpleNamespace(tool_ref=ref, argv=[])
+        assert secret_env_hints_for_plan([step]) == ("ENCORD_SSH_KEY_B64",), ref
 
 
 def test_specs_declare_cpu_resource_blocks() -> None:
-    for path in (PUSH,):
+    for path in (PUSH, PULL):
         spec = load_spec(path)
         assert "cpu" in spec.resources, path.name
         profile = spec.resources["cpu"]
@@ -59,6 +72,13 @@ def test_push_argv_renders_every_flag() -> None:
     ):
         assert flag in argv, flag
     assert "{{run.id}}" in argv
+
+
+def test_pull_argv_renders_every_flag() -> None:
+    argv = argv_for_tool("workbench.encord.pull")
+    assert argv[:4] == ["npa", "workbench", "encord", "pull"]
+    for flag in ("--source", "--source-id", "--output-path", "--workflow-run", "--output"):
+        assert flag in argv, flag
 
 
 def test_push_plan_omits_dataset_flag_when_empty() -> None:

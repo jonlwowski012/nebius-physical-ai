@@ -1475,6 +1475,29 @@ TOOL_CATALOG: dict[str, ToolEntry] = {
             "encord_poll_timeout_seconds": "1800",
         },
     ),
+    "workbench.encord.pull": ToolEntry(
+        name="workbench.encord.pull",
+        description=(
+            "Pull a curated Encord Collection, Dataset, or Project's labels back "
+            "to S3 as media + item JSON + a lineage manifest."
+        ),
+        argv_template=[
+            "npa",
+            "workbench",
+            "encord",
+            "pull",
+            "--source",
+            "{{config.encord_source}}",
+            "--source-id",
+            "{{config.encord_source_id}}",
+            "--output-path",
+            "{{config.encord_pull_uri}}",
+            "--workflow-run",
+            "{{run.id}}",
+            "--output",
+            "json",
+        ],
+    ),
     "workbench.dataset.write_quality_decision": ToolEntry(
         name="workbench.dataset.write_quality_decision",
         description="Write accept/reject decision from a validation quality gate.",

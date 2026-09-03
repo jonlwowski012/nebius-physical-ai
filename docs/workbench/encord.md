@@ -1,9 +1,8 @@
-# Encord: push data for curation
+# Encord: push data for curation, pull curated data back
 
 [Encord](https://encord.com/) is a data curation and annotation platform. The
 Workbench integration is a round trip your data makes around a human curation
-step. This page covers the first half, **push**, plus **cleanup** of the state
-push creates; later verbs land as the integration grows.
+step:
 
 1. **`npa workbench encord push`** — your S3 media becomes an Encord dataset.
    In the default *register* mode the bytes never leave your bucket; Encord
@@ -11,14 +10,18 @@ push creates; later verbs land as the integration grows.
    mode copies the bytes into Encord-hosted storage instead.
 2. **You curate in the Encord app** — filter, review, build a Collection, or
    annotate in a Project.
+3. **`npa workbench encord pull`** — the curated Collection, Dataset, or a
+   Project's labels come back to S3 as media + per-item JSON + a lineage
+   manifest that downstream stages consume.
 
 > **TL;DR:** create an Encord API key and an S3-compatible integration (both
 > one-time, in the Encord app), point `~/.npa/credentials.yaml` at the key,
-> run `npa workbench health preflight --checks encord`, then `push`.
+> run `npa workbench health preflight --checks encord`, then `push` → curate in
+> the app → `pull`.
 
-Verbs: `push` and `cleanup`. Every verb takes `--output json` and then prints
-exactly one JSON document on stdout, including on failure; diagnostics go to
-stderr.
+Verbs: `push`, `pull`, and `cleanup`. Every verb takes `--output json` and then
+prints exactly one JSON document on stdout, including on failure; diagnostics
+go to stderr.
 
 ## File-format support in this integration
 
@@ -27,10 +30,11 @@ every format Encord itself can store or annotate.
 
 | Data | NPA Encord support | Details |
 |---|---|---|
-| Video | Supported: `.mp4` | `push` registers or uploads it. |
-| Images | Supported: `.png`, `.jpg`, `.jpeg` | `push` registers or uploads individual images. |
+| Video | Supported: `.mp4` | `push` registers or uploads it; `pull` materializes it. |
+| Images | Supported: `.png`, `.jpg`, `.jpeg` | `push` registers or uploads individual images; `pull` materializes them. |
 | MCAP / LiDAR / point clouds | Not supported | Encord supports scene and point-cloud modalities, including `.mcap`, but this integration does not yet construct the required per-stream scene payload. `--media mcap` or `--media all` records each MCAP as `experimental_error` and fails closed. |
 | ROS bags / other sensor data | Not supported | No scene, calibration, timestamp, or multi-stream ingestion path is implemented. |
+| Composite Encord items | Pull not supported | Image groups and DICOM series have no single signed URL, so pull records a per-item error. |
 
 Do not use an unsupported suffix as a generic file transport. The tool skips
 unknown formats by default so a successful receipt always means the registered
@@ -43,10 +47,12 @@ flowchart LR
     subgraph nebius["Your Nebius project"]
         SRC[("S3 media prefix<br/>*.mp4 · *.png · *.jpg")]
         RCPT[("push_receipt.json<br/>write-ahead, then final:<br/>uuid · size · etag · checksum")]
+        DEST[("S3 output prefix<br/>media/ · items/ · labels/ · manifest.json")]
     end
 
     subgraph cli["npa workbench encord"]
         PUSH["push"]
+        PULL["pull"]
         CLN["cleanup"]
     end
 
@@ -55,6 +61,7 @@ flowchart LR
         FOLDER["Storage folder<br/>items carry npa.source_uri<br/>identity metadata"]
         DATASET["Dataset"]
         HCUR{{"Human curation<br/>in the Encord app"}}
+        COLL["Collection · Dataset · Project labels"]
     end
 
     SRC -- "list prefix" --> PUSH
@@ -65,15 +72,19 @@ flowchart LR
     PUSH -- "durable receipt" --> RCPT
     FOLDER -- "link_items (explicit)" --> DATASET
     DATASET -.-> HCUR
+    HCUR -.-> COLL
+    COLL -- "--source + --source-id" --> PULL
+    PULL == "registered media:<br/>zero-egress server-side copy" ==> DEST
+    PULL -. "Encord-hosted media:<br/>signed-URL download, hashed in-stream" .-> DEST
     CLN -- "--title-prefix" --> FOLDER
 ```
 
-Solid heavy arrows are the default register-mode path; dashed arrows are the
-upload-mode variant and the human step. Both verbs authenticate with your
+Solid heavy arrows are the default register-mode paths; dashed arrows are the
+upload-mode variants and the human step. All verbs authenticate with your
 Encord API key (`ENCORD_SSH_KEY_B64` or `ENCORD_SSH_KEY_FILE`); the cloud
 integration is a separate, Encord-side credential that only ever grants *read*
-on the media bucket. The receipt is written before any failure exit, so lineage
-survives fail-closed runs.
+on the media bucket. The receipt and manifest are written before any failure
+exit, so lineage survives fail-closed runs.
 
 ## One-time setup
 
@@ -166,6 +177,43 @@ npa workbench encord push \
   intent — then the final receipt with per-item uuids, sizes, ETags, and
   checksums.
 
+## Curate in the Encord app
+
+Work exactly as you normally do in Encord: filter, review, build a Collection,
+or annotate in a Project. When you're done, the pull source is one of:
+
+| You curated with… | Pull with |
+|---|---|
+| A **Collection** (Index/Curate) | `--source collection --source-id <uuid-or-name>` |
+| The **Dataset** itself (deleting bad items) | `--source dataset --source-id <hash-or-title>` |
+| An Annotate **Project** (labels) | `--source project --source-id <hash-or-title>` |
+
+## Pull: Encord → S3
+
+```bash
+npa workbench encord pull \
+  --source collection --source-id keepers \
+  --output-path s3://<bucket>/encord/pull/
+```
+
+Output layout under `--output-path`:
+
+```text
+media/<item_uuid>__<name>     # the curated media files
+items/<item_uuid>.json        # per-item Encord metadata
+labels/<label_hash>.json      # project source only (LabelRowV2 JSON)
+manifest.json                 # npa.encord.pull_manifest.v1 lineage + counts
+```
+
+Media registered from your own bucket returns as **zero-egress server-side
+copies**; Encord-hosted (uploaded) media streams back through signed URLs (the
+download is hashed in-stream, and its sha256 lands in the manifest). If a
+same-bucket copy fails (an access-policy gap, say) the item falls back to the
+signed-URL download and the manifest row's `copy_error` says why egress was
+paid. Transfers run in a bounded parallel pool, so pulling thousands of curated
+clips does not pay a serial round-trip each. The manifest is written before any
+failure exit; any failed item fails the command closed.
+
 ## Cleanup: tear down run-scoped Encord state
 
 Everything the tool creates in Encord carries a run-scoped title whose run id
@@ -195,19 +243,26 @@ receipt = encord.push(
     dataset="my-batch",
     output_path="s3://<bucket>/encord/push/",
 )
+manifest = encord.pull(
+    source="collection",
+    source_id="my-batch-keepers",
+    output_path="s3://<bucket>/encord/pull/",
+)
 summary = encord.cleanup(title_prefix="npa-e2e-", dry_run=True)
 ```
 
-`push` returns the `PushReceipt` Pydantic model that is also persisted to S3 and
-raises `EncordToolError` on the same fail-closed conditions as the CLI.
+`push` and `pull` return the Pydantic models (`PushReceipt` / `PullManifest`)
+that are also persisted to S3, and raise `EncordToolError` on the same
+fail-closed conditions as the CLI.
 
 ## Workflows
 
-The shipped spec wraps the same tool
+The shipped specs wrap the same tool
 (`npa/workflows/workbench/npa-workflows/`):
 
 - `encord-push.yaml` — production push, terminal at the receipt (for the
   human-curation path between workflows).
+- `encord-pull.yaml` — production pull, run after curation.
 
 Forward the credential to pods **by name only** — the base64 form survives the
 secret transport:
@@ -232,6 +287,7 @@ environment.)
 | Push receipt shows per-file `error` rows (403/404 from Encord) | The integration's access keys cannot read that bucket/prefix, or the endpoint in the integration is wrong. Fix the integration in the Encord app; the receipt names each failing file. |
 | `No Encord cloud integration titled '...'` | Title mismatch — the error lists the titles your key can see. |
 | `.mcap` files land as `experimental_error` in the receipt | MCAP cloud registration has no supported upload format in the pinned SDK yet; the receipt-visible error is intentional. Push videos/images with the default `--media`. |
+| Pull error `item has no signed URL (composite items...)` | Image groups / DICOM series expose no single signed URL and are not supported by pull. |
 | US-hosted org, auth fails with a valid key | Set `ENCORD_DOMAIN` (the SDK default is the EU endpoint). |
 | `health preflight` warns `encord SDK is not installed` | An Encord credential is configured but the optional extra is missing; `pip install 'npa[encord]'` only if you use the tool. |
 | A `--output json` command printed diagnostics you expected on stdout | stdout carries exactly one JSON document per verb (also on failure: `{"result": "error", ...}`); human-readable errors and progress go to stderr. |

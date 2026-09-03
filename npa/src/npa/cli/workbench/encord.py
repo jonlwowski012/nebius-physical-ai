@@ -5,6 +5,8 @@ Encord labeling/curation SaaS integration:
 - ``push``  register S3 media in place into an Encord storage folder (and
   optionally link a dataset) through a cloud integration created once in the
   Encord app. Bytes stay in the bucket.
+- ``pull``  materialize a curated Collection, a Dataset, or a Project's labels
+  back to an S3 prefix as media + item JSON + a lineage manifest.
 - ``cleanup``  tear down run-scoped Encord state by title prefix.
 
 Every verb is a thin client of ``npa.sdk.workbench.encord``: the CLI validates
@@ -24,7 +26,7 @@ from npa.workbench.encord.schemas import DEFAULT_POLL_TIMEOUT_SECONDS
 
 app = typer.Typer(
     name="encord",
-    help="Encord curation SaaS: register-in-place push of S3 media.",
+    help="Encord curation SaaS: register-in-place push and curated pull.",
     no_args_is_help=True,
 )
 
@@ -40,6 +42,12 @@ class MediaFilter(str, Enum):
     videos_images = "videos-images"
     mcap = "mcap"
     all = "all"
+
+
+class PullSource(str, Enum):
+    collection = "collection"
+    dataset = "dataset"
+    project = "project"
 
 
 def _call(operation: Callable[[], T]) -> T:
@@ -143,6 +151,54 @@ def push_cmd(
             f"pushed {receipt.units_done}/{receipt.files_discovered} item(s) to "
             f"Encord folder {receipt.folder_name!r} "
             f"(linked {receipt.linked_count}); receipt: {receipt.receipt_uri}"
+        ),
+    )
+
+
+@app.command("pull")
+@json_stdout_contract
+def pull_cmd(
+    source: PullSource = typer.Option(
+        ...,
+        "--source",
+        help="Which Encord container to pull: collection, dataset, or project.",
+    ),
+    source_id: str = typer.Option(
+        ...,
+        "--source-id",
+        help="Collection uuid / dataset hash / project hash, or a unique title.",
+    ),
+    output_path: str = typer.Option(
+        ...,
+        "--output-path",
+        help="s3:// output prefix for media/, items/, labels/, and manifest.json.",
+    ),
+    workflow_run: str = typer.Option("", "--workflow-run", help=WORKFLOW_RUN_HELP),
+    output_format: OutputFormat = OUTPUT_OPTION,
+) -> None:
+    """Pull curated media + labels + lineage manifest back to S3."""
+
+    from npa.cli.path_contract import validate_write_path
+    from npa.sdk.workbench.encord import pull as sdk_pull
+
+    _call(lambda: validate_write_path(output_path, tool="encord pull", required=True))
+    manifest = _call(
+        lambda: sdk_pull(
+            source=source.value,
+            source_id=source_id,
+            output_path=output_path,
+            workflow_run=workflow_run,
+        )
+    )
+    emit(
+        manifest.model_dump(by_alias=True),
+        output=output_format,
+        text=(
+            f"pulled {manifest.items_total} item(s) "
+            f"({manifest.media_copied} copied, {manifest.media_downloaded} "
+            f"downloaded, {manifest.label_rows} label rows) from "
+            f"{manifest.source_kind} {manifest.source_name!r}; manifest: "
+            f"{manifest.manifest_uri}"
         ),
     )
 

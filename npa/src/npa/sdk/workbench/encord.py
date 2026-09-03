@@ -12,6 +12,7 @@ from npa.workbench.encord.schemas import (
     DEFAULT_MEDIA_FILTER,
     DEFAULT_POLL_TIMEOUT_SECONDS,
     DEFAULT_TRANSFER,
+    PullManifest,
     PushReceipt,
 )
 
@@ -49,6 +50,29 @@ def push(
     )
 
 
+def pull(
+    *,
+    source: str,
+    source_id: str,
+    output_path: str,
+    workflow_run: str = "",
+    user_client: Any = None,
+    storage_client: Any = None,
+) -> PullManifest:
+    """Materialize a curated Encord source to S3; write a lineage manifest."""
+
+    from npa.workbench.encord.pull import run_pull
+
+    return run_pull(
+        source=source,
+        source_id=source_id,
+        output_path=output_path,
+        workflow_run=workflow_run,
+        user_client=user_client,
+        storage_client=storage_client,
+    )
+
+
 def cleanup(
     *,
     title_prefix: str,
@@ -67,7 +91,9 @@ def cleanup(
 
 
 __all__ = [
+    "PullManifest",
     "PushReceipt",
     "cleanup",
+    "pull",
     "push",
 ]

@@ -15,6 +15,8 @@ from pathlib import Path
 from types import SimpleNamespace
 from typing import Any
 
+import pytest
+
 ENDPOINT = "https://storage.test.example"
 ENVIRON = {"AWS_ENDPOINT_URL": ENDPOINT}
 # Every durable artifact is an s3:// object; the fake storage captures the bytes.
@@ -328,4 +330,27 @@ class FakeDownloadStorage(FakeStorage):
         Path(local_path).write_bytes(b"media-bytes")
         return local_path
 
+
+
+
+def stub_httpx_stream(monkeypatch: pytest.MonkeyPatch, body: bytes = b"payload") -> None:
+    """Make httpx.stream yield one fixed body: the cross-origin download path."""
+
+    import httpx
+
+    class FakeResponse:
+        def raise_for_status(self) -> None: ...
+
+        def iter_bytes(self, chunk_size: int):
+            yield body
+
+    class FakeStream:
+        def __init__(self, *args, **kwargs) -> None: ...
+
+        def __enter__(self) -> FakeResponse:
+            return FakeResponse()
+
+        def __exit__(self, *args) -> None: ...
+
+    monkeypatch.setattr(httpx, "stream", FakeStream)
 

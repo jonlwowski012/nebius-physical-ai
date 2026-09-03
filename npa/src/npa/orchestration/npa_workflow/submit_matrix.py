@@ -100,6 +100,21 @@ SUBMIT_LIVE_MATRIX: tuple[SubmitLiveCase, ...] = (
         notes="Manual/plan runs only; needs an Encord cloud integration titled by config.encord_integration.",
     ),
     SubmitLiveCase(
+        "encord-pull.yaml",
+        "cpu",
+        secret_envs=(
+            "ENCORD_SSH_KEY_B64",
+            "AWS_ACCESS_KEY_ID",
+            "AWS_SECRET_ACCESS_KEY",
+        ),
+        rotation_skip=True,
+        skip_reason=(
+            "Needs a human-curated Collection/Dataset id from the Encord app; "
+            "no standalone submit can supply one."
+        ),
+        notes="Manual/plan runs only; pairs with encord-push.yaml around a human curation step.",
+    ),
+    SubmitLiveCase(
         "token-factory-caption.yaml",
         "cpu",
         secret_envs=(
