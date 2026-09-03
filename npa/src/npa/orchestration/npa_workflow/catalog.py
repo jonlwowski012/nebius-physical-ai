@@ -1475,6 +1475,35 @@ TOOL_CATALOG: dict[str, ToolEntry] = {
             "encord_poll_timeout_seconds": "1800",
         },
     ),
+    "workbench.encord.curate": ToolEntry(
+        name="workbench.encord.curate",
+        description=(
+            "Headless curation: evaluate workbench-declared Encord quality "
+            "filters (metric:min:max, comma-separated) server-side into a "
+            "Collection — no human in the Encord app."
+        ),
+        argv_template=[
+            "npa",
+            "workbench",
+            "encord",
+            "curate",
+            "--folder",
+            "{{config.encord_folder}}",
+            "--filter",
+            "{{config.encord_curate_filters}}",
+            "--collection",
+            "{{config.encord_collection}}",
+            "--poll-seconds",
+            "{{config.encord_curate_poll_seconds}}",
+            "--output-path",
+            "{{config.encord_curate_receipt_uri}}",
+            "--workflow-run",
+            "{{run.id}}",
+            "--output",
+            "json",
+        ],
+        config_defaults={"encord_curate_poll_seconds": "300"},
+    ),
     "workbench.encord.pull": ToolEntry(
         name="workbench.encord.pull",
         description=(

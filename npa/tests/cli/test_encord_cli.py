@@ -10,7 +10,12 @@ from typer.testing import CliRunner
 
 import npa.clients.credentials as credentials_module
 from npa.cli.main import app
-from npa.workbench.encord.schemas import EncordToolError, PullManifest, PushReceipt
+from npa.workbench.encord.schemas import (
+    CurateReceipt,
+    EncordToolError,
+    PullManifest,
+    PushReceipt,
+)
 
 runner = CliRunner()
 
@@ -65,6 +70,26 @@ def _manifest(**overrides) -> PullManifest:
     return PullManifest(**payload)
 
 
+def _curate_receipt(**overrides) -> CurateReceipt:
+    payload = dict(
+        generated_at="2026-08-24T00:00:00+00:00",
+        encord_domain="https://api.encord.com",
+        folder_uuid="00000000-0000-0000-0000-000000000001",
+        folder_name="src",
+        collection_uuid="00000000-0000-0000-0000-0000000000c8",
+        collection_name="keepers",
+        collection_created=True,
+        preset_uuid="00000000-0000-0000-0000-00000000012c",
+        preset_name="npa-curate-run-1",
+        items_total=3,
+        items_selected=2,
+        status="done",
+        receipt_uri="s3://bkt/curate/curate_receipt.json",
+    )
+    payload.update(overrides)
+    return CurateReceipt(**payload)
+
+
 def _cleanup_summary(**overrides) -> dict:
     summary = {
         "folders_deleted": ["npa-e2e-run1"],
@@ -81,7 +106,8 @@ def test_encord_group_registered() -> None:
     result = runner.invoke(app, ["workbench", "encord", "--help"])
     assert result.exit_code == 0
     assert "push" in result.output and "pull" in result.output
-    assert "cleanup" in result.output
+    assert "curate" in result.output and "cleanup" in result.output
+    assert "system-info" in result.output
 
 
 def test_push_help_contains_contract_options() -> None:
@@ -269,6 +295,117 @@ def test_pull_tool_error_exits_nonzero(monkeypatch: pytest.MonkeyPatch) -> None:
          "--output-path", "s3://bkt/pull/"],
     )
     assert result.exit_code == 1 and "item error" in result.output
+
+
+def test_curate_help_contains_contract_options() -> None:
+    result = runner.invoke(app, ["workbench", "encord", "curate", "--help"])
+    assert result.exit_code == 0
+    for option in ("folder", "filter", "collection", "output-path", "poll-seconds"):
+        assert option in result.output
+
+
+def test_curate_happy_path_json(monkeypatch: pytest.MonkeyPatch) -> None:
+    captured: dict = {}
+
+    def fake_curate(**kwargs):
+        captured.update(kwargs)
+        return _curate_receipt()
+
+    monkeypatch.setattr("npa.sdk.workbench.encord.curate", fake_curate)
+    result = runner.invoke(
+        app,
+        [
+            "workbench", "encord", "curate",
+            "--folder", "src",
+            "--filter", "brightness:0.2:0.8,sharpness:0.3:1",
+            "--filter", "width:32:4096",
+            "--collection", "keepers",
+            "--output-path", "s3://bkt/curate/",
+            "--workflow-run", "run-1",
+            "--output", "json",
+        ],
+    )
+    assert result.exit_code == 0, result.output
+    payload = json.loads(result.output)
+    assert payload["schema"] == "npa.encord.curate_receipt.v1"
+    assert captured["folder"] == "src"
+    assert captured["filters"] == ["brightness:0.2:0.8,sharpness:0.3:1", "width:32:4096"]
+    assert captured["collection"] == "keepers"
+    assert captured["workflow_run"] == "run-1"
+
+
+def test_curate_text_output(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setattr(
+        "npa.sdk.workbench.encord.curate", lambda **kwargs: _curate_receipt()
+    )
+    result = runner.invoke(
+        app,
+        [
+            "workbench", "encord", "curate",
+            "--folder", "src",
+            "--filter", "width:1:100000",
+            "--collection", "keepers",
+            "--output-path", "s3://bkt/curate/",
+            "--output", "text",
+        ],
+    )
+    assert result.exit_code == 0, result.output
+    assert "curated 2 of 3 item(s)" in result.output
+
+
+def test_curate_rejects_local_output_path() -> None:
+    result = runner.invoke(
+        app,
+        [
+            "workbench", "encord", "curate",
+            "--folder", "src",
+            "--filter", "width:1:100000",
+            "--collection", "keepers",
+            "--output-path", "/tmp/out",
+        ],
+    )
+    assert result.exit_code == 1
+
+
+def test_curate_tool_error_exits_nonzero(monkeypatch: pytest.MonkeyPatch) -> None:
+    def fake_curate(**kwargs):
+        raise EncordToolError("Encord curate selected 0 items.")
+
+    monkeypatch.setattr("npa.sdk.workbench.encord.curate", fake_curate)
+    result = runner.invoke(
+        app,
+        [
+            "workbench", "encord", "curate",
+            "--folder", "src",
+            "--filter", "brightness:0.2:0.8",
+            "--collection", "keepers",
+            "--output-path", "s3://bkt/curate/",
+        ],
+    )
+    assert result.exit_code == 1
+    assert "selected 0 items" in result.output
+
+
+
+def test_system_info_reports_setup_without_touching_encord(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setenv("ENCORD_SSH_KEY_FILE", "/keys/encord.pem")
+    monkeypatch.setenv("ENCORD_DOMAIN", "https://api.us.encord.com")
+    result = runner.invoke(app, ["workbench", "encord", "system-info", "--output", "json"])
+    assert result.exit_code == 0, result.output
+    payload = json.loads(result.output)
+    assert payload["tool"] == "encord" and payload["status"] == "ok"
+    assert payload["encord_domain"] == "https://api.us.encord.com"
+    # Names only — never the credential value.
+    assert payload["credential_transports"] == ["ENCORD_SSH_KEY_FILE"]
+    assert "/keys/encord.pem" not in result.output
+    assert payload["schemas"]["push"] == "npa.encord.push_receipt.v1"
+    assert "width" in payload["curate_metrics"]
+    result = runner.invoke(app, ["workbench", "encord", "system-info"])
+    assert result.exit_code == 0
+    assert "credential_transports: ['ENCORD_SSH_KEY_FILE']" in result.output
+
 
 
 def test_cleanup_help_and_dry_run_text(monkeypatch: pytest.MonkeyPatch) -> None:

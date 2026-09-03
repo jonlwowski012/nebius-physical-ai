@@ -8,20 +8,25 @@ step:
    In the default *register* mode the bytes never leave your bucket; Encord
    references them through a cloud integration you create once. An *upload*
    mode copies the bytes into Encord-hosted storage instead.
-2. **You curate in the Encord app** — filter, review, build a Collection, or
-   annotate in a Project.
+2. **Curation** — either **`npa workbench encord curate`** selects a
+   Collection headlessly with declared quality filters that Encord evaluates
+   server-side, or you curate in the Encord app: filter, review, build a
+   Collection, or annotate in a Project.
 3. **`npa workbench encord pull`** — the curated Collection, Dataset, or a
    Project's labels come back to S3 as media + per-item JSON + a lineage
    manifest that downstream stages consume.
 
 > **TL;DR:** create an Encord API key and an S3-compatible integration (both
 > one-time, in the Encord app), point `~/.npa/credentials.yaml` at the key,
-> run `npa workbench health preflight --checks encord`, then `push` → curate in
-> the app → `pull`.
+> run `npa workbench health preflight --checks encord`, then `push` → `curate`
+> (or curate in the app) → `pull`.
 
-Verbs: `push`, `pull`, and `cleanup`. Every verb takes `--output json` and then
+Verbs: `push`, `curate`, `pull`, `cleanup`, and `system-info` (SDK pin, API
+domain, configured credential names). Every verb takes `--output json` and then
 prints exactly one JSON document on stdout, including on failure; diagnostics
-go to stderr.
+go to stderr. Design rationale and the live evidence behind the
+headless-curation filter shape:
+[encord-headless-curation.md](encord-headless-curation.md).
 
 ## File-format support in this integration
 
@@ -52,6 +57,7 @@ flowchart LR
 
     subgraph cli["npa workbench encord"]
         PUSH["push"]
+        CUR["curate<br/>(headless filters)"]
         PULL["pull"]
         CLN["cleanup"]
     end
@@ -71,6 +77,8 @@ flowchart LR
     INT -- "read-only bucket access" --> SRC
     PUSH -- "durable receipt" --> RCPT
     FOLDER -- "link_items (explicit)" --> DATASET
+    CUR == "quality-filter preset,<br/>evaluated server-side" ==> COLL
+    FOLDER --- CUR
     DATASET -.-> HCUR
     HCUR -.-> COLL
     COLL -- "--source + --source-id" --> PULL
@@ -79,8 +87,8 @@ flowchart LR
     CLN -- "--title-prefix" --> FOLDER
 ```
 
-Solid heavy arrows are the default register-mode paths; dashed arrows are the
-upload-mode variants and the human step. All verbs authenticate with your
+Solid heavy arrows are the default register-mode and headless-curation paths;
+dashed arrows are the upload-mode variants and the optional human step. All verbs authenticate with your
 Encord API key (`ENCORD_SSH_KEY_B64` or `ENCORD_SSH_KEY_FILE`); the cloud
 integration is a separate, Encord-side credential that only ever grants *read*
 on the media bucket. The receipt and manifest are written before any failure
@@ -140,7 +148,9 @@ npa workbench health preflight --checks encord
 
 `PASS ... Encord authenticated` means the key parses and the API accepts it.
 This gate catches a truncated key paste or an unregistered key in seconds
-instead of mid-push.
+instead of mid-push. `npa workbench encord system-info` shows, without calling
+Encord, which credential transport is configured (by name, never the value),
+the SDK version, the API domain, and the supported media and curate metrics.
 
 ## Push: S3 → Encord
 
@@ -177,10 +187,62 @@ npa workbench encord push \
   intent — then the final receipt with per-item uuids, sizes, ETags, and
   checksums.
 
-## Curate in the Encord app
+## Curate headlessly: quality filters, no human in the app
 
-Work exactly as you normally do in Encord: filter, review, build a Collection,
-or annotate in a Project. When you're done, the pull source is one of:
+`curate` closes the push → curate → pull loop without anyone opening Encord.
+You declare filters over Encord's **built-in data quality metrics**; the tool
+creates a run-scoped Encord filter preset from them, creates (or reuses) the
+target Collection, and Encord evaluates the selection **server-side** into it.
+No media bytes move, and the transient preset is deleted once the selection
+lands (the receipt keeps its exact JSON).
+
+```bash
+npa workbench encord curate \
+  --folder my-batch \
+  --filter brightness:0.2:0.8 --filter width:640:4096 \
+  --collection my-batch-keepers \
+  --output-path s3://<bucket>/encord/curate/
+```
+
+- `--filter metric:min:max` is repeatable, and one value may carry several
+  filters comma-separated (`brightness:0.2:0.8,sharpness:0.3:1`) — that is the
+  workflow-template form.
+- Supported metrics (allowlisted; unknown names fail closed before any Encord
+  call): `width`, `height`, `area`, `aspect-ratio` are **intrinsic** and work
+  on any folder immediately; `brightness`, `sharpness`, `file-size` are
+  **computed** quality metrics and match nothing until quality metrics have
+  been computed for the folder — a one-time action in the Encord app (open the
+  folder → upgrade/compute metrics; Encord exposes no API for it). Filter
+  ranges use Encord's own metric scales.
+- `--folder` is never created by curate (an absent folder means there is
+  nothing to curate); a `--collection` title is created when absent. An
+  existing Collection is reused only while it is empty: Encord's evaluation
+  only ever adds items, so curate refuses a populated Collection rather than
+  report a stale selection as this run's. Use run-scoped titles (the shipped
+  specs do) or `cleanup` the old one first.
+- Selection is asynchronous in Encord; curate polls until the Collection is
+  stable (`--poll-seconds`, default 300). **Zero selected items fails closed**
+  (exit 1) — an empty curated set silently feeding a training stage is a bug,
+  not a result.
+- The transient preset is titled `npa-curate-<run-id>` (an ad-hoc CLI run
+  without `--workflow-run` gets a UTC timestamp plus a random suffix) and is
+  deleted whether the run succeeded or crashed after creating it; the receipt's
+  `preset_deleted` flag records whether that delete went through, so a `false`
+  means `cleanup --title-prefix npa-curate-` is owed.
+- A durable receipt (`curate_receipt.json`, `npa.encord.curate_receipt.v1`)
+  records the parsed filters, the exact preset JSON sent to Encord, the preset
+  and Collection uuids, `items_total` (storage items in the folder when the
+  filters were evaluated) and `items_selected` — a write-ahead `status:
+  planned` copy lands before the first Encord mutation, and the final receipt
+  is written **before** any failure exit, like push and pull.
+- Pull the result with `--source collection --source-id <collection>`.
+
+## Or curate in the Encord app
+
+Human judgment still beats a brightness threshold for some batches. Work
+exactly as you normally do; the two paths compose (start from an
+agent-curated Collection and refine it, or skip `curate` entirely). When
+you're done, the pull source is one of:
 
 | You curated with… | Pull with |
 |---|---|
@@ -217,7 +279,7 @@ failure exit; any failed item fails the command closed.
 ## Cleanup: tear down run-scoped Encord state
 
 Everything the tool creates in Encord carries a run-scoped title whose run id
-embeds a UTC timestamp (for example `npa-e2e-*`), so nothing accumulates
+embeds a UTC timestamp (`npa-e2e-*`, `npa-curate-*`), so nothing accumulates
 anonymously. Tear a namespace down with:
 
 ```bash
@@ -243,6 +305,12 @@ receipt = encord.push(
     dataset="my-batch",
     output_path="s3://<bucket>/encord/push/",
 )
+curated = encord.curate(
+    folder="my-batch",
+    filters=["brightness:0.2:0.8", "width:640:4096"],
+    collection="my-batch-keepers",
+    output_path="s3://<bucket>/encord/curate/",
+)
 manifest = encord.pull(
     source="collection",
     source_id="my-batch-keepers",
@@ -251,9 +319,9 @@ manifest = encord.pull(
 summary = encord.cleanup(title_prefix="npa-e2e-", dry_run=True)
 ```
 
-`push` and `pull` return the Pydantic models (`PushReceipt` / `PullManifest`)
-that are also persisted to S3, and raise `EncordToolError` on the same
-fail-closed conditions as the CLI.
+All three return the Pydantic models (`PushReceipt` / `CurateReceipt` /
+`PullManifest`) that are also persisted to S3, and raise `EncordToolError` on
+the same fail-closed conditions as the CLI.
 
 ## Workflows
 
@@ -263,13 +331,18 @@ The shipped specs wrap the same tool
 - `encord-push.yaml` — production push, terminal at the receipt (for the
   human-curation path between workflows).
 - `encord-pull.yaml` — production pull, run after curation.
+- `encord-roundtrip-smoke.yaml` — live e2e proof: push fixture media into a
+  fresh `npa-e2e-<run-id>` folder + dataset, curate a run-scoped Collection
+  headlessly through a filter preset, then pull both the dataset and the
+  Collection straight back, no human step. Add `--var encord_transfer=upload`
+  for the byte-copy variant.
 
 Forward the credential to pods **by name only** — the base64 form survives the
 secret transport:
 
 ```bash
 export ENCORD_SSH_KEY_B64="$(base64 < ~/.ssh/encord-private-key.ed25519 | tr -d '\n')"
-npa workbench workflow submit npa/workflows/workbench/npa-workflows/encord-push.yaml \
+npa workbench workflow submit npa/workflows/workbench/npa-workflows/encord-roundtrip-smoke.yaml \
   --runtime --var bucket=<bucket> --var encord_integration=nebius-s3 \
   --secret-env ENCORD_SSH_KEY_B64 \
   --secret-env AWS_ACCESS_KEY_ID --secret-env AWS_SECRET_ACCESS_KEY
@@ -288,6 +361,9 @@ environment.)
 | `No Encord cloud integration titled '...'` | Title mismatch — the error lists the titles your key can see. |
 | `.mcap` files land as `experimental_error` in the receipt | MCAP cloud registration has no supported upload format in the pinned SDK yet; the receipt-visible error is intentional. Push videos/images with the default `--media`. |
 | Pull error `item has no signed URL (composite items...)` | Image groups / DICOM series expose no single signed URL and are not supported by pull. |
+| `Encord curate selected 0 items` with brightness/sharpness/file-size filters | Those are computed quality metrics: they match nothing until metrics have been computed for the folder (one-time, in the Encord app). Use intrinsic metrics (width, height, area, aspect-ratio), or compute the folder's metrics once and re-run. |
+| `Unknown filter metric '...'` | Only allowlisted metrics with a live-verified Encord filter shape are accepted — an unverified shape would hang Encord's server-side evaluation. The error lists the supported names. |
+| `curate` fails with `already holds items` | The `--collection` title resolved to a populated Collection; curate never adds to one. Use a fresh run-scoped title or `cleanup --title-prefix`. |
 | US-hosted org, auth fails with a valid key | Set `ENCORD_DOMAIN` (the SDK default is the EU endpoint). |
 | `health preflight` warns `encord SDK is not installed` | An Encord credential is configured but the optional extra is missing; `pip install 'npa[encord]'` only if you use the tool. |
 | A `--output json` command printed diagnostics you expected on stdout | stdout carries exactly one JSON document per verb (also on failure: `{"result": "error", ...}`); human-readable errors and progress go to stderr. |

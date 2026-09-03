@@ -11,6 +11,7 @@ ROOT = Path(__file__).resolve().parents[3]
 WORKFLOWS = ROOT / "npa" / "workflows" / "workbench" / "npa-workflows"
 PUSH = WORKFLOWS / "encord-push.yaml"
 PULL = WORKFLOWS / "encord-pull.yaml"
+ROUNDTRIP = WORKFLOWS / "encord-roundtrip-smoke.yaml"
 
 
 def test_push_spec_is_a_single_terminal_state() -> None:
@@ -37,16 +38,62 @@ def test_pull_spec_is_a_single_terminal_state() -> None:
     assert outputs[0].uri.endswith("manifest.json")
 
 
+def test_roundtrip_smoke_chains_push_curate_then_both_pulls() -> None:
+    spec = load_spec(ROUNDTRIP)
+    validate_spec(spec)
+    assert spec.name == "encord-roundtrip-smoke"
+    plan = build_plan(spec, run_id="t")
+    steps = [step.state for step in plan.steps]
+    assert steps == ["push", "curate", "pull", "pull-curated"]
+    assert spec.states["curate"].needs == ["push"]
+    assert spec.states["pull"].needs == ["curate"]
+    # needs states the true data dependency (the curate receipt), not the
+    # linear next-chain position.
+    assert spec.states["pull-curated"].needs == ["curate"]
+    # Schema chain: receipt -> curate receipt -> both pull manifests.
+    assert spec.states["push"].outputs[0].schema == "npa.encord.push_receipt.v1"
+    assert spec.states["curate"].inputs[0].schema == "npa.encord.push_receipt.v1"
+    assert spec.states["curate"].outputs[0].schema == "npa.encord.curate_receipt.v1"
+    assert spec.states["pull"].inputs[0].schema == "npa.encord.push_receipt.v1"
+    assert spec.states["pull-curated"].inputs[0].schema == "npa.encord.curate_receipt.v1"
+    # The e2e pulls the dataset push just created, resolved by run-scoped title.
+    assert spec.config["encord_source"] == "dataset"
+    assert spec.config["encord_source_id"] == spec.config["encord_dataset"]
+    # The curate stage uses an intrinsic metric so it evaluates on any folder
+    # without app-side quality-metric computation.
+    assert spec.config["encord_curate_filters"].startswith("width:")
+    # pull-curated pulls the headlessly curated Collection by run-scoped title.
+    curated_argv = next(s.argv for s in plan.steps if s.state == "pull-curated")
+    assert curated_argv[curated_argv.index("--source") + 1] == "collection"
+    assert curated_argv[curated_argv.index("--source-id") + 1] == "npa-e2e-t"
+
+
+def test_curate_argv_renders_every_flag() -> None:
+    argv = argv_for_tool("workbench.encord.curate")
+    assert argv[:4] == ["npa", "workbench", "encord", "curate"]
+    for flag in (
+        "--folder",
+        "--filter",
+        "--collection",
+        "--poll-seconds",
+        "--output-path",
+        "--workflow-run",
+        "--output",
+    ):
+        assert flag in argv, flag
+    assert "{{run.id}}" in argv
+
+
 def test_push_stage_hints_the_encord_secret() -> None:
     """Every Encord-facing verb needs the base64 key; the renderer says so."""
 
-    for ref in ("workbench.encord.push", "workbench.encord.pull"):
+    for ref in ("workbench.encord.push", "workbench.encord.curate", "workbench.encord.pull"):
         step = SimpleNamespace(tool_ref=ref, argv=[])
         assert secret_env_hints_for_plan([step]) == ("ENCORD_SSH_KEY_B64",), ref
 
 
 def test_specs_declare_cpu_resource_blocks() -> None:
-    for path in (PUSH, PULL):
+    for path in (PUSH, PULL, ROUNDTRIP):
         spec = load_spec(path)
         assert "cpu" in spec.resources, path.name
         profile = spec.resources["cpu"]

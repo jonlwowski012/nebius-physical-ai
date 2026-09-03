@@ -9,9 +9,11 @@ from __future__ import annotations
 from typing import Any
 
 from npa.workbench.encord.schemas import (
+    DEFAULT_CURATE_POLL_SECONDS,
     DEFAULT_MEDIA_FILTER,
     DEFAULT_POLL_TIMEOUT_SECONDS,
     DEFAULT_TRANSFER,
+    CurateReceipt,
     PullManifest,
     PushReceipt,
 )
@@ -45,6 +47,33 @@ def push(
         transfer=transfer,
         poll_timeout_seconds=poll_timeout_seconds,
         workflow_run=workflow_run,
+        user_client=user_client,
+        storage_client=storage_client,
+    )
+
+
+def curate(
+    *,
+    folder: str,
+    filters: list[str],
+    collection: str,
+    output_path: str,
+    workflow_run: str = "",
+    poll_seconds: float = DEFAULT_CURATE_POLL_SECONDS,
+    user_client: Any = None,
+    storage_client: Any = None,
+) -> CurateReceipt:
+    """Headlessly curate a folder into a Collection; write a receipt."""
+
+    from npa.workbench.encord.curate import run_curate
+
+    return run_curate(
+        folder=folder,
+        filters=filters,
+        collection=collection,
+        output_path=output_path,
+        workflow_run=workflow_run,
+        poll_seconds=poll_seconds,
         user_client=user_client,
         storage_client=storage_client,
     )
@@ -90,10 +119,21 @@ def cleanup(
     )
 
 
+def system_info() -> dict[str, Any]:
+    """Runtime information for the Encord tool; makes no Encord API call."""
+
+    from npa.workbench.encord.system_info import system_info_payload
+
+    return system_info_payload()
+
+
 __all__ = [
+    "CurateReceipt",
     "PullManifest",
     "PushReceipt",
     "cleanup",
+    "curate",
     "pull",
     "push",
+    "system_info",
 ]

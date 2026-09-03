@@ -8,6 +8,7 @@ from encord_fakes import ENDPOINT, FakeDataset, FakeFolder, FakeUserClient, fake
 from npa.workbench.encord.client import (
     CORD_STORAGE_LOCATION,
     default_user_client,
+    resolve_collection,
     resolve_dataset,
     resolve_folder,
     resolve_integration,
@@ -88,4 +89,25 @@ def test_resolve_public_endpoint_prefers_env() -> None:
     assert resolve_public_endpoint({"AWS_ENDPOINT_URL": ENDPOINT + "/"}) == ENDPOINT
     with pytest.raises(EncordToolError, match="No S3 endpoint"):
         resolve_public_endpoint({})
+
+
+
+def test_resolve_folder_create_flag_fails_closed() -> None:
+    client = FakeUserClient(folders=[])
+    with pytest.raises(EncordToolError, match="No Encord storage folder"):
+        resolve_folder(client, "absent", create=False)
+    assert client.created_folders == []
+
+
+def test_resolve_collection_create_paths() -> None:
+    client = FakeUserClient()
+    with pytest.raises(EncordToolError, match="No Encord collection"):
+        resolve_collection(client, "fresh")
+    ref = resolve_collection(client, "fresh", create_in_folder_uuid=fake_uuid(1))
+    assert ref.created is True and ref.title == "fresh"
+    assert ref.id == str(ref.obj.uuid)
+    # Idempotent re-resolution finds the created collection instead.
+    again = resolve_collection(client, "fresh")
+    assert again.created is False and again.id == ref.id
+
 

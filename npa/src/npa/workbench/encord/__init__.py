@@ -7,6 +7,7 @@ cleanly without it.
 
 from __future__ import annotations
 
+from npa.workbench.encord.curate import curate_receipt_uri_for
 from npa.workbench.encord.pull import pull_manifest_uri_for
 from npa.workbench.encord.push import push_receipt_uri_for
 from npa.workbench.encord.schemas import (
@@ -45,6 +46,7 @@ __all__ = [
     "PushedItem",
     "PushReceipt",
     "RoundtripReport",
+    "curate_receipt_uri_for",
     "pull_manifest_uri_for",
     "push_receipt_uri_for",
 ]
