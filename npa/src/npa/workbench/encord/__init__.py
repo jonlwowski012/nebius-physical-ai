@@ -7,6 +7,7 @@ cleanly without it.
 
 from __future__ import annotations
 
+from npa.workbench.encord.push import push_receipt_uri_for
 from npa.workbench.encord.schemas import (
     CURATE_RECEIPT_FILENAME,
     CURATE_RECEIPT_SCHEMA,
@@ -43,4 +44,5 @@ __all__ = [
     "PushedItem",
     "PushReceipt",
     "RoundtripReport",
+    "push_receipt_uri_for",
 ]

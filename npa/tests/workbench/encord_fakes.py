@@ -291,3 +291,41 @@ class FakeUserClient:
         return [item for item in self.items if str(item.uuid) in wanted]
 
 
+
+
+def folder_item(seed: int, key: str, *, metadata: bool = True, url: bool = True):
+    """A folder-inventory item carrying exact identity (metadata and/or url)."""
+
+    return SimpleNamespace(
+        uuid=fake_uuid(seed),
+        name=key,
+        client_metadata=({"npa": {"source_uri": f"s3://bkt/{key}"}} if metadata else {}),
+        url=f"{ENDPOINT}/bkt/{key}" if url else "",
+    )
+
+
+class FakeUploadFolder(FakeFolder):
+    def __init__(self) -> None:
+        super().__init__()
+        self.uploads: list[tuple[str, str, str]] = []  # (kind, path, title)
+
+    def upload_image(self, file_path, title=None, **kwargs):
+        self.uploads.append(("image", str(file_path), str(title)))
+        return uuid.UUID(int=200 + len(self.uploads))
+
+    def upload_video(self, file_path, title=None, **kwargs):
+        self.uploads.append(("video", str(file_path), str(title)))
+        return uuid.UUID(int=200 + len(self.uploads))
+
+
+class FakeDownloadStorage(FakeStorage):
+    def __init__(self, keys=None) -> None:
+        super().__init__(keys)
+        self.downloads: list[str] = []
+
+    def download_file(self, bucket_uri: str, local_path: str) -> str:
+        self.downloads.append(bucket_uri)
+        Path(local_path).write_bytes(b"media-bytes")
+        return local_path
+
+
