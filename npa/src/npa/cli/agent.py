@@ -195,7 +195,7 @@ DEFAULT_LLM_MODELS = (
     "Qwen/Qwen3-32B",
     "meta-llama/Llama-3.3-70B-Instruct",
     DEFAULT_LLM_MODEL,
-    "google/gemma-3-27b-it",
+    "MiniMaxAI/MiniMax-M3",
 )
 AGENT_UI_VERSION = "2026082901"
 ARTIFACT_DISCOVERY_CONTRACT = "s3-source-qualified-v1"

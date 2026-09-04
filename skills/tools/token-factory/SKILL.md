@@ -43,10 +43,11 @@ Every command takes local paths or `s3://` URIs for both input and output, and
 supports `--dry-run` (compute without writing the artifact) and
 `--output text|json`.
 
-**Caption images** — default model `google/gemma-3-27b-it`. The workbench only
+**Caption images** — default model `MiniMaxAI/MiniMax-M3`. The workbench only
 uses the public serverless endpoint; `Qwen/Qwen2.5-VL-72B-Instruct` is no longer
 served there since 2026-09-04 (dedicated endpoints only, unsupported by the
-workbench). `NPA_VLM_API_MODEL=<model>` repoints the default, and
+workbench). `NPA_VLM_API_MODEL=<model>` repoints the default (for workflow
+stages pass `--secret-env NPA_VLM_API_MODEL` at submit), and
 `npa workbench health preflight --checks token_factory` fails when the resolved
 model is not in `/v1/models`:
 
@@ -95,7 +96,7 @@ one has already cost real debugging time:
   text models on one key, exactly one — `openai/gpt-oss-120b` — was batch
   routable; `meta-llama/Llama-3.3-70B-Instruct`, `Qwen/Qwen3-32B`,
   `Qwen/Qwen3-30B-A3B-Instruct-2507`, `Qwen/Qwen3-235B-A22B-Instruct-2507`,
-  `google/gemma-3-27b-it`, `deepseek-ai/DeepSeek-V4-Flash`,
+  `MiniMaxAI/MiniMax-M3`, `deepseek-ai/DeepSeek-V4-Flash`,
   `nvidia/NVIDIA-Nemotron-3-Nano-30B-A3B`, and `zai-org/GLM-5.1` were not. That
   is why `DEFAULT_BATCH_MODEL` is `openai/gpt-oss-120b` and not
   `DEFAULT_TEXT_MODEL`. Treat the routable set as per-key and verify on a couple

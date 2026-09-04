@@ -71,7 +71,7 @@ where NPA substitutes its own endpoint.
 
 **Model roles** (verified available on Nebius Token Factory):
 
-- VLM captioning + the evaluator's attribute answering: `google/gemma-3-27b-it`
+- VLM captioning + the evaluator's attribute answering: `MiniMaxAI/MiniMax-M3`
 - Cosmos-family reasoning critic: `nvidia/Cosmos3-Super-Reasoner`
 - Prompt / MCQ LLM: `meta-llama/Llama-3.3-70B-Instruct`
 

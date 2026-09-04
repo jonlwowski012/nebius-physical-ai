@@ -35,10 +35,12 @@ DEFAULT_TEXT_MODEL = "meta-llama/Llama-3.3-70B-Instruct"
 # base URL below), so a default must be served there. Qwen/Qwen2.5-VL-72B-Instruct
 # left that tier on 2026-09-04 (its public endpoint was removed under the
 # August-31 deprecation; it remains dedicated-endpoint only, which the workbench
-# does not support) and every request 404ed. google/gemma-3-27b-it was the
-# vision model served that day, verified with an image chat completion.
+# does not support) and every request 404ed. MiniMaxAI/MiniMax-M3 is the
+# Nebius-recommended replacement; it is served on the public endpoint and was
+# verified with an image chat completion on 2026-09-04 (it returns a reasoning
+# trace alongside content, which chat_completion_text handles).
 # `npa workbench health preflight` fails when this model leaves /v1/models.
-DEFAULT_VISION_MODEL = "google/gemma-3-27b-it"
+DEFAULT_VISION_MODEL = "MiniMaxAI/MiniMax-M3"
 # Operator override for the hosted vision model, honored by caption, vlm-eval's
 # api backend, and the cosmos evaluator, so one variable repoints a running
 # workflow without changing its argv (and therefore its plan fingerprint).

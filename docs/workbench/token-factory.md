@@ -112,7 +112,7 @@ Caption a folder of images (local or S3):
 npa workbench token-factory caption \
   --input-path ./frames \
   --output-path /tmp/captions \
-  --model google/gemma-3-27b-it \
+  --model MiniMaxAI/MiniMax-M3 \
   --output json
 ```
 
@@ -275,7 +275,10 @@ if you are pointed at a non-default deployment.
   `npa workbench health preflight --checks token_factory`; it fails closed when
   the configured vision model is not in `/v1/models`. Pick one from
   `npa workbench token-factory models` and export `NPA_VLM_API_MODEL=<model>`
-  (or pass `--model`); the default is `google/gemma-3-27b-it`.
+  (or pass `--model`); for workflow stages add `--secret-env NPA_VLM_API_MODEL`
+  to `npa workbench workflow submit`, since pods do not inherit your shell. The
+  default is `MiniMaxAI/MiniMax-M3` (MiniMax community license; vendor terms
+  apply to captions and judgements you feed into downstream training).
 - **`NEBIUS_TOKEN_FACTORY_KEY is not set`** — provide the key via step 2; confirm with
   `npa workbench token-factory status`.
 - **`Token Factory request failed (401)`** — the key is invalid or revoked;

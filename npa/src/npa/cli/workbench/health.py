@@ -17,6 +17,11 @@ from typing import Optional
 import typer
 
 from npa.clients.credentials import load_credentials
+from npa.clients.token_factory import (
+    TokenFactoryClient,
+    resolve_config,
+    resolve_vision_model,
+)
 from npa.clients.huggingface import validate_hf_access, validate_hf_identity
 from npa.clients.kube import run_kubectl
 from npa.clients.storage import StorageClient
@@ -98,8 +103,6 @@ def _emit_results(results, *, output_json: bool) -> None:
 def _token_factory_verifier() -> list[str]:
     """Live Token Factory auth probe: resolve the key and list models."""
 
-    from npa.clients.token_factory import TokenFactoryClient, resolve_config
-
     config = resolve_config(require_api_key=True)
     return TokenFactoryClient(config=config).list_models()
 
@@ -152,8 +155,6 @@ def preflight_command(
     if offline:
         probes = CredentialProbes()
     else:
-        from npa.clients.token_factory import resolve_vision_model
-
         probes = CredentialProbes(
             hf_validator=validate_hf_identity,
             ngc_validator=_ngc_auth_verifier,

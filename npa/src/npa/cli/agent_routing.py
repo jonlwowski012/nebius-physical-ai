@@ -35,7 +35,7 @@ STANDARD_MODEL = "meta-llama/Llama-3.3-70B-Instruct"
 REASONING_MODEL = "nvidia/Cosmos3-Super-Reasoner"
 # Mirrors npa.clients.token_factory.DEFAULT_VISION_MODEL; this module is embedded
 # verbatim into the agent VM, so it cannot import it (drift test in test_agent_routing).
-VISION_MODEL = "google/gemma-3-27b-it"
+VISION_MODEL = "MiniMaxAI/MiniMax-M3"
 
 TIER_CHEAP = "cheap"
 TIER_STANDARD = "standard"

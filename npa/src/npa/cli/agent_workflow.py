@@ -1191,7 +1191,7 @@ def _data_factory_spec() -> dict[str, Any]:
                 "appearance_blur_ksize": "7",
                 "appearance_max_dimension": "256",
                 "appearance_regions_json": "",
-                "caption_model": "google/gemma-3-27b-it",
+                "caption_model": "MiniMaxAI/MiniMax-M3",
                 "vlm_backend": "api",
                 "max_images": "8",
                 "max_tokens": "512",

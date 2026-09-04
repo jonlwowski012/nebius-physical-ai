@@ -582,13 +582,13 @@ def test_preflight_token_factory_fails_closed_when_vision_model_left_public_endp
     assert result.exit_code == 1, result.output
     row = next(c for c in json.loads(result.output)["checks"] if c["name"] == "token_factory")
     assert row["status"] == "FAIL"
-    assert "google/gemma-3-27b-it" in row["summary"]
+    assert "MiniMaxAI/MiniMax-M3" in row["summary"]
     assert "NPA_VLM_API_MODEL" in row["remedy"]
 
 
 def test_preflight_token_factory_gate_follows_vision_model_override(monkeypatch) -> None:
     monkeypatch.setenv("NPA_VLM_API_MODEL", "openbmb/MiniCPM-V-4_5")
-    assert _preflight_token_factory(monkeypatch, ["google/gemma-3-27b-it"]).exit_code == 1
+    assert _preflight_token_factory(monkeypatch, ["MiniMaxAI/MiniMax-M3"]).exit_code == 1
     result = _preflight_token_factory(monkeypatch, ["openbmb/MiniCPM-V-4_5"])
     assert result.exit_code == 0, result.output
     assert "serves openbmb/MiniCPM-V-4_5" in result.output
@@ -596,8 +596,8 @@ def test_preflight_token_factory_gate_follows_vision_model_override(monkeypatch)
 
 def test_preflight_token_factory_passes_when_vision_model_is_served(monkeypatch) -> None:
     result = _preflight_token_factory(
-        monkeypatch, ["meta-llama/Llama-3.3-70B-Instruct", "google/gemma-3-27b-it"]
+        monkeypatch, ["meta-llama/Llama-3.3-70B-Instruct", "MiniMaxAI/MiniMax-M3"]
     )
     assert result.exit_code == 0, result.output
     assert "PASS" in result.output
-    assert "google/gemma-3-27b-it" in result.output
+    assert "MiniMaxAI/MiniMax-M3" in result.output

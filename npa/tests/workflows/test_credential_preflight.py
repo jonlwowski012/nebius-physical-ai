@@ -185,23 +185,23 @@ def test_token_factory_fails_closed_when_required_model_is_not_served() -> None:
     endpoint, after which every caption/judge stage 404s."""
     probes = CredentialProbes(
         token_factory_verifier=lambda: ["meta-llama/Llama-3.3-70B-Instruct"],
-        token_factory_required_models=("google/gemma-3-27b-it",),
+        token_factory_required_models=("MiniMaxAI/MiniMax-M3",),
     )
     result = check_token_factory(_Creds(token_factory_api_key="v1.abc"), probes)
     assert result.status == FAIL
-    assert result.summary.endswith("(s): google/gemma-3-27b-it.")
+    assert result.summary.endswith("(s): MiniMaxAI/MiniMax-M3.")
     assert "NPA_VLM_API_MODEL" in result.remedy
     assert "token-factory models" in result.remedy
 
 
 def test_token_factory_passes_and_names_the_served_required_model() -> None:
     probes = CredentialProbes(
-        token_factory_verifier=lambda: ["a", "google/gemma-3-27b-it"],
-        token_factory_required_models=("google/gemma-3-27b-it",),
+        token_factory_verifier=lambda: ["a", "MiniMaxAI/MiniMax-M3"],
+        token_factory_required_models=("MiniMaxAI/MiniMax-M3",),
     )
     result = check_token_factory(_Creds(token_factory_api_key="v1.abc"), probes)
     assert result.status == PASS
-    assert result.summary.endswith("serves google/gemma-3-27b-it).")
+    assert result.summary.endswith("serves MiniMaxAI/MiniMax-M3).")
 
 
 def test_run_credential_preflight_default_order() -> None:

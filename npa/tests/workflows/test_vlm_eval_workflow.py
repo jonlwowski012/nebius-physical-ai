@@ -138,7 +138,7 @@ def test_loop_judge_model_is_an_optional_knob() -> None:
     assert "--model" not in step.argv
 
     with_model = load_spec(SPECS / spec_name)
-    with_model.config["vlm_model"] = "google/gemma-3-27b-it"
+    with_model.config["vlm_model"] = "MiniMaxAI/MiniMax-M3"
     plan = build_plan(with_model, run_id="vlm-eval-workflow-test")
     (pinned,) = [s for s in plan.steps if s.argv]
-    assert _flag(pinned.argv, "--model") == "google/gemma-3-27b-it"
+    assert _flag(pinned.argv, "--model") == "MiniMaxAI/MiniMax-M3"

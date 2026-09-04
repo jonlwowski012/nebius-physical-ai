@@ -415,4 +415,4 @@ def test_default_vision_model_is_served_on_the_public_endpoint() -> None:
     on 2026-09-04; the default must be a model that tier still serves."""
     from npa.clients.token_factory import DEFAULT_VISION_MODEL
 
-    assert DEFAULT_VISION_MODEL == "google/gemma-3-27b-it"
+    assert DEFAULT_VISION_MODEL == "MiniMaxAI/MiniMax-M3"

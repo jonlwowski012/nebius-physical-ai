@@ -208,15 +208,19 @@ def test_usage_summary_handles_missing_or_malformed() -> None:
 
 
 def test_tier_models_mirror_token_factory_defaults() -> None:
-    """agent_routing (and agent_workflow) are embedded verbatim on the agent VM
-    and cannot import the client, so their literals must be kept in step."""
-    import inspect
-
+    """agent_routing and agent_workflow are embedded verbatim on the agent VM and
+    content_agents ships in a narrow image without the client, so their literals
+    must be kept in step by hand."""
     from npa.cli import agent, agent_workflow
     from npa.clients import token_factory as tf
+    from npa.workflows import content_agents
 
     assert r.VISION_MODEL == tf.DEFAULT_VISION_MODEL
     assert r.STANDARD_MODEL == tf.DEFAULT_TEXT_MODEL
     assert r.REASONING_MODEL == tf.DEFAULT_REASONER_MODEL
     assert tf.DEFAULT_VISION_MODEL in agent.DEFAULT_LLM_MODELS
-    assert f'"caption_model": "{tf.DEFAULT_VISION_MODEL}"' in inspect.getsource(agent_workflow)
+    spec = agent_workflow._data_factory_spec()
+    assert spec["config_runtime"]["caption_model"] == tf.DEFAULT_VISION_MODEL
+    assert content_agents.DEFAULT_MODEL == tf.DEFAULT_VISION_MODEL
+    assert content_agents.VISION_MODEL_ENV == tf.VISION_MODEL_ENV
+    assert content_agents.DEFAULT_BASE_URL == tf.DEFAULT_BASE_URL

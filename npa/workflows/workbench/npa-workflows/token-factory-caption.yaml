@@ -8,7 +8,7 @@ metadata:
 config:
   bucket: example-bucket
   prefix: "runs/{{run.id}}/token-factory"
-  caption_model: "google/gemma-3-27b-it"
+  caption_model: "MiniMaxAI/MiniMax-M3"
   max_images: "50"
   max_tokens: "512"
 

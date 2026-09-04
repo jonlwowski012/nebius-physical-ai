@@ -270,9 +270,11 @@ def check_token_factory(credentials: Any, probes: CredentialProbes) -> CheckResu
                 f"model(s): {', '.join(missing)}."
             ),
             remedy=(
-                "Pick a served model from `npa workbench token-factory models` "
-                f"and export {VISION_MODEL_ENV}=<model> (or pass --model / set the "
-                "spec's caption_model / vlm_model), then re-run this preflight."
+                "Pick a served model from `npa workbench token-factory models` and "
+                f"export {VISION_MODEL_ENV}=<model>, then re-run this preflight. For "
+                f"workflow stages also pass `--secret-env {VISION_MODEL_ENV}` to "
+                "`npa workbench workflow submit` (pods do not inherit your shell), "
+                "or set the spec's caption_model / vlm_model."
             ),
             details=(f"{len(models)} models served; required: {', '.join(required)}",),
         )

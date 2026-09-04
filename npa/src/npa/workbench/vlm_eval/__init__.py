@@ -416,11 +416,14 @@ def evaluate_vlm(
         # the client asks for that one instead of the 7B default (a mismatch is a
         # 404 from the server). See `_vllm_serve_preamble` in the workflow render.
         effective_model = os.environ.get(SELF_HOSTED_MODEL_ENV, "").strip() or effective_model
-    if backend == "api" and effective_model == DEFAULT_MODEL:
+    if backend == "api":
         # DEFAULT_MODEL is the self-hosted (vLLM) default, which the hosted API
-        # does not serve; use the Token Factory vision default (or its
-        # NPA_VLM_API_MODEL override) unless the caller overrode --model.
-        effective_model = resolve_vision_model()
+        # does not serve; map it to the Token Factory vision default. Like every
+        # other hosted vision caller, an explicit hosted default still yields to
+        # NPA_VLM_API_MODEL, while any other explicit --model wins.
+        effective_model = resolve_vision_model(
+            "" if effective_model == DEFAULT_MODEL else effective_model
+        )
     effective_rubric = _load_rubric(rubric=rubric, rubric_path=rubric_path)
     if score is not None:
         _validate_score_override(score)
@@ -661,6 +664,7 @@ def evaluate_rollout_set(
 
     started_at = time.monotonic()
     rollouts: list[VlmLoopRollout] = []
+    judged_models: list[str] = []
     for rollout_uri in discover_rollouts(input_path):
         rollout_id = _rollout_id_for(rollout_uri)
         result = evaluate_vlm(
@@ -681,6 +685,8 @@ def evaluate_rollout_set(
         written = write_result(
             asdict(result), result_uri=result.result_uri, storage_client=storage_client
         )
+        if result.model and result.model not in judged_models:
+            judged_models.append(result.model)
         rollouts.append(
             VlmLoopRollout(
                 rollout_id=rollout_id,
@@ -693,9 +699,11 @@ def evaluate_rollout_set(
             )
         )
 
+    # Record the model that answered, not the CLI value: the api backend maps
+    # the vLLM default to the hosted model (or NPA_VLM_API_MODEL).
     report = aggregate_loop_report(
         rollouts,
-        model=model,
+        model=judged_models[0] if len(judged_models) == 1 else model,
         frame_selection=_normalize_frame_selection(frame_selection),
         success_threshold=success_threshold,
         output_dir=output_path,

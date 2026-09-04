@@ -65,6 +65,16 @@ def test_api_backend_model_env_override_repoints_the_default(tmp_path, monkeypat
         score=0.9,
     )
     assert result.model == "openbmb/MiniCPM-V-4_5"
+    from npa.clients.token_factory import DEFAULT_VISION_MODEL
+
+    pinned_default = evaluate_vlm(
+        input_path="s3://ignored",
+        output_path=str(tmp_path / "out3.json"),
+        backend="api",
+        model=DEFAULT_VISION_MODEL,
+        score=0.9,
+    )
+    assert pinned_default.model == "openbmb/MiniCPM-V-4_5"  # same rule as caption
     explicit = evaluate_vlm(
         input_path="s3://ignored",
         output_path=str(tmp_path / "out2.json"),

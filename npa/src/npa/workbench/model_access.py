@@ -260,15 +260,17 @@ WORKBENCH_ASSETS: tuple[GatedAsset, ...] = (
     ),
     GatedAsset("Qwen/Qwen2-VL-7B-Instruct", HF, ("vlm_eval",), False),
     GatedAsset(
-        "google/gemma-3-27b-it",
+        "MiniMaxAI/MiniMax-M3",
         HF,
         ("vlm_eval", "token_factory"),
-        True,
-        note="Only needed to self-host; Token Factory serves it hosted (no HF gating).",
-        official_url="https://huggingface.co/google/gemma-3-27b-it",
-        terms_revision="gemma-terms-of-use-current",
-        revision="005ad3404e59d6023443cb575daa05336842228a",
-        probe_path="model-00001-of-00012.safetensors",
+        False,
+        note=(
+            "Hosted Token Factory vision default (MiniMax community license; vendor "
+            "terms apply to outputs). Public on HF; only needed to self-host."
+        ),
+        official_url="https://huggingface.co/MiniMaxAI/MiniMax-M3",
+        terms_revision="minimax-community-license-current",
+        revision="f0e1c1e04d40177e4673a22097036854f536e9c0",
     ),
     GatedAsset("lerobot/pusht", HF, ("lerobot", "sim2real"), False),
     GatedAsset(
