@@ -48,7 +48,7 @@ def _write_shard(root: Path, shard: str, count: int) -> None:
     path.write_text(
         json.dumps(
             {
-                "model": "Qwen/Qwen2.5-VL-72B-Instruct",
+                "model": "google/gemma-3-27b-it",
                 "captions": [{"image": f"{shard}-{i}.png", "caption": "x"} for i in range(count)],
             }
         ),

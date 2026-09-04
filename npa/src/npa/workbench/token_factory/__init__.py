@@ -44,6 +44,7 @@ from npa.clients.token_factory import (
     DEFAULT_REASONER_MODEL,
     DEFAULT_TEXT_MODEL,
     DEFAULT_VISION_MODEL,
+    resolve_vision_model,
     TokenFactoryClient,
     TokenFactoryError,
     split_reasoning,
@@ -238,7 +239,7 @@ def caption_images(
     _require(output_path, "output_path")
     if max_images <= 0:
         raise TokenFactoryToolError("--max-images must be positive")
-    effective_model = model or DEFAULT_VISION_MODEL
+    effective_model = resolve_vision_model(model)
     effective_instruction = (instruction or DEFAULT_CAPTION_INSTRUCTION).strip()
     active = client or _default_client()
 

@@ -33,7 +33,9 @@ from typing import Any, Iterable, Sequence
 CHEAP_MODEL = "Qwen/Qwen3-32B"
 STANDARD_MODEL = "meta-llama/Llama-3.3-70B-Instruct"
 REASONING_MODEL = "nvidia/Cosmos3-Super-Reasoner"
-VISION_MODEL = "Qwen/Qwen2.5-VL-72B-Instruct"
+# Keep in step with npa.clients.token_factory.DEFAULT_VISION_MODEL (this module
+# is embedded verbatim into the agent VM, so it cannot import it).
+VISION_MODEL = "google/gemma-3-27b-it"
 
 TIER_CHEAP = "cheap"
 TIER_STANDARD = "standard"

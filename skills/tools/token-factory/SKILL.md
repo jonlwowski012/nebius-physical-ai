@@ -43,7 +43,11 @@ Every command takes local paths or `s3://` URIs for both input and output, and
 supports `--dry-run` (compute without writing the artifact) and
 `--output text|json`.
 
-**Caption images** — default model `Qwen/Qwen2.5-VL-72B-Instruct`:
+**Caption images** — default model `google/gemma-3-27b-it` (the vision model
+Token Factory served after retiring `Qwen/Qwen2.5-VL-72B-Instruct` on
+2026-09-04; `NPA_VLM_API_MODEL=<model>` repoints the default, and
+`npa workbench health preflight --checks token_factory` fails when the resolved
+model is not in `/v1/models`):
 
 ```bash
 npa workbench token-factory caption \

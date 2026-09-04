@@ -554,3 +554,51 @@ def test_access_save_env_credentials_json_stays_valid_and_redacted(monkeypatch) 
     payload = json.loads(result.output)
     assert payload["credential_persistence"]["persisted"] == ["HF_TOKEN"]
     assert secret not in result.output
+
+
+def test_preflight_token_factory_fails_closed_on_retired_vision_model(monkeypatch) -> None:
+    """A key that authenticates but whose /v1/models lacks the configured vision
+    model must exit 1: this is how the 2026-09-04 Qwen2.5-VL-72B retirement
+    surfaces before a run instead of as 404s inside caption/judge stages."""
+    from npa.cli.workbench import health as health_module
+
+    class _Creds(_EmptyCreds):
+        token_factory_api_key = "v1.present"
+
+    monkeypatch.delenv("NPA_VLM_API_MODEL", raising=False)
+    monkeypatch.setattr(health_module, "load_credentials", lambda *a, **k: _Creds())
+    monkeypatch.setattr(
+        health_module,
+        "_token_factory_verifier",
+        lambda: ["meta-llama/Llama-3.3-70B-Instruct", "openai/gpt-oss-120b"],
+    )
+    result = runner.invoke(
+        app, ["workbench", "health", "preflight", "--checks", "token_factory", "--json"]
+    )
+    assert result.exit_code == 1, result.output
+    payload = json.loads(result.output)
+    row = next(c for c in payload["checks"] if c["name"] == "token_factory")
+    assert row["status"] == "FAIL"
+    assert "google/gemma-3-27b-it" in row["summary"]
+    assert "NPA_VLM_API_MODEL" in row["remedy"]
+
+
+def test_preflight_token_factory_passes_when_vision_model_is_served(monkeypatch) -> None:
+    from npa.cli.workbench import health as health_module
+
+    class _Creds(_EmptyCreds):
+        token_factory_api_key = "v1.present"
+
+    monkeypatch.delenv("NPA_VLM_API_MODEL", raising=False)
+    monkeypatch.setattr(health_module, "load_credentials", lambda *a, **k: _Creds())
+    monkeypatch.setattr(
+        health_module,
+        "_token_factory_verifier",
+        lambda: ["meta-llama/Llama-3.3-70B-Instruct", "google/gemma-3-27b-it"],
+    )
+    result = runner.invoke(
+        app, ["workbench", "health", "preflight", "--checks", "token_factory"]
+    )
+    assert result.exit_code == 0, result.output
+    assert "PASS" in result.output
+    assert "google/gemma-3-27b-it" in result.output

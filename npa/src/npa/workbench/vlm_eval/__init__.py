@@ -26,6 +26,8 @@ import numpy as np
 from PIL import Image
 from urllib.parse import urlparse
 
+from npa.clients.token_factory import VISION_MODEL_ENV
+
 if TYPE_CHECKING:
     from npa.clients.storage import StorageClient
 
@@ -44,6 +46,12 @@ READY_TIMEOUT_ENV = "NPA_VLM_READY_TIMEOUT_S"
 #: Set by a job that starts its own vLLM server, so the eval client requests the
 #: model that server actually loaded rather than ``DEFAULT_MODEL``.
 SELF_HOSTED_MODEL_ENV = "NPA_VLM_SELF_HOSTED_MODEL"
+#: Hosted (Token Factory) judge model when ``--model`` is left at the vLLM
+#: default; lets an operator repoint a running workflow when the service
+#: retires a model (Qwen2.5-VL-72B disappeared from Token Factory on
+#: 2026-09-04 and every api-backend judge 404ed). An explicit --model wins.
+#: Same variable the Token Factory client and ``health preflight`` use.
+API_MODEL_ENV = VISION_MODEL_ENV
 DEFAULT_API_KEY_ENV = "VLM_EVAL_API_KEY"
 DEFAULT_RUBRIC = (
     "Score whether the rollout completes the requested physical task. "
@@ -416,11 +424,12 @@ def evaluate_vlm(
         effective_model = os.environ.get(SELF_HOSTED_MODEL_ENV, "").strip() or effective_model
     if backend == "api" and effective_model == DEFAULT_MODEL:
         # DEFAULT_MODEL is the self-hosted (vLLM) default. The hosted Token
-        # Factory API does not serve it (requests 404); use the vision model
-        # Token Factory actually serves unless the caller overrode --model.
-        from npa.clients.token_factory import DEFAULT_VISION_MODEL
+        # Factory API does not serve it (requests 404); use the operator's
+        # NPA_VLM_API_MODEL when set, else the shared Token Factory vision
+        # default, unless the caller overrode --model.
+        from npa.clients.token_factory import resolve_vision_model
 
-        effective_model = DEFAULT_VISION_MODEL
+        effective_model = resolve_vision_model()
     effective_rubric = _load_rubric(rubric=rubric, rubric_path=rubric_path)
     if score is not None:
         _validate_score_override(score)

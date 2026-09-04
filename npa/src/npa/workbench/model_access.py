@@ -260,7 +260,15 @@ WORKBENCH_ASSETS: tuple[GatedAsset, ...] = (
     ),
     GatedAsset("Qwen/Qwen2-VL-7B-Instruct", HF, ("vlm_eval",), False),
     GatedAsset(
-        "Qwen/Qwen2.5-VL-72B-Instruct", HF, ("vlm_eval", "token_factory"), False
+        "google/gemma-3-27b-it",
+        HF,
+        ("vlm_eval", "token_factory"),
+        True,
+        note="Only needed to self-host; Token Factory serves it hosted (no HF gating).",
+        official_url="https://huggingface.co/google/gemma-3-27b-it",
+        terms_revision="gemma-terms-of-use-current",
+        revision="005ad3404e59d6023443cb575daa05336842228a",
+        probe_path="model-00001-of-00012.safetensors",
     ),
     GatedAsset("lerobot/pusht", HF, ("lerobot", "sim2real"), False),
     GatedAsset(
