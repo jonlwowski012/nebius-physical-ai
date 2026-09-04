@@ -261,16 +261,14 @@ WORKBENCH_ASSETS: tuple[GatedAsset, ...] = (
     GatedAsset("Qwen/Qwen2-VL-7B-Instruct", HF, ("vlm_eval",), False),
     GatedAsset(
         "MiniMaxAI/MiniMax-M3",
-        HF,
+        TOKEN_FACTORY,
         ("vlm_eval", "token_factory"),
         False,
         note=(
-            "Hosted Token Factory vision default (MiniMax community license; vendor "
-            "terms apply to outputs). Public on HF; only needed to self-host."
+            "Hosted vision/reasoning default (MiniMax community license; vendor "
+            "terms apply to outputs); verify availability through Token Factory, "
+            "not Hugging Face."
         ),
-        official_url="https://huggingface.co/MiniMaxAI/MiniMax-M3",
-        terms_revision="minimax-community-license-current",
-        revision="f0e1c1e04d40177e4673a22097036854f536e9c0",
     ),
     GatedAsset("lerobot/pusht", HF, ("lerobot", "sim2real"), False),
     GatedAsset(

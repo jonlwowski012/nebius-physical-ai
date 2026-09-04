@@ -418,9 +418,7 @@ def evaluate_vlm(
         effective_model = os.environ.get(SELF_HOSTED_MODEL_ENV, "").strip() or effective_model
     if backend == "api":
         # DEFAULT_MODEL is the self-hosted (vLLM) default, which the hosted API
-        # does not serve; map it to the Token Factory vision default. Like every
-        # other hosted vision caller, an explicit hosted default still yields to
-        # NPA_VLM_API_MODEL, while any other explicit --model wins.
+        # does not serve; map it to "unchosen" so the shared resolver applies.
         effective_model = resolve_vision_model(
             "" if effective_model == DEFAULT_MODEL else effective_model
         )
@@ -664,7 +662,7 @@ def evaluate_rollout_set(
 
     started_at = time.monotonic()
     rollouts: list[VlmLoopRollout] = []
-    judged_models: list[str] = []
+    judged_model = model
     for rollout_uri in discover_rollouts(input_path):
         rollout_id = _rollout_id_for(rollout_uri)
         result = evaluate_vlm(
@@ -685,8 +683,7 @@ def evaluate_rollout_set(
         written = write_result(
             asdict(result), result_uri=result.result_uri, storage_client=storage_client
         )
-        if result.model and result.model not in judged_models:
-            judged_models.append(result.model)
+        judged_model = result.model or judged_model
         rollouts.append(
             VlmLoopRollout(
                 rollout_id=rollout_id,
@@ -699,11 +696,9 @@ def evaluate_rollout_set(
             )
         )
 
-    # Record the model that answered, not the CLI value: the api backend maps
-    # the vLLM default to the hosted model (or NPA_VLM_API_MODEL).
     report = aggregate_loop_report(
         rollouts,
-        model=judged_models[0] if len(judged_models) == 1 else model,
+        model=judged_model,  # the model that answered, not the CLI value
         frame_selection=_normalize_frame_selection(frame_selection),
         success_threshold=success_threshold,
         output_dir=output_path,

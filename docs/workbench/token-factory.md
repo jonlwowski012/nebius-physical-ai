@@ -268,17 +268,19 @@ if you are pointed at a non-default deployment.
 
 ## Troubleshooting
 
-- **`404 The model ... does not exist` from a caption or `vlm-eval --backend api`
-  stage** — the model is no longer served on Token Factory's **public serverless
-  endpoint**, which is the only tier the workbench calls. `Qwen/Qwen2.5-VL-72B-Instruct`
-  left it on 2026-09-04 (August-31 public-endpoint deprecation; the model remains
+- **`404 The model ... does not exist` from a caption, `vlm-eval --backend api`,
+  or `reason` stage** — the model is no longer served on Token Factory's
+  **public serverless endpoint**, the only tier the workbench calls
+  (`Qwen/Qwen2.5-VL-72B-Instruct` and `nvidia/Cosmos3-Super-Reasoner` left it on
+  2026-09-04 under the August-31 public-endpoint deprecation; they remain
   dedicated-endpoint only, which the workbench does not support). Run
-  `npa workbench health preflight --checks token_factory`; it fails closed when
-  the configured vision model is not in `/v1/models`. Pick one from
+  `npa workbench health preflight --checks token_factory`; it fails closed when a
+  configured default is not in `/v1/models`. Pick one from
   `npa workbench token-factory models` and export `NPA_VLM_API_MODEL=<model>`
-  (or pass `--model`); for workflow stages add `--secret-env NPA_VLM_API_MODEL`
-  to `npa workbench workflow submit`, since pods do not inherit your shell. The
-  default is `MiniMaxAI/MiniMax-M3` (MiniMax community license; vendor terms
+  (caption, vlm-eval, evaluator) or `NPA_REASONER_API_MODEL=<model>` (reason), or
+  pass `--model`; for workflow stages add `--secret-env <NAME>` to
+  `npa workbench workflow submit`, since pods do not inherit your shell. Both
+  default to `MiniMaxAI/MiniMax-M3` (MiniMax community license; vendor terms
   apply to captions and judgements you feed into downstream training).
 - **`NEBIUS_TOKEN_FACTORY_KEY is not set`** — provide the key via step 2; confirm with
   `npa workbench token-factory status`.

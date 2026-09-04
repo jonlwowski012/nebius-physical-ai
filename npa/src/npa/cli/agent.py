@@ -143,6 +143,7 @@ from npa.cli.agent_contracts import (  # noqa: F401 - public compatibility expor
     rendered_agent_ui_html,
 )
 from npa.cli.agent_embed import embedded_python_source
+from npa.clients.token_factory import DEFAULT_REASONER_MODEL
 from npa.cli.agent_site import (
     DEFAULT_LICHTBLICK_PORT,
     nginx_agent_site_body as _nginx_agent_site_body,
@@ -188,9 +189,7 @@ DEFAULT_AGENT_NAME = "agent"
 DEFAULT_AGENT_IMAGE_FAMILY = "ubuntu24.04-driverless"
 DEFAULT_AGENT_USER = "npa"
 DEFAULT_LLM_PROVIDER = "token_factory"
-# Mirrors npa.clients.token_factory.DEFAULT_REASONER_MODEL (drift test in
-# test_agent_routing); also the vision-tier model, so the ladder lists it once.
-DEFAULT_LLM_MODEL = "MiniMaxAI/MiniMax-M3"
+DEFAULT_LLM_MODEL = DEFAULT_REASONER_MODEL
 # Cost-ordered ladder; per-turn routing reorders it, while no-routing paths and
 # the model picker retain the cheap workhorse as their default.
 DEFAULT_LLM_MODELS = (

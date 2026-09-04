@@ -31,26 +31,20 @@ DEFAULT_TIMEOUT_S = 600.0
 DEFAULT_RETRY_ATTEMPTS = 4
 RETRYABLE_STATUS_CODES = frozenset({429, 500, 502, 503, 504, 529})
 DEFAULT_TEXT_MODEL = "meta-llama/Llama-3.3-70B-Instruct"
-# The workbench only uses Token Factory's public serverless endpoint (the shared
-# base URL below), so a default must be served there. Qwen/Qwen2.5-VL-72B-Instruct
-# left that tier on 2026-09-04 (its public endpoint was removed under the
-# August-31 deprecation; it remains dedicated-endpoint only, which the workbench
-# does not support) and every request 404ed. MiniMaxAI/MiniMax-M3 is the
-# Nebius-recommended replacement; it is served on the public endpoint and was
-# verified with an image chat completion on 2026-09-04 (it returns a reasoning
-# trace alongside content, which chat_completion_text handles).
-# `npa workbench health preflight` fails when this model leaves /v1/models.
+# The workbench only calls Token Factory's public serverless endpoint, so every
+# default here must be served there (Qwen/Qwen2.5-VL-72B-Instruct and
+# nvidia/Cosmos3-Super-Reasoner left that tier on 2026-09-04). MiniMax-M3 is the
+# Nebius-recommended multimodal replacement; `npa workbench health preflight`
+# fails closed when a default is missing from /v1/models.
 DEFAULT_VISION_MODEL = "MiniMaxAI/MiniMax-M3"
-# Operator override for the hosted vision model, honored by caption, vlm-eval's
-# api backend, and the cosmos evaluator, so one variable repoints a running
-# workflow without changing its argv (and therefore its plan fingerprint).
-VISION_MODEL_ENV = "NPA_VLM_API_MODEL"
-# Hosted vision-language reasoner for `token-factory reason` and the agent's
-# reasoning tier. nvidia/Cosmos3-Super-Reasoner was also absent from the public
-# serverless /v1/models on 2026-09-04; MiniMax-M3 is the Nebius-recommended
-# replacement (multimodal, returns a reasoning trace). Sim2Real's Cosmos3
-# evaluator keeps its own DEFAULT_COSMOS3_MODEL. `health preflight` gates on this.
+# One multimodal model serves both tiers. Sim2Real's Cosmos3 evaluator keeps its
+# own DEFAULT_COSMOS3_MODEL.
 DEFAULT_REASONER_MODEL = DEFAULT_VISION_MODEL
+# Operator overrides for the hosted models. Repointing via env leaves a running
+# workflow's argv (and plan fingerprint) unchanged; pods receive them through
+# `workflow submit --secret-env <NAME>`.
+VISION_MODEL_ENV = "NPA_VLM_API_MODEL"
+REASONER_MODEL_ENV = "NPA_REASONER_API_MODEL"
 
 # Batch inference is a separate entitlement from real-time chat: a model can
 # serve /chat/completions and still reject a batch operation. The batch default
@@ -151,21 +145,34 @@ def resolve_config(
     return TokenFactoryConfig(base_url=resolved_base, api_key=resolved_key, timeout_s=timeout_s)
 
 
-def resolve_vision_model(model: str = "", *, environ: dict[str, str] | None = None) -> str:
-    """Return the hosted vision model a caller should request.
-
-    An explicit ``model`` other than :data:`DEFAULT_VISION_MODEL` wins. Otherwise
-    the :data:`VISION_MODEL_ENV` override applies, then the default. Passing the
-    default explicitly (CLI option defaults do) counts as "not chosen", so the
-    override can repoint it; the default is therefore not pinnable against the
-    override.
-    """
-
+def _resolve_hosted_model(
+    model: str, *, default: str, env_key: str, environ: dict[str, str] | None
+) -> str:
     chosen = model.strip()
-    if chosen and chosen != DEFAULT_VISION_MODEL:
+    if chosen and chosen != default:
         return chosen
     env = os.environ if environ is None else environ
-    return _first_env(env, (VISION_MODEL_ENV,)) or DEFAULT_VISION_MODEL
+    return _first_env(env, (env_key,)) or default
+
+
+def resolve_vision_model(model: str = "", *, environ: dict[str, str] | None = None) -> str:
+    """Explicit non-default ``model`` wins; else ``$NPA_VLM_API_MODEL``, else the default.
+
+    The default passed explicitly counts as unchosen, so CLI option defaults stay
+    overridable by the environment.
+    """
+
+    return _resolve_hosted_model(
+        model, default=DEFAULT_VISION_MODEL, env_key=VISION_MODEL_ENV, environ=environ
+    )
+
+
+def resolve_reasoner_model(model: str = "", *, environ: dict[str, str] | None = None) -> str:
+    """Same rule as :func:`resolve_vision_model` for the reasoner (``$NPA_REASONER_API_MODEL``)."""
+
+    return _resolve_hosted_model(
+        model, default=DEFAULT_REASONER_MODEL, env_key=REASONER_MODEL_ENV, environ=environ
+    )
 
 
 def validate_model_access(api_key: str, model: str) -> TokenFactoryAccessResult:

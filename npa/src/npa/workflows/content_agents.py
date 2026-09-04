@@ -41,8 +41,8 @@ PROVENANCE_SCHEMA = "npa.content_agents.provenance.v1"
 SCENE_SPEC_SCHEMA = "npa.sim2real.manip_scene_spec.v1"
 # Mirrors npa.clients.token_factory.{DEFAULT_VISION_MODEL, VISION_MODEL_ENV,
 # DEFAULT_BASE_URL}. The content-agents image ships only this module and
-# clients/storage.py (no httpx), so it cannot import the client; a drift test in
-# test_agent_routing keeps the literals in step.
+# clients/storage.py (no httpx), so it cannot import the client;
+# tests/test_model_default_drift.py keeps the literals in step.
 DEFAULT_MODEL = "MiniMaxAI/MiniMax-M3"
 VISION_MODEL_ENV = "NPA_VLM_API_MODEL"
 DEFAULT_BASE_URL = "https://api.tokenfactory.nebius.com/v1/"

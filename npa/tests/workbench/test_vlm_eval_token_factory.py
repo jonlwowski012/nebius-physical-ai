@@ -55,7 +55,7 @@ def test_api_backend_model_env_override_repoints_the_default(tmp_path, monkeypat
     """NPA_VLM_API_MODEL repoints the api-backend default without changing a
     workflow's argv, so a running workflow stays resumable when a model leaves
     the public endpoint. An explicit --model still wins."""
-    from npa.clients.token_factory import VISION_MODEL_ENV
+    from npa.clients.token_factory import DEFAULT_VISION_MODEL, VISION_MODEL_ENV
 
     monkeypatch.setenv(VISION_MODEL_ENV, "openbmb/MiniCPM-V-4_5")
     result = evaluate_vlm(
@@ -65,8 +65,6 @@ def test_api_backend_model_env_override_repoints_the_default(tmp_path, monkeypat
         score=0.9,
     )
     assert result.model == "openbmb/MiniCPM-V-4_5"
-    from npa.clients.token_factory import DEFAULT_VISION_MODEL
-
     pinned_default = evaluate_vlm(
         input_path="s3://ignored",
         output_path=str(tmp_path / "out3.json"),

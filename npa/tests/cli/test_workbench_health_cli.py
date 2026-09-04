@@ -570,12 +570,9 @@ def _preflight_token_factory(monkeypatch, served: list[str], *args: str):
     )
 
 
-def test_preflight_token_factory_fails_closed_when_vision_model_left_public_endpoint(
+def test_preflight_token_factory_fails_closed_when_default_model_is_not_served(
     monkeypatch,
 ) -> None:
-    """A key that authenticates but whose /v1/models lacks the configured vision
-    model must exit 1, so the gap surfaces before a run instead of as 404s in
-    caption/judge stages."""
     result = _preflight_token_factory(
         monkeypatch, ["meta-llama/Llama-3.3-70B-Instruct", "openai/gpt-oss-120b"], "--json"
     )
@@ -583,27 +580,21 @@ def test_preflight_token_factory_fails_closed_when_vision_model_left_public_endp
     row = next(c for c in json.loads(result.output)["checks"] if c["name"] == "token_factory")
     assert row["status"] == "FAIL"
     assert "MiniMaxAI/MiniMax-M3" in row["summary"]
-    assert "NPA_VLM_API_MODEL" in row["remedy"]
+    assert "NPA_VLM_API_MODEL" in row["remedy"] and "NPA_REASONER_API_MODEL" in row["remedy"]
+    assert "--secret-env" in row["remedy"]
 
 
-def test_preflight_token_factory_gate_follows_vision_model_override(monkeypatch) -> None:
+def test_preflight_token_factory_gate_follows_model_overrides(monkeypatch) -> None:
     monkeypatch.setenv("NPA_VLM_API_MODEL", "openbmb/MiniCPM-V-4_5")
-    assert _preflight_token_factory(monkeypatch, ["MiniMaxAI/MiniMax-M3"]).exit_code == 1
-    # The reasoner default is gated alongside the (overridden) vision model.
-    only_vision = _preflight_token_factory(monkeypatch, ["openbmb/MiniCPM-V-4_5"])
-    assert only_vision.exit_code == 1
-    assert "MiniMaxAI/MiniMax-M3" in only_vision.output
-    result = _preflight_token_factory(
-        monkeypatch, ["openbmb/MiniCPM-V-4_5", "MiniMaxAI/MiniMax-M3"]
-    )
-    assert result.exit_code == 0, result.output
-    assert "serves openbmb/MiniCPM-V-4_5, MiniMaxAI/MiniMax-M3" in result.output
-
-
-def test_preflight_token_factory_passes_when_vision_model_is_served(monkeypatch) -> None:
-    result = _preflight_token_factory(
-        monkeypatch, ["meta-llama/Llama-3.3-70B-Instruct", "MiniMaxAI/MiniMax-M3"]
-    )
-    assert result.exit_code == 0, result.output
-    assert "PASS" in result.output
-    assert "MiniMaxAI/MiniMax-M3" in result.output
+    default_only = _preflight_token_factory(monkeypatch, ["MiniMaxAI/MiniMax-M3"])
+    assert default_only.exit_code == 1, "vision override not served must fail"
+    vision_only = _preflight_token_factory(monkeypatch, ["openbmb/MiniCPM-V-4_5"])
+    assert vision_only.exit_code == 1, "reasoner default is gated too"
+    assert "MiniMaxAI/MiniMax-M3" in vision_only.output
+    both = _preflight_token_factory(monkeypatch, ["openbmb/MiniCPM-V-4_5", "MiniMaxAI/MiniMax-M3"])
+    assert both.exit_code == 0, both.output
+    assert "serves openbmb/MiniCPM-V-4_5, MiniMaxAI/MiniMax-M3" in both.output
+    monkeypatch.setenv("NPA_REASONER_API_MODEL", "openbmb/MiniCPM-V-4_5")
+    repointed = _preflight_token_factory(monkeypatch, ["openbmb/MiniCPM-V-4_5"])
+    assert repointed.exit_code == 0, repointed.output
+    assert "serves openbmb/MiniCPM-V-4_5)" in repointed.output

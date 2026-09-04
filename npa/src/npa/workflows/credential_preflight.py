@@ -16,7 +16,6 @@ from __future__ import annotations
 from dataclasses import dataclass
 from typing import Any, Callable, Iterable
 
-from npa.clients.token_factory import VISION_MODEL_ENV
 from npa.workflows.sim2real_health import (
     FAIL,
     PASS,
@@ -43,10 +42,10 @@ class CredentialProbes:
     ngc_validator: Callable[[str], str] | None = None
     s3_client_factory: Callable[[], Any] | None = None
     token_factory_verifier: Callable[[], list[str]] | None = None
-    #: Model ids the live Token Factory check requires in ``/v1/models``; the
-    #: CLI passes the resolved vision model so the check fails when the service
-    #: stops serving it instead of passing on authentication alone.
+    #: Model ids the live Token Factory check requires in ``/v1/models`` (auth
+    #: alone is not readiness), and the remedy to print when one is missing.
     token_factory_required_models: tuple[str, ...] = ()
+    token_factory_model_remedy: str = ""
 
 
 def _looks_like_auth_failure(text: str) -> bool:
@@ -257,11 +256,9 @@ def check_token_factory(credentials: Any, probes: CredentialProbes) -> CheckResu
             remedy="Confirm the key at https://tokenfactory.nebius.com/ -> API keys.",
             details=(str(exc),),
         )
-    required = probes.token_factory_required_models
+    required = tuple(dict.fromkeys(m for m in probes.token_factory_required_models if m))
     missing = [model for model in required if model not in models]
     if missing:
-        # Authentication is not readiness: a model can leave the public
-        # serverless endpoint, after which every caption/judge stage 404s.
         return CheckResult(
             name="token_factory",
             status=FAIL,
@@ -269,12 +266,9 @@ def check_token_factory(credentials: Any, probes: CredentialProbes) -> CheckResu
                 "Token Factory authenticated but does not serve required "
                 f"model(s): {', '.join(missing)}."
             ),
-            remedy=(
+            remedy=probes.token_factory_model_remedy or (
                 "Pick a served model from `npa workbench token-factory models` and "
-                f"export {VISION_MODEL_ENV}=<model>, then re-run this preflight. For "
-                f"workflow stages also pass `--secret-env {VISION_MODEL_ENV}` to "
-                "`npa workbench workflow submit` (pods do not inherit your shell), "
-                "or set the spec's caption_model / vlm_model."
+                "repoint the stage that requires it, then re-run this preflight."
             ),
             details=(f"{len(models)} models served; required: {', '.join(required)}",),
         )

@@ -42,6 +42,7 @@ from npa.clients.token_factory import (
     DEFAULT_BATCH_TIMEOUT_S,
     DEFAULT_COMPLETION_WINDOW,
     DEFAULT_REASONER_MODEL,
+    resolve_reasoner_model,
     DEFAULT_TEXT_MODEL,
     DEFAULT_VISION_MODEL,
     resolve_vision_model,
@@ -929,7 +930,7 @@ def reason_scene(
     _require(output_path, "output_path")
     if max_images <= 0:
         raise TokenFactoryToolError("--max-images must be positive")
-    effective_model = model or DEFAULT_REASONER_MODEL
+    effective_model = resolve_reasoner_model(model)
     effective_task = (task or DEFAULT_REASON_TASK).strip()
     effective_system = (system_prompt or DEFAULT_REASON_SYSTEM_PROMPT).strip()
     active = client or _default_client()

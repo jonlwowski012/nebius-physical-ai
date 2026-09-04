@@ -34,7 +34,7 @@ CHEAP_MODEL = "Qwen/Qwen3-32B"
 STANDARD_MODEL = "meta-llama/Llama-3.3-70B-Instruct"
 # Mirror npa.clients.token_factory.DEFAULT_REASONER_MODEL / DEFAULT_VISION_MODEL;
 # this module is embedded verbatim into the agent VM, so it cannot import them
-# (drift test in test_agent_routing). One multimodal model serves both tiers.
+# (tests/test_model_default_drift.py). One multimodal model serves both tiers.
 REASONING_MODEL = "MiniMaxAI/MiniMax-M3"
 VISION_MODEL = REASONING_MODEL
 

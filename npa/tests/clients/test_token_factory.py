@@ -410,9 +410,17 @@ def test_resolve_vision_model_precedence() -> None:
     assert resolve_vision_model("some/explicit", environ=override) == "some/explicit"
 
 
-def test_default_vision_model_is_served_on_the_public_endpoint() -> None:
-    """Qwen/Qwen2.5-VL-72B-Instruct left Token Factory's public serverless endpoint
-    on 2026-09-04; the default must be a model that tier still serves."""
-    from npa.clients.token_factory import DEFAULT_VISION_MODEL
+def test_resolve_reasoner_model_has_its_own_override() -> None:
+    from npa.clients.token_factory import (
+        DEFAULT_REASONER_MODEL,
+        REASONER_MODEL_ENV,
+        VISION_MODEL_ENV,
+        resolve_reasoner_model,
+    )
 
-    assert DEFAULT_VISION_MODEL == "MiniMaxAI/MiniMax-M3"
+    assert REASONER_MODEL_ENV == "NPA_REASONER_API_MODEL"
+    assert resolve_reasoner_model(environ={}) == DEFAULT_REASONER_MODEL
+    vision_only = {VISION_MODEL_ENV: "other/model"}
+    assert resolve_reasoner_model(environ=vision_only) == DEFAULT_REASONER_MODEL
+    assert resolve_reasoner_model(environ={REASONER_MODEL_ENV: "some/reasoner"}) == "some/reasoner"
+

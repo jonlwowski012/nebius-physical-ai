@@ -18,9 +18,11 @@ import typer
 
 from npa.clients.credentials import load_credentials
 from npa.clients.token_factory import (
-    DEFAULT_REASONER_MODEL,
+    REASONER_MODEL_ENV,
+    VISION_MODEL_ENV,
     TokenFactoryClient,
     resolve_config,
+    resolve_reasoner_model,
     resolve_vision_model,
 )
 from npa.clients.huggingface import validate_hf_access, validate_hf_identity
@@ -57,6 +59,15 @@ app = typer.Typer(
 )
 
 _STATUS_ICON = {PASS: "PASS", WARN: "WARN", FAIL: "FAIL", SKIP: "SKIP"}
+
+_TOKEN_FACTORY_MODEL_REMEDY = (
+    "Pick a served model from `npa workbench token-factory models` and export "
+    f"{VISION_MODEL_ENV}=<model> (caption, vlm-eval, evaluator) or "
+    f"{REASONER_MODEL_ENV}=<model> (reason), then re-run this preflight. For "
+    "workflow stages also pass `--secret-env <NAME>` to `npa workbench workflow "
+    "submit` (pods do not inherit your shell), or set the spec's caption_model / "
+    "vlm_model / reason_model."
+)
 
 
 def _repo_root() -> Path:
@@ -167,11 +178,8 @@ def preflight_command(
                 aws_secret_access_key=credentials.s3_secret_access_key,
             ),
             token_factory_verifier=_token_factory_verifier,
-            # Fail closed if the hosted vision/reasoning models the caption,
-            # judge, and reason stages request have left the public endpoint.
-            token_factory_required_models=tuple(
-                dict.fromkeys((resolve_vision_model(), DEFAULT_REASONER_MODEL))
-            ),
+            token_factory_required_models=(resolve_vision_model(), resolve_reasoner_model()),
+            token_factory_model_remedy=_TOKEN_FACTORY_MODEL_REMEDY,
         )
 
     results = run_credential_preflight(credentials, probes=probes, checks=selected)
