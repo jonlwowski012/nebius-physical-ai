@@ -37,9 +37,10 @@ DEFAULT_TEXT_MODEL = "meta-llama/Llama-3.3-70B-Instruct"
 # Nebius-recommended multimodal replacement; `npa workbench health preflight`
 # fails closed when a default is missing from /v1/models.
 DEFAULT_VISION_MODEL = "MiniMaxAI/MiniMax-M3"
-# One multimodal model serves both tiers. Sim2Real's Cosmos3 evaluator keeps its
-# own DEFAULT_COSMOS3_MODEL.
-DEFAULT_REASONER_MODEL = DEFAULT_VISION_MODEL
+# Separate from the vision default on purpose: the two roles share a model today
+# and may not tomorrow. Sim2Real's Cosmos3 evaluator keeps its own
+# DEFAULT_COSMOS3_MODEL.
+DEFAULT_REASONER_MODEL = "MiniMaxAI/MiniMax-M3"
 # Operator overrides for the hosted models. Repointing via env leaves a running
 # workflow's argv (and plan fingerprint) unchanged; pods receive them through
 # `workflow submit --secret-env <NAME>`.
