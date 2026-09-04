@@ -32,10 +32,11 @@ from typing import Any, Iterable, Sequence
 # ``flavor_variants`` / ``build_model_ladder``.
 CHEAP_MODEL = "Qwen/Qwen3-32B"
 STANDARD_MODEL = "meta-llama/Llama-3.3-70B-Instruct"
-REASONING_MODEL = "nvidia/Cosmos3-Super-Reasoner"
-# Mirrors npa.clients.token_factory.DEFAULT_VISION_MODEL; this module is embedded
-# verbatim into the agent VM, so it cannot import it (drift test in test_agent_routing).
-VISION_MODEL = "MiniMaxAI/MiniMax-M3"
+# Mirror npa.clients.token_factory.DEFAULT_REASONER_MODEL / DEFAULT_VISION_MODEL;
+# this module is embedded verbatim into the agent VM, so it cannot import them
+# (drift test in test_agent_routing). One multimodal model serves both tiers.
+REASONING_MODEL = "MiniMaxAI/MiniMax-M3"
+VISION_MODEL = REASONING_MODEL
 
 TIER_CHEAP = "cheap"
 TIER_STANDARD = "standard"

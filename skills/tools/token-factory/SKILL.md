@@ -143,8 +143,9 @@ your batches (`GET /v1/batches?limit=100` — the default page is 10, which make
 long history look artificially short) and count the non-terminal ones. All
 terminal plus a 403 with no `x-ratelimit-*` headers means availability, not quota.
 
-**Physical-AI reasoning over a scene** — default model
-`nvidia/Cosmos3-Super-Reasoner`. Point it at scene images and ask what a robot
+**Physical-AI reasoning over a scene** — default model `MiniMaxAI/MiniMax-M3`
+(`nvidia/Cosmos3-Super-Reasoner` also works where your key serves it). Point it at
+scene images and ask what a robot
 should do:
 
 ```bash

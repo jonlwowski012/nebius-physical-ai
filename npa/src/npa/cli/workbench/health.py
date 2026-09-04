@@ -18,6 +18,7 @@ import typer
 
 from npa.clients.credentials import load_credentials
 from npa.clients.token_factory import (
+    DEFAULT_REASONER_MODEL,
     TokenFactoryClient,
     resolve_config,
     resolve_vision_model,
@@ -166,9 +167,11 @@ def preflight_command(
                 aws_secret_access_key=credentials.s3_secret_access_key,
             ),
             token_factory_verifier=_token_factory_verifier,
-            # Fail closed if the hosted vision model every caption/judge stage
-            # requests has left the public serverless endpoint.
-            token_factory_required_models=(resolve_vision_model(),),
+            # Fail closed if the hosted vision/reasoning models the caption,
+            # judge, and reason stages request have left the public endpoint.
+            token_factory_required_models=tuple(
+                dict.fromkeys((resolve_vision_model(), DEFAULT_REASONER_MODEL))
+            ),
         )
 
     results = run_credential_preflight(credentials, probes=probes, checks=selected)

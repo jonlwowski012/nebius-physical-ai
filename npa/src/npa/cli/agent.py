@@ -188,14 +188,15 @@ DEFAULT_AGENT_NAME = "agent"
 DEFAULT_AGENT_IMAGE_FAMILY = "ubuntu24.04-driverless"
 DEFAULT_AGENT_USER = "npa"
 DEFAULT_LLM_PROVIDER = "token_factory"
-DEFAULT_LLM_MODEL = "nvidia/Cosmos3-Super-Reasoner"
+# Mirrors npa.clients.token_factory.DEFAULT_REASONER_MODEL (drift test in
+# test_agent_routing); also the vision-tier model, so the ladder lists it once.
+DEFAULT_LLM_MODEL = "MiniMaxAI/MiniMax-M3"
 # Cost-ordered ladder; per-turn routing reorders it, while no-routing paths and
 # the model picker retain the cheap workhorse as their default.
 DEFAULT_LLM_MODELS = (
     "Qwen/Qwen3-32B",
     "meta-llama/Llama-3.3-70B-Instruct",
     DEFAULT_LLM_MODEL,
-    "MiniMaxAI/MiniMax-M3",
 )
 AGENT_UI_VERSION = "2026082901"
 ARTIFACT_DISCOVERY_CONTRACT = "s3-source-qualified-v1"

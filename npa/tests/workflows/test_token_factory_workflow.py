@@ -143,7 +143,7 @@ def test_cosmos_reason_spec_reaches_the_hosted_reasoner_by_cli_default() -> None
     _, step = _only_step("token-factory-cosmos-reason.yaml")
 
     assert "--model" not in step.argv
-    assert DEFAULT_REASONER_MODEL == "nvidia/Cosmos3-Super-Reasoner"
+    assert DEFAULT_REASONER_MODEL == "MiniMaxAI/MiniMax-M3"
 
 
 def test_vlm_eval_token_factory_spec_uses_the_hosted_api_backend() -> None:

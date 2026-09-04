@@ -45,9 +45,12 @@ DEFAULT_VISION_MODEL = "MiniMaxAI/MiniMax-M3"
 # api backend, and the cosmos evaluator, so one variable repoints a running
 # workflow without changing its argv (and therefore its plan fingerprint).
 VISION_MODEL_ENV = "NPA_VLM_API_MODEL"
-# NVIDIA Cosmos3 Super-Reasoner: hosted vision-language physical-AI reasoner.
-# Confirm availability for your key with `npa workbench token-factory models`.
-DEFAULT_REASONER_MODEL = "nvidia/Cosmos3-Super-Reasoner"
+# Hosted vision-language reasoner for `token-factory reason` and the agent's
+# reasoning tier. nvidia/Cosmos3-Super-Reasoner was also absent from the public
+# serverless /v1/models on 2026-09-04; MiniMax-M3 is the Nebius-recommended
+# replacement (multimodal, returns a reasoning trace). Sim2Real's Cosmos3
+# evaluator keeps its own DEFAULT_COSMOS3_MODEL. `health preflight` gates on this.
+DEFAULT_REASONER_MODEL = DEFAULT_VISION_MODEL
 
 # Batch inference is a separate entitlement from real-time chat: a model can
 # serve /chat/completions and still reject a batch operation. The batch default

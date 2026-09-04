@@ -218,6 +218,7 @@ def test_tier_models_mirror_token_factory_defaults() -> None:
     assert r.VISION_MODEL == tf.DEFAULT_VISION_MODEL
     assert r.STANDARD_MODEL == tf.DEFAULT_TEXT_MODEL
     assert r.REASONING_MODEL == tf.DEFAULT_REASONER_MODEL
+    assert agent.DEFAULT_LLM_MODEL == tf.DEFAULT_REASONER_MODEL
     assert tf.DEFAULT_VISION_MODEL in agent.DEFAULT_LLM_MODELS
     spec = agent_workflow._data_factory_spec()
     assert spec["config_runtime"]["caption_model"] == tf.DEFAULT_VISION_MODEL

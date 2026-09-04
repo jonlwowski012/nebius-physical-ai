@@ -49,7 +49,7 @@ Registering and minting a key takes about two minutes:
 > it's handy when filtering models by project in the console.
 
 Optional 10-second self-test from your own terminal (proves the key works and
-shows the served catalog, including whether `nvidia/Cosmos3-Super-Reasoner` is
+shows the served catalog, including whether `MiniMaxAI/MiniMax-M3` is
 enabled for you):
 
 ```bash
@@ -192,15 +192,16 @@ state: they are deleted once results are collected, unless `--keep-datasets` is
 passed. A `--no-wait` run deliberately leaves its request dataset in place,
 because the operation reads it after the submitting process exits.
 
-Reason over a scene with NVIDIA Cosmos3-Super-Reasoner — point it at scene
-images and ask what a robot should do (scene understanding + plan of action):
+Reason over a scene with the hosted reasoner (default `MiniMaxAI/MiniMax-M3`;
+`nvidia/Cosmos3-Super-Reasoner` also works where your key serves it) — point it
+at scene images and ask what a robot should do (scene understanding + plan):
 
 ```bash
 npa workbench token-factory reason \
   --input-path ./scene \
   --output-path /tmp/scene-reasoning \
   --task "What is in this scene and how should a robot pick up the red box?" \
-  --model nvidia/Cosmos3-Super-Reasoner \
+  --model MiniMaxAI/MiniMax-M3 \
   --output json
 ```
 
@@ -243,7 +244,7 @@ NEBIUS_TOKEN_FACTORY_KEY=nebius_xxx npa/.venv/bin/python -m pytest \
 ```
 
 They cover: `list_models` authenticates, a text chat completion returns text,
-and `nvidia/Cosmos3-Super-Reasoner` produces a scene plan (that last one skips if
+and `MiniMaxAI/MiniMax-M3` produces a scene plan (that last one skips if
 the model is not available for your key). For a quick manual check use
 `npa workbench token-factory verify`.
 

@@ -589,9 +589,15 @@ def test_preflight_token_factory_fails_closed_when_vision_model_left_public_endp
 def test_preflight_token_factory_gate_follows_vision_model_override(monkeypatch) -> None:
     monkeypatch.setenv("NPA_VLM_API_MODEL", "openbmb/MiniCPM-V-4_5")
     assert _preflight_token_factory(monkeypatch, ["MiniMaxAI/MiniMax-M3"]).exit_code == 1
-    result = _preflight_token_factory(monkeypatch, ["openbmb/MiniCPM-V-4_5"])
+    # The reasoner default is gated alongside the (overridden) vision model.
+    only_vision = _preflight_token_factory(monkeypatch, ["openbmb/MiniCPM-V-4_5"])
+    assert only_vision.exit_code == 1
+    assert "MiniMaxAI/MiniMax-M3" in only_vision.output
+    result = _preflight_token_factory(
+        monkeypatch, ["openbmb/MiniCPM-V-4_5", "MiniMaxAI/MiniMax-M3"]
+    )
     assert result.exit_code == 0, result.output
-    assert "serves openbmb/MiniCPM-V-4_5" in result.output
+    assert "serves openbmb/MiniCPM-V-4_5, MiniMaxAI/MiniMax-M3" in result.output
 
 
 def test_preflight_token_factory_passes_when_vision_model_is_served(monkeypatch) -> None:

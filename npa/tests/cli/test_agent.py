@@ -2734,7 +2734,7 @@ def test_resolve_deploy_llm_credentials_reads_credentials(monkeypatch) -> None:
 
     key, model = _resolve_deploy_llm_credentials()
     assert key == "tf-test-key"
-    assert model == "nvidia/Cosmos3-Super-Reasoner"
+    assert model == "MiniMaxAI/MiniMax-M3"
 
 
 def test_normalize_llm_models_supports_repeated_and_csv_values() -> None:
