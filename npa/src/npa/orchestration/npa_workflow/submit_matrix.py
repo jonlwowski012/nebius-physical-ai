@@ -94,7 +94,8 @@ SUBMIT_LIVE_MATRIX: tuple[SubmitLiveCase, ...] = (
         notes=(
             "Live Encord e2e: register fixture media into a fresh npa-e2e-* "
             "folder+dataset through the operator's cloud integration, curate a "
-            "run-scoped Collection headlessly, then pull both straight back. "
+            "run-scoped Collection headlessly, pull both straight back, and verify "
+            "the roundtrip by exact identity and checksum. "
             "Needs seeded encord-fixtures/media/ objects and an integration "
             "titled by config.encord_integration."
         ),

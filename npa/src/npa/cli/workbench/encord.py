@@ -10,6 +10,8 @@ Encord labeling/curation SaaS integration:
   no human in the app.
 - ``pull``  materialize a curated Collection, a Dataset, or a Project's labels
   back to an S3 prefix as media + item JSON + a lineage manifest.
+- ``verify``  join a push receipt to a pull manifest by exact identity and
+  fail closed on anything missing, resized, or checksum-mismatched.
 - ``cleanup``  tear down run-scoped Encord state by title prefix.
 - ``system-info``  the tool's SDK pin, domain, and configured credentials.
 
@@ -33,7 +35,7 @@ from npa.workbench.encord.schemas import (
 
 app = typer.Typer(
     name="encord",
-    help="Encord curation SaaS: register-in-place push, headless curation, and curated pull.",
+    help="Encord curation SaaS: register-in-place push, headless curation, curated pull, and roundtrip verify.",
     no_args_is_help=True,
 )
 
@@ -267,6 +269,62 @@ def pull_cmd(
             f"downloaded, {manifest.label_rows} label rows) from "
             f"{manifest.source_kind} {manifest.source_name!r}; manifest: "
             f"{manifest.manifest_uri}"
+        ),
+    )
+
+
+@app.command("verify")
+@json_stdout_contract
+def verify_cmd(
+    receipt_uri: str = typer.Option(
+        ...,
+        "--receipt-uri",
+        help="s3:// URI of the push receipt (push_receipt.json).",
+    ),
+    manifest_uri: str = typer.Option(
+        ...,
+        "--manifest-uri",
+        help="s3:// URI of the pull manifest (manifest.json).",
+    ),
+    output_path: str = typer.Option(
+        ...,
+        "--output-path",
+        help="s3:// destination prefix (or .json URI) for the roundtrip report.",
+    ),
+    workflow_run: str = typer.Option("", "--workflow-run", help=WORKFLOW_RUN_HELP),
+    output_format: OutputFormat = OUTPUT_OPTION,
+) -> None:
+    """Verify a push receipt against a pull manifest by exact identity."""
+
+    from npa.cli.path_contract import validate_read_path, validate_write_path
+    from npa.sdk.workbench.encord import verify as sdk_verify
+
+    _call(
+        lambda: validate_read_path(
+            receipt_uri, tool="encord verify", option="--receipt-uri", allow_hf=False
+        )
+    )
+    _call(
+        lambda: validate_read_path(
+            manifest_uri, tool="encord verify", option="--manifest-uri", allow_hf=False
+        )
+    )
+    _call(lambda: validate_write_path(output_path, tool="encord verify", required=True))
+    report = _call(
+        lambda: sdk_verify(
+            receipt_uri=receipt_uri,
+            manifest_uri=manifest_uri,
+            output_path=output_path,
+            workflow_run=workflow_run,
+        )
+    )
+    emit(
+        report.model_dump(by_alias=True),
+        output=output_format,
+        text=(
+            f"roundtrip {report.status}: {report.matched}/{report.expected} matched, "
+            f"{report.checksum_verified} checksum-verified, "
+            f"{report.checksum_unavailable} unavailable; report: {report.report_uri}"
         ),
     )
 

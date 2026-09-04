@@ -16,6 +16,7 @@ from npa.workbench.encord.schemas import (
     CurateReceipt,
     PullManifest,
     PushReceipt,
+    RoundtripReport,
 )
 
 
@@ -102,6 +103,27 @@ def pull(
     )
 
 
+def verify(
+    *,
+    receipt_uri: str,
+    manifest_uri: str,
+    output_path: str,
+    workflow_run: str = "",
+    storage_client: Any = None,
+) -> RoundtripReport:
+    """Verify a push receipt against a pull manifest; write the report."""
+
+    from npa.workbench.encord.verify import run_verify
+
+    return run_verify(
+        receipt_uri=receipt_uri,
+        manifest_uri=manifest_uri,
+        output_path=output_path,
+        workflow_run=workflow_run,
+        storage_client=storage_client,
+    )
+
+
 def cleanup(
     *,
     title_prefix: str,
@@ -131,9 +153,11 @@ __all__ = [
     "CurateReceipt",
     "PullManifest",
     "PushReceipt",
+    "RoundtripReport",
     "cleanup",
     "curate",
     "pull",
     "push",
     "system_info",
+    "verify",
 ]

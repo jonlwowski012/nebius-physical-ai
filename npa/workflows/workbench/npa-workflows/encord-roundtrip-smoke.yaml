@@ -52,6 +52,7 @@ config:
   encord_source_id: "npa-e2e-{{run.id}}"
   encord_pull_uri: "s3://{{config.bucket}}/{{config.prefix}}/pull/"
   encord_curated_pull_uri: "s3://{{config.bucket}}/{{config.prefix}}/pull-curated/"
+  encord_verify_uri: "s3://{{config.bucket}}/{{config.prefix}}/verify/"
 
 resources:
   cpu:
@@ -114,4 +115,22 @@ states:
     outputs:
       - uri: "{{config.encord_curated_pull_uri}}manifest.json"
         schema: npa.encord.pull_manifest.v1
+    next: verify
+
+  verify:
+    description: >
+      Terminal roundtrip verifier: every pushed item must come back from the
+      dataset pull with matching size and checksum (exact identity, no name
+      matching). This is the machine-checkable checksum evidence.
+    needs: [pull]
+    toolRef: workbench.encord.verify
+    resources: cpu
+    inputs:
+      - uri: "{{config.encord_receipt_uri}}push_receipt.json"
+        schema: npa.encord.push_receipt.v1
+      - uri: "{{config.encord_pull_uri}}manifest.json"
+        schema: npa.encord.pull_manifest.v1
+    outputs:
+      - uri: "{{config.encord_verify_uri}}roundtrip_report.json"
+        schema: npa.encord.roundtrip_report.v1
     terminal: true

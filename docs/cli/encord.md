@@ -5,7 +5,7 @@
 ```text
 Usage: npa workbench encord [OPTIONS] COMMAND [ARGS]...
 
-Encord curation SaaS: register-in-place push, headless curation, and curated pull.
+Encord curation SaaS: register-in-place push, headless curation, curated pull, and roundtrip verify.
 
 Options
 --help  Show this message and exit.
@@ -13,6 +13,7 @@ Commands
 push  Register S3 media in Encord and optionally link a dataset.
 curate  Headlessly curate a folder into a Collection via Encord quality filters.
 pull  Pull curated media + labels + lineage manifest back to S3.
+verify  Verify a push receipt against a pull manifest by exact identity.
 cleanup  Tear down run-scoped Encord state created by push/curate.
 system-info  Show the Encord tool's SDK pin, API domain, and configured credentials.
 ```
@@ -30,6 +31,7 @@ system-info  Show the Encord tool's SDK pin, API domain, and configured credenti
 | `push` | Register S3 media in Encord and optionally link a dataset. |
 | `curate` | Headlessly curate a folder into a Collection via Encord quality filters. |
 | `pull` | Pull curated media + labels + lineage manifest back to S3. |
+| `verify` | Verify a push receipt against a pull manifest by exact identity. |
 | `cleanup` | Tear down run-scoped Encord state created by push/curate. |
 | `system-info` | Show the Encord tool's SDK pin, API domain, and configured credentials. |
 

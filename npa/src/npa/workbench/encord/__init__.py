@@ -28,6 +28,7 @@ from npa.workbench.encord.schemas import (
     PushReceipt,
     RoundtripReport,
 )
+from npa.workbench.encord.verify import roundtrip_report_uri_for
 
 __all__ = [
     "CURATE_RECEIPT_FILENAME",
@@ -49,4 +50,5 @@ __all__ = [
     "curate_receipt_uri_for",
     "pull_manifest_uri_for",
     "push_receipt_uri_for",
+    "roundtrip_report_uri_for",
 ]

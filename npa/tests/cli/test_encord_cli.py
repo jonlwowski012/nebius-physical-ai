@@ -107,6 +107,7 @@ def test_encord_group_registered() -> None:
     assert result.exit_code == 0
     assert "push" in result.output and "pull" in result.output
     assert "curate" in result.output and "cleanup" in result.output
+    assert "verify" in result.output
     assert "system-info" in result.output
 
 
@@ -405,6 +406,64 @@ def test_system_info_reports_setup_without_touching_encord(
     result = runner.invoke(app, ["workbench", "encord", "system-info"])
     assert result.exit_code == 0
     assert "credential_transports: ['ENCORD_SSH_KEY_FILE']" in result.output
+
+
+
+def test_verify_happy_and_failure_paths(monkeypatch: pytest.MonkeyPatch) -> None:
+    from npa.workbench.encord.schemas import RoundtripReport
+
+    def fake_verify(**kwargs):
+        return RoundtripReport(
+            generated_at="t",
+            receipt_uri=kwargs["receipt_uri"],
+            manifest_uri=kwargs["manifest_uri"],
+            report_uri="s3://bkt/verify/roundtrip_report.json",
+            status="passed",
+            expected=2,
+            matched=2,
+            checksum_verified=2,
+        )
+
+    monkeypatch.setattr("npa.sdk.workbench.encord.verify", fake_verify)
+    result = runner.invoke(
+        app,
+        [
+            "workbench", "encord", "verify",
+            "--receipt-uri", "s3://bkt/push/push_receipt.json",
+            "--manifest-uri", "s3://bkt/pull/manifest.json",
+            "--output-path", "s3://bkt/verify/",
+            "--output", "text",
+        ],
+    )
+    assert result.exit_code == 0, result.output
+    assert "roundtrip passed: 2/2 matched" in result.output
+
+    def failing_verify(**kwargs):
+        raise EncordToolError("Encord roundtrip verification failed: 1 missing")
+
+    monkeypatch.setattr("npa.sdk.workbench.encord.verify", failing_verify)
+    result = runner.invoke(
+        app,
+        [
+            "workbench", "encord", "verify",
+            "--receipt-uri", "s3://bkt/push/push_receipt.json",
+            "--manifest-uri", "s3://bkt/pull/manifest.json",
+            "--output-path", "s3://bkt/verify/",
+        ],
+    )
+    assert result.exit_code == 1 and "1 missing" in result.output
+    # local paths violate the contract, and the error names the failing flag
+    result = runner.invoke(
+        app,
+        [
+            "workbench", "encord", "verify",
+            "--receipt-uri", "/tmp/push_receipt.json",
+            "--manifest-uri", "s3://bkt/pull/manifest.json",
+            "--output-path", "s3://bkt/verify/",
+        ],
+    )
+    assert result.exit_code == 1
+    assert "--receipt-uri" in result.output and "--input-path" not in result.output
 
 
 

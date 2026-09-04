@@ -169,7 +169,8 @@ receipt names — replacing a pull-what-we-pushed placeholder with a real,
 declared quality gate.
 
 The live evidence loop (`encord-roundtrip-smoke.yaml`) proves every hop in one
-submit:
+submit, ending with the roundtrip verifier that makes the checksum claim
+machine-checkable:
 
 ```mermaid
 flowchart LR
@@ -177,7 +178,10 @@ flowchart LR
     C["curate<br/>(headless filter preset)"]
     L1["pull<br/>(dataset · 4 items)"]
     L2["pull-curated<br/>(collection · filtered subset)"]
-    P --> C --> L1 --> L2
+    V["verify<br/>(join by uuid ·<br/>size + checksum · fail-closed)"]
+    P --> C --> L1 --> L2 --> V
+    P -. "push_receipt.json" .-> V
+    L1 -. "manifest.json" .-> V
 ```
 
 The human path is not removed: an operator can still curate in the app and
@@ -251,5 +255,5 @@ only with re-run live verification (`METRIC_FILTERS` in
 - Workflow: argv-render assertions for the new toolRef, matching
   `test_encord_workflow.py`.
 - Live: `encord-roundtrip-smoke.yaml` runs `push → curate → pull →
-  pull-curated` on fixture media, keeping the run-scoped `npa-e2e-*` cleanup
-  contract.
+  pull-curated → verify` on fixture media, keeping the run-scoped `npa-e2e-*`
+  cleanup contract.

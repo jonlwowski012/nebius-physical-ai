@@ -75,6 +75,9 @@ SECRET_ENV_HINTS: dict[str, tuple[str, ...]] = {
     # multi-line-safe through --secret-env (a raw PEM paste is a documented
     # live failure mode and is no longer accepted).
     "workbench.encord": ("ENCORD_SSH_KEY_B64",),
+    # verify compares a receipt with a manifest in S3 and never opens an
+    # Encord client, so it needs no Encord secret.
+    "workbench.encord.verify": (),
     "workbench.vlm_eval": (),
     # Attribute verification generates and answers its questions on Token Factory.
     "workbench.cosmos_evaluator": ("NEBIUS_TOKEN_FACTORY_KEY",),
@@ -1640,7 +1643,7 @@ def render_setup_for_tool(
             "  exit 1\n"
             "fi\n"
         )
-    if tool_ref.startswith("workbench.encord"):
+    if tool_ref.startswith("workbench.encord") and tool_ref != "workbench.encord.verify":
         # Avoid ${VAR:-} bash forms so SkyPilot placeholder lint stays clean.
         parts.append(
             'if [[ -z "$ENCORD_SSH_KEY_B64" ]]; then\n'

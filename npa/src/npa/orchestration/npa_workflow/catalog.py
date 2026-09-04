@@ -1504,6 +1504,30 @@ TOOL_CATALOG: dict[str, ToolEntry] = {
         ],
         config_defaults={"encord_curate_poll_seconds": "300"},
     ),
+    "workbench.encord.verify": ToolEntry(
+        name="workbench.encord.verify",
+        description=(
+            "Verify an Encord push receipt against a pull manifest by exact "
+            "identity: every item present, sizes equal, checksums matching "
+            "wherever digests exist on both sides."
+        ),
+        argv_template=[
+            "npa",
+            "workbench",
+            "encord",
+            "verify",
+            "--receipt-uri",
+            "{{config.encord_receipt_uri}}push_receipt.json",
+            "--manifest-uri",
+            "{{config.encord_pull_uri}}manifest.json",
+            "--output-path",
+            "{{config.encord_verify_uri}}",
+            "--workflow-run",
+            "{{run.id}}",
+            "--output",
+            "json",
+        ],
+    ),
     "workbench.encord.pull": ToolEntry(
         name="workbench.encord.pull",
         description=(

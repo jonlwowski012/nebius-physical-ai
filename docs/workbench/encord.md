@@ -15,14 +15,16 @@ step:
 3. **`npa workbench encord pull`** — the curated Collection, Dataset, or a
    Project's labels come back to S3 as media + per-item JSON + a lineage
    manifest that downstream stages consume.
+4. **`npa workbench encord verify`** — proves the roundtrip: every pushed item
+   came back with matching size and checksum, joined by exact identity.
 
 > **TL;DR:** create an Encord API key and an S3-compatible integration (both
 > one-time, in the Encord app), point `~/.npa/credentials.yaml` at the key,
 > run `npa workbench health preflight --checks encord`, then `push` → `curate`
-> (or curate in the app) → `pull`.
+> (or curate in the app) → `pull` → `verify`.
 
-Verbs: `push`, `curate`, `pull`, `cleanup`, and `system-info` (SDK pin, API
-domain, configured credential names). Every verb takes `--output json` and then
+Verbs: `push`, `curate`, `pull`, `verify`, `cleanup`, and `system-info` (SDK
+pin, API domain, configured credential names). Every verb takes `--output json` and then
 prints exactly one JSON document on stdout, including on failure; diagnostics
 go to stderr. Design rationale and the live evidence behind the
 headless-curation filter shape:
@@ -53,12 +55,14 @@ flowchart LR
         SRC[("S3 media prefix<br/>*.mp4 · *.png · *.jpg")]
         RCPT[("push_receipt.json<br/>write-ahead, then final:<br/>uuid · size · etag · checksum")]
         DEST[("S3 output prefix<br/>media/ · items/ · labels/ · manifest.json")]
+        RPT[("roundtrip_report.json")]
     end
 
     subgraph cli["npa workbench encord"]
         PUSH["push"]
         CUR["curate<br/>(headless filters)"]
         PULL["pull"]
+        VER["verify"]
         CLN["cleanup"]
     end
 
@@ -84,6 +88,9 @@ flowchart LR
     COLL -- "--source + --source-id" --> PULL
     PULL == "registered media:<br/>zero-egress server-side copy" ==> DEST
     PULL -. "Encord-hosted media:<br/>signed-URL download, hashed in-stream" .-> DEST
+    RCPT -- "receipt" --> VER
+    DEST -- "manifest" --> VER
+    VER -- "identity + size + checksum,<br/>fail-closed" --> RPT
     CLN -- "--title-prefix" --> FOLDER
 ```
 
@@ -291,6 +298,29 @@ presets, and **reports** matching datasets — the Encord SDK exposes no dataset
 deletion, so those need one click in the app (the folder cleanup already
 removed their items). Prefixes shorter than four characters are refused.
 
+## Verify: prove the roundtrip
+
+```bash
+npa workbench encord verify \
+  --receipt-uri s3://<bucket>/encord/push/push_receipt.json \
+  --manifest-uri s3://<bucket>/encord/pull/manifest.json \
+  --output-path s3://<bucket>/encord/verify/
+```
+
+Joins the push receipt to the pull manifest by Encord item uuid (identity is
+exact — `npa.source_uri` clientMetadata or the normalized objectUrl, never a
+filename) and fails closed when any pushed item is missing from the pull, any
+size differs, or any comparable checksum differs. It also fails closed on the
+receipt itself: a receipt whose `status` is not `done` (the write-ahead
+`planned` copy, or a `failed`/`timeout` push) or one with zero attributable
+items can never produce a `passed` report — the report's `defects` list names
+the reason — and on any matched item that carries neither a comparable
+checksum nor a size on both sides (counted as `unverifiable`). The report (`roundtrip_report.json`,
+`npa.encord.roundtrip_report.v1`) records per-item expected/observed sizes and
+checksums; incomparable checksum kinds (e.g. a multipart ETag against a sha256)
+are reported as unavailable, not failures.
+
+
 ## Python SDK
 
 The CLI is a thin wrapper over the same functions:
@@ -333,9 +363,10 @@ The shipped specs wrap the same tool
 - `encord-pull.yaml` — production pull, run after curation.
 - `encord-roundtrip-smoke.yaml` — live e2e proof: push fixture media into a
   fresh `npa-e2e-<run-id>` folder + dataset, curate a run-scoped Collection
-  headlessly through a filter preset, then pull both the dataset and the
-  Collection straight back, no human step. Add `--var encord_transfer=upload`
-  for the byte-copy variant.
+  headlessly through a filter preset, pull both the dataset and the
+  Collection straight back, and end with `verify` joining the push receipt to
+  the dataset pull — the machine-checkable checksum evidence, no human step.
+  Add `--var encord_transfer=upload` for the byte-copy variant.
 
 Forward the credential to pods **by name only** — the base64 form survives the
 secret transport:
@@ -364,8 +395,13 @@ environment.)
 | `Encord curate selected 0 items` with brightness/sharpness/file-size filters | Those are computed quality metrics: they match nothing until metrics have been computed for the folder (one-time, in the Encord app). Use intrinsic metrics (width, height, area, aspect-ratio), or compute the folder's metrics once and re-run. |
 | `Unknown filter metric '...'` | Only allowlisted metrics with a live-verified Encord filter shape are accepted — an unverified shape would hang Encord's server-side evaluation. The error lists the supported names. |
 | `curate` fails with `already holds items` | The `--collection` title resolved to a populated Collection; curate never adds to one. Use a fresh run-scoped title or `cleanup --title-prefix`. |
+| `verify` fails with `push receipt status is 'planned', not 'done'` | The push never finished (killed mid-run, or `verify` was pointed at a write-ahead receipt). Re-run the push; a receipt that is not `done` is not roundtrip evidence. |
+| `verify` fails with `no attributable items` | The receipt has no `registered`/`uploaded` rows with an Encord uuid, so 0/0 would be a vacuous pass. Check the push receipt's per-item errors. |
+| `verify` reports `unverifiable` items | Both sides carry a multipart ETag (no content digest) and Encord returned no size, so nothing compares. Re-pull with `--transfer upload` sources (sha256 in-stream) or push single-part objects. |
 | US-hosted org, auth fails with a valid key | Set `ENCORD_DOMAIN` (the SDK default is the EU endpoint). |
 | `health preflight` warns `encord SDK is not installed` | An Encord credential is configured but the optional extra is missing; `pip install 'npa[encord]'` only if you use the tool. |
 | A `--output json` command printed diagnostics you expected on stdout | stdout carries exactly one JSON document per verb (also on failure: `{"result": "error", ...}`); human-readable errors and progress go to stderr. |
 
-The CLI reference is generated at [docs/cli/encord.md](../cli/encord.md).
+For the agent-facing summary and validation status see
+[skills/tools/encord/SKILL.md](../../skills/tools/encord/SKILL.md); the CLI
+reference is generated at [docs/cli/encord.md](../cli/encord.md).
