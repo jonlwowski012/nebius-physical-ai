@@ -152,6 +152,8 @@ def preflight_command(
     if offline:
         probes = CredentialProbes()
     else:
+        from npa.clients.token_factory import resolve_vision_model
+
         probes = CredentialProbes(
             hf_validator=validate_hf_identity,
             ngc_validator=_ngc_auth_verifier,
@@ -163,6 +165,9 @@ def preflight_command(
                 aws_secret_access_key=credentials.s3_secret_access_key,
             ),
             token_factory_verifier=_token_factory_verifier,
+            # Fail closed if the hosted vision model every caption/judge stage
+            # requests has left the public serverless endpoint.
+            token_factory_required_models=(resolve_vision_model(),),
         )
 
     results = run_credential_preflight(credentials, probes=probes, checks=selected)

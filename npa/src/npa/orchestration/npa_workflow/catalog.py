@@ -516,9 +516,7 @@ TOOL_CATALOG: dict[str, ToolEntry] = {
             "{{config.vlm_max_frames}}",
             "--success-threshold",
             "{{config.vlm_success_threshold}}",
-            # Optional judge model; omitted when a spec leaves it unset so the
-            # backend default (or NPA_VLM_API_MODEL) applies and existing specs
-            # render unchanged.
+            # Optional judge pin; unset falls through to the backend default.
             "--model",
             "{{config.vlm_model}}",
         ],

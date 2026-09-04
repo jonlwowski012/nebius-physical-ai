@@ -16,6 +16,7 @@ from __future__ import annotations
 from dataclasses import dataclass
 from typing import Any, Callable, Iterable
 
+from npa.clients.token_factory import VISION_MODEL_ENV
 from npa.workflows.sim2real_health import (
     FAIL,
     PASS,
@@ -42,12 +43,10 @@ class CredentialProbes:
     ngc_validator: Callable[[str], str] | None = None
     s3_client_factory: Callable[[], Any] | None = None
     token_factory_verifier: Callable[[], list[str]] | None = None
-    #: Model ids the live Token Factory check requires in ``/v1/models``.
-    #: ``None`` (the default) resolves to the configured hosted vision model
-    #: (``NPA_VLM_API_MODEL`` or the client default), so the check fails closed
-    #: when the service retires that model instead of passing on auth alone.
-    #: Pass ``()`` to gate on authentication only.
-    token_factory_required_models: tuple[str, ...] | None = None
+    #: Model ids the live Token Factory check requires in ``/v1/models``; the
+    #: CLI passes the resolved vision model so the check fails when the service
+    #: stops serving it instead of passing on authentication alone.
+    token_factory_required_models: tuple[str, ...] = ()
 
 
 def _looks_like_auth_failure(text: str) -> bool:
@@ -249,7 +248,7 @@ def check_token_factory(credentials: Any, probes: CredentialProbes) -> CheckResu
             summary="NEBIUS_TOKEN_FACTORY_KEY is set (not verified).",
         )
     try:
-        models = list(probes.token_factory_verifier())
+        models = probes.token_factory_verifier()
     except Exception as exc:  # noqa: BLE001 - surface any auth/connectivity error
         return CheckResult(
             name="token_factory",
@@ -258,23 +257,20 @@ def check_token_factory(credentials: Any, probes: CredentialProbes) -> CheckResu
             remedy="Confirm the key at https://tokenfactory.nebius.com/ -> API keys.",
             details=(str(exc),),
         )
-    required = _token_factory_required_models(probes)
+    required = probes.token_factory_required_models
     missing = [model for model in required if model not in models]
     if missing:
-        from npa.clients.token_factory import VISION_MODEL_ENV
-
-        # Authentication alone is not readiness: Token Factory retires models
-        # (Qwen/Qwen2.5-VL-72B-Instruct vanished on 2026-09-04) and every
-        # caption/judge stage then 404s mid-run. Fail here instead.
+        # Authentication is not readiness: a model can leave the public
+        # serverless endpoint, after which every caption/judge stage 404s.
         return CheckResult(
             name="token_factory",
             status=FAIL,
             summary=(
-                "Token Factory authenticated but does not serve the configured "
-                f"vision model ({', '.join(missing)})."
+                "Token Factory authenticated but does not serve required "
+                f"model(s): {', '.join(missing)}."
             ),
             remedy=(
-                "Pick a served vision model from `npa workbench token-factory models` "
+                "Pick a served model from `npa workbench token-factory models` "
                 f"and export {VISION_MODEL_ENV}=<model> (or pass --model / set the "
                 "spec's caption_model / vlm_model), then re-run this preflight."
             ),
@@ -286,15 +282,6 @@ def check_token_factory(credentials: Any, probes: CredentialProbes) -> CheckResu
         status=PASS,
         summary=f"Token Factory authenticated ({len(models)} models available{served}).",
     )
-
-
-def _token_factory_required_models(probes: CredentialProbes) -> tuple[str, ...]:
-    if probes.token_factory_required_models is not None:
-        return tuple(dict.fromkeys(m for m in probes.token_factory_required_models if m))
-    from npa.clients.token_factory import resolve_vision_model
-
-    return (resolve_vision_model(),)
-
 
 
 _CHECK_FUNCS: dict[str, Callable[[Any, CredentialProbes], CheckResult]] = {

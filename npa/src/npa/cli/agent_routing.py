@@ -33,8 +33,8 @@ from typing import Any, Iterable, Sequence
 CHEAP_MODEL = "Qwen/Qwen3-32B"
 STANDARD_MODEL = "meta-llama/Llama-3.3-70B-Instruct"
 REASONING_MODEL = "nvidia/Cosmos3-Super-Reasoner"
-# Keep in step with npa.clients.token_factory.DEFAULT_VISION_MODEL (this module
-# is embedded verbatim into the agent VM, so it cannot import it).
+# Mirrors npa.clients.token_factory.DEFAULT_VISION_MODEL; this module is embedded
+# verbatim into the agent VM, so it cannot import it (drift test in test_agent_routing).
 VISION_MODEL = "google/gemma-3-27b-it"
 
 TIER_CHEAP = "cheap"

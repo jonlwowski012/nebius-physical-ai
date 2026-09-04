@@ -10,13 +10,12 @@ from npa.workbench.vlm_eval import (
 )
 
 
-def test_api_backend_defaults_to_token_factory_served_vision_model(tmp_path, monkeypatch) -> None:
+def test_api_backend_defaults_to_token_factory_served_vision_model(tmp_path) -> None:
     """The Token Factory API does not serve vlm_eval's self-hosted default
     (Qwen2-VL-7B 404s there), so the api backend must pick the hosted vision
     default unless --model is overridden."""
     from npa.clients.token_factory import DEFAULT_VISION_MODEL
 
-    monkeypatch.delenv("NPA_VLM_API_MODEL", raising=False)
     result = evaluate_vlm(
         input_path="s3://ignored",
         output_path=str(tmp_path / "out.json"),
@@ -53,13 +52,12 @@ def test_api_backend_requires_a_key(monkeypatch) -> None:
 
 
 def test_api_backend_model_env_override_repoints_the_default(tmp_path, monkeypatch) -> None:
-    """Token Factory retired Qwen2.5-VL-72B on 2026-09-04 and every api-backend judge
-    404ed; NPA_VLM_API_MODEL repoints the default without changing a workflow's argv
-    (so a running workflow stays resumable). An explicit --model still wins."""
-    from npa.workbench.vlm_eval import API_MODEL_ENV
+    """NPA_VLM_API_MODEL repoints the api-backend default without changing a
+    workflow's argv, so a running workflow stays resumable when a model leaves
+    the public endpoint. An explicit --model still wins."""
+    from npa.clients.token_factory import VISION_MODEL_ENV
 
-    assert API_MODEL_ENV == "NPA_VLM_API_MODEL"
-    monkeypatch.setenv(API_MODEL_ENV, "openbmb/MiniCPM-V-4_5")
+    monkeypatch.setenv(VISION_MODEL_ENV, "openbmb/MiniCPM-V-4_5")
     result = evaluate_vlm(
         input_path="s3://ignored",
         output_path=str(tmp_path / "out.json"),

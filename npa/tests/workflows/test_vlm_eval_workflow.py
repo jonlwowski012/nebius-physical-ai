@@ -129,15 +129,16 @@ def test_the_three_retired_templates_are_gone() -> None:
 def test_loop_judge_model_is_an_optional_knob() -> None:
     """`config.vlm_model` forwards `--model`; unset, the flag is omitted so the
     backend default (or NPA_VLM_API_MODEL) applies and existing specs render
-    unchanged — the same knob that let a live run outlive the 2026-09-04
-    Token Factory model retirement without a new plan fingerprint."""
+    unchanged. Only `loop` carries it: self-hosted `run` specs already use
+    `vlm_model` for the vLLM they serve, and the three-tier contract pins that argv."""
 
-    spec, step = _only_step("vlm-eval-loop.yaml")
+    spec_name = "vlm-eval-loop.yaml"
+    spec, step = _only_step(spec_name)
     assert not spec.config.get("vlm_model")
     assert "--model" not in step.argv
 
-    with_model = load_spec(SPECS / "vlm-eval-loop.yaml")
+    with_model = load_spec(SPECS / spec_name)
     with_model.config["vlm_model"] = "google/gemma-3-27b-it"
     plan = build_plan(with_model, run_id="vlm-eval-workflow-test")
-    (loop_step,) = [s for s in plan.steps if s.argv]
-    assert _flag(loop_step.argv, "--model") == "google/gemma-3-27b-it"
+    (pinned,) = [s for s in plan.steps if s.argv]
+    assert _flag(pinned.argv, "--model") == "google/gemma-3-27b-it"

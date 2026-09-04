@@ -31,16 +31,17 @@ DEFAULT_TIMEOUT_S = 600.0
 DEFAULT_RETRY_ATTEMPTS = 4
 RETRYABLE_STATUS_CODES = frozenset({429, 500, 502, 503, 504, 529})
 DEFAULT_TEXT_MODEL = "meta-llama/Llama-3.3-70B-Instruct"
-# Token Factory retired Qwen/Qwen2.5-VL-72B-Instruct on 2026-09-04 (requests
-# 404 with "The model ... does not exist"); google/gemma-3-27b-it was the vision
-# model it served that day, verified with an image chat completion. Confirm with
-# `npa workbench token-factory models`; `npa workbench health preflight` fails
-# closed when the configured vision model is not in /v1/models.
+# The workbench only uses Token Factory's public serverless endpoint (the shared
+# base URL below), so a default must be served there. Qwen/Qwen2.5-VL-72B-Instruct
+# left that tier on 2026-09-04 (its public endpoint was removed under the
+# August-31 deprecation; it remains dedicated-endpoint only, which the workbench
+# does not support) and every request 404ed. google/gemma-3-27b-it was the
+# vision model served that day, verified with an image chat completion.
+# `npa workbench health preflight` fails when this model leaves /v1/models.
 DEFAULT_VISION_MODEL = "google/gemma-3-27b-it"
-# Operator override for the hosted vision model. Shared with
-# `npa workbench vlm-eval` (its API_MODEL_ENV) so one variable repoints every
-# hosted judge/caption call when the service retires a model, without changing
-# a running workflow's argv (which would change its plan fingerprint).
+# Operator override for the hosted vision model, honored by caption, vlm-eval's
+# api backend, and the cosmos evaluator, so one variable repoints a running
+# workflow without changing its argv (and therefore its plan fingerprint).
 VISION_MODEL_ENV = "NPA_VLM_API_MODEL"
 # NVIDIA Cosmos3 Super-Reasoner: hosted vision-language physical-AI reasoner.
 # Confirm availability for your key with `npa workbench token-factory models`.
@@ -149,16 +150,17 @@ def resolve_vision_model(model: str = "", *, environ: dict[str, str] | None = No
     """Return the hosted vision model a caller should request.
 
     An explicit ``model`` other than :data:`DEFAULT_VISION_MODEL` wins. Otherwise
-    the :data:`VISION_MODEL_ENV` override applies, then the default. A caller that
-    passes the default explicitly (CLI option defaults do) is treated as "not
-    chosen", so the override can repoint it.
+    the :data:`VISION_MODEL_ENV` override applies, then the default. Passing the
+    default explicitly (CLI option defaults do) counts as "not chosen", so the
+    override can repoint it; the default is therefore not pinnable against the
+    override.
     """
 
-    chosen = (model or "").strip()
+    chosen = model.strip()
     if chosen and chosen != DEFAULT_VISION_MODEL:
         return chosen
     env = os.environ if environ is None else environ
-    return (env.get(VISION_MODEL_ENV) or "").strip() or DEFAULT_VISION_MODEL
+    return _first_env(env, (VISION_MODEL_ENV,)) or DEFAULT_VISION_MODEL
 
 
 def validate_model_access(api_key: str, model: str) -> TokenFactoryAccessResult:

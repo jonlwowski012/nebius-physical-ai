@@ -35,9 +35,10 @@ default is `hf,ngc,s3,token_factory`.
 
 Online `token_factory` lists `/v1/models` and **fails closed when the
 configured hosted vision model is not served** — authentication alone is not
-readiness. Token Factory retired `Qwen/Qwen2.5-VL-72B-Instruct` on 2026-09-04
-and every caption/judge stage 404ed mid-run; this row now catches that before a
-submit. The configured model is `NPA_VLM_API_MODEL` when set, else the client
+readiness. The workbench only calls Token Factory's **public serverless
+endpoint**; `Qwen/Qwen2.5-VL-72B-Instruct` left that tier on 2026-09-04 (it is
+dedicated-endpoint only now, which the workbench does not support) and every
+caption/judge stage 404ed mid-run. This row now catches that before a submit. The configured model is `NPA_VLM_API_MODEL` when set, else the client
 default (`google/gemma-3-27b-it`). On FAIL, pick a served model from
 `npa workbench token-factory models` and export `NPA_VLM_API_MODEL=<model>`
 (or set the spec's `caption_model` / `vlm_model`); the same variable repoints

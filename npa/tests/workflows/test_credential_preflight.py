@@ -164,58 +164,11 @@ def test_token_factory_warns_when_missing() -> None:
     assert "TOKEN_FACTORY" in result.summary
 
 
-def test_token_factory_pass_when_authenticated(monkeypatch) -> None:
-    from npa.clients.token_factory import DEFAULT_VISION_MODEL
-
-    monkeypatch.delenv("NPA_VLM_API_MODEL", raising=False)
-    probes = CredentialProbes(
-        token_factory_verifier=lambda: ["m1", DEFAULT_VISION_MODEL]
-    )
+def test_token_factory_pass_when_authenticated() -> None:
+    probes = CredentialProbes(token_factory_verifier=lambda: ["m1", "m2"])
     result = check_token_factory(_Creds(token_factory_api_key="v1.abc"), probes)
     assert result.status == PASS
     assert "2 models" in result.summary
-    assert DEFAULT_VISION_MODEL in result.summary
-
-
-def test_token_factory_fails_closed_when_vision_model_is_not_served(monkeypatch) -> None:
-    """Auth alone is not readiness: Token Factory retired Qwen2.5-VL-72B on
-    2026-09-04 and every caption/judge stage 404ed mid-run. The preflight must
-    FAIL when the configured vision model is absent from /v1/models."""
-    from npa.clients.token_factory import DEFAULT_VISION_MODEL
-
-    monkeypatch.delenv("NPA_VLM_API_MODEL", raising=False)
-    probes = CredentialProbes(
-        token_factory_verifier=lambda: ["meta-llama/Llama-3.3-70B-Instruct", "Qwen/Qwen2.5-VL-72B-Instruct"]
-    )
-    result = check_token_factory(_Creds(token_factory_api_key="v1.abc"), probes)
-    assert result.status == FAIL
-    assert DEFAULT_VISION_MODEL in result.summary
-    assert "NPA_VLM_API_MODEL" in result.remedy
-    assert "token-factory models" in result.remedy
-
-
-def test_token_factory_gate_honors_vision_model_env_override(monkeypatch) -> None:
-    monkeypatch.setenv("NPA_VLM_API_MODEL", "openbmb/MiniCPM-V-4_5")
-    served = CredentialProbes(token_factory_verifier=lambda: ["openbmb/MiniCPM-V-4_5"])
-    assert check_token_factory(_Creds(token_factory_api_key="v1.abc"), served).status == PASS
-    not_served = CredentialProbes(token_factory_verifier=lambda: ["google/gemma-3-27b-it"])
-    result = check_token_factory(_Creds(token_factory_api_key="v1.abc"), not_served)
-    assert result.status == FAIL
-    assert "openbmb/MiniCPM-V-4_5" in result.summary
-
-
-def test_token_factory_required_models_can_be_pinned_or_disabled() -> None:
-    pinned = CredentialProbes(
-        token_factory_verifier=lambda: ["a", "b"],
-        token_factory_required_models=("a", "c"),
-    )
-    result = check_token_factory(_Creds(token_factory_api_key="v1.abc"), pinned)
-    assert result.status == FAIL
-    assert "c" in result.summary and "a" not in result.summary.split("(")[1]
-    auth_only = CredentialProbes(
-        token_factory_verifier=lambda: ["a"], token_factory_required_models=()
-    )
-    assert check_token_factory(_Creds(token_factory_api_key="v1.abc"), auth_only).status == PASS
 
 
 def test_token_factory_fail_when_verifier_raises() -> None:
@@ -225,6 +178,30 @@ def test_token_factory_fail_when_verifier_raises() -> None:
     probes = CredentialProbes(token_factory_verifier=_boom)
     result = check_token_factory(_Creds(token_factory_api_key="v1.bad"), probes)
     assert result.status == FAIL
+
+
+def test_token_factory_fails_closed_when_required_model_is_not_served() -> None:
+    """Authentication is not readiness: a model can leave the public serverless
+    endpoint, after which every caption/judge stage 404s."""
+    probes = CredentialProbes(
+        token_factory_verifier=lambda: ["meta-llama/Llama-3.3-70B-Instruct"],
+        token_factory_required_models=("google/gemma-3-27b-it",),
+    )
+    result = check_token_factory(_Creds(token_factory_api_key="v1.abc"), probes)
+    assert result.status == FAIL
+    assert result.summary.endswith("(s): google/gemma-3-27b-it.")
+    assert "NPA_VLM_API_MODEL" in result.remedy
+    assert "token-factory models" in result.remedy
+
+
+def test_token_factory_passes_and_names_the_served_required_model() -> None:
+    probes = CredentialProbes(
+        token_factory_verifier=lambda: ["a", "google/gemma-3-27b-it"],
+        token_factory_required_models=("google/gemma-3-27b-it",),
+    )
+    result = check_token_factory(_Creds(token_factory_api_key="v1.abc"), probes)
+    assert result.status == PASS
+    assert result.summary.endswith("serves google/gemma-3-27b-it).")
 
 
 def test_run_credential_preflight_default_order() -> None:

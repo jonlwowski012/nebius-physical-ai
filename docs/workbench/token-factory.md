@@ -268,10 +268,12 @@ if you are pointed at a non-default deployment.
 ## Troubleshooting
 
 - **`404 The model ... does not exist` from a caption or `vlm-eval --backend api`
-  stage** — Token Factory retired the model (it dropped
-  `Qwen/Qwen2.5-VL-72B-Instruct` on 2026-09-04). Run
+  stage** — the model is no longer served on Token Factory's **public serverless
+  endpoint**, which is the only tier the workbench calls. `Qwen/Qwen2.5-VL-72B-Instruct`
+  left it on 2026-09-04 (August-31 public-endpoint deprecation; the model remains
+  dedicated-endpoint only, which the workbench does not support). Run
   `npa workbench health preflight --checks token_factory`; it fails closed when
-  the configured vision model is not served. Pick one from
+  the configured vision model is not in `/v1/models`. Pick one from
   `npa workbench token-factory models` and export `NPA_VLM_API_MODEL=<model>`
   (or pass `--model`); the default is `google/gemma-3-27b-it`.
 - **`NEBIUS_TOKEN_FACTORY_KEY is not set`** — provide the key via step 2; confirm with

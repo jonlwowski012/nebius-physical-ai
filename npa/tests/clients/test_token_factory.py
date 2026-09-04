@@ -410,9 +410,9 @@ def test_resolve_vision_model_precedence() -> None:
     assert resolve_vision_model("some/explicit", environ=override) == "some/explicit"
 
 
-def test_default_vision_model_is_not_the_retired_qwen_vl() -> None:
-    """Token Factory stopped serving Qwen/Qwen2.5-VL-72B-Instruct on 2026-09-04."""
+def test_default_vision_model_is_served_on_the_public_endpoint() -> None:
+    """Qwen/Qwen2.5-VL-72B-Instruct left Token Factory's public serverless endpoint
+    on 2026-09-04; the default must be a model that tier still serves."""
     from npa.clients.token_factory import DEFAULT_VISION_MODEL
 
-    assert DEFAULT_VISION_MODEL != "Qwen/Qwen2.5-VL-72B-Instruct"
     assert DEFAULT_VISION_MODEL == "google/gemma-3-27b-it"

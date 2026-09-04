@@ -26,6 +26,7 @@ from typing import Any, Sequence
 import yaml
 
 from npa.clients.storage import StorageClient
+from npa.clients.token_factory import DEFAULT_VISION_MODEL, resolve_vision_model
 
 
 CONTENT_AGENTS_REPOSITORY = "https://github.com/NVIDIA-Omniverse/content-agents.git"
@@ -39,7 +40,7 @@ STAGE_REPORT_SCHEMA = "npa.content_agents.stage_report.v1"
 RIGID_ASSET_SCHEMA = "npa.content_agents.isaac_rigid_asset.v1"
 PROVENANCE_SCHEMA = "npa.content_agents.provenance.v1"
 SCENE_SPEC_SCHEMA = "npa.sim2real.manip_scene_spec.v1"
-DEFAULT_MODEL = "google/gemma-3-27b-it"
+DEFAULT_MODEL = DEFAULT_VISION_MODEL
 DEFAULT_BASE_URL = "https://api.tokenfactory.nebius.com/v1/"
 SUPPORTED_USD_SUFFIXES = frozenset({".usd", ".usda", ".usdc", ".usdz"})
 FRICTION_MIN = 0.1
@@ -1226,11 +1227,11 @@ def main(argv: Sequence[str] | None = None) -> int:
         result = acquire_stage(source_uri=args.source_uri, run_uri=args.run_uri)
     elif args.command == "materials":
         result = materials_stage(
-            run_uri=args.run_uri, model=args.model, base_url=args.base_url
+            run_uri=args.run_uri, model=resolve_vision_model(args.model), base_url=args.base_url
         )
     elif args.command == "physics":
         result = physics_stage(
-            run_uri=args.run_uri, model=args.model, base_url=args.base_url
+            run_uri=args.run_uri, model=resolve_vision_model(args.model), base_url=args.base_url
         )
     elif args.command == "validate":
         result = validate_stage(run_uri=args.run_uri)
