@@ -244,6 +244,30 @@ model against the GPU first, since changing the accelerator does not prove its
 kernels are compatible. Plan S3 capacity from your first measured checkpoint
 size, and note that optimizer state can exceed the weights.
 
+**Check the node's disk before you choose the GPU.** This is the sizing trap
+that bites, because it has nothing to do with GPU memory. The GR00T image is
+about 27 GB compressed and unpacks to roughly 55 to 80 GB. Add the base model
+and its runtime dependency, then the checkpoints the schedule retains: at five
+retained weights-only checkpoints for a 3B model, budget on the order of
+
+```text
+55-80 GB (image) + ~10 GB (models) + 5 x ~13 GB (checkpoints) = 130-155 GB
+```
+
+A node advertising around 118 GB of ephemeral storage cannot hold that, and a
+node advertising around 238 GB can. Check yours before submitting:
+
+```bash
+kubectl get nodes -o custom-columns=\
+'NAME:.metadata.name,GPU:.metadata.labels.nebius\.com/gpu-name,DISK:.status.allocatable.ephemeral-storage'
+```
+
+If the GPU you want is short on disk, the levers are a lower
+`save_total_limit` (at the cost of selection candidates), the
+[durable model cache](../model-weight-cache.md) on a mounted volume, or simply
+picking the node with more room. Training that dies on `no space left on
+device` after an hour looks like a training failure and is not one.
+
 Two costs to know about. Conversion **re-encodes** video when the source packs
 episodes together, which costs CPU time and one lossy generation; a dataset
 already recorded per-episode is copied byte-for-byte instead. And conversion is
