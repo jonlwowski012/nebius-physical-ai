@@ -23,6 +23,19 @@ config:
   # pipeline does; the curated path is the Encord/GR00T fine-tuning workflow.
   curation_manifest_uri: ""
   curation_report_uri: ""
+  # Empty resolves the final checkpoint. Populated only by a workflow that runs
+  # the per-checkpoint validation stage and selects among candidates.
+  checkpoint_selection_uri: ""
+  # W&B is opt-in per workflow. Empty drops the flags entirely, so this
+  # operational pipeline trains exactly as it did and relies on the S3 evidence
+  # it already publishes. Set wandb_mode: online in a workflow that wants live
+  # curves, with WANDB_API_KEY forwarded as a runtime secret.
+  wandb_mode: ""
+  wandb_project: ""
+  # Empty measures the validation cohort. This pipeline runs with
+  # final_episodes: 0, so it has no once-touched final split to report on; a
+  # workflow that selects a checkpoint sets this to final for its headline.
+  evaluation_split_role: ""
   # GR00T fine-tuning and offline evaluation are headless tensor workloads.
   # B200 is the canonical reserved-capacity target; no stage requires RT cores.
   gpu_type: B200

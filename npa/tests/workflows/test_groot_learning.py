@@ -123,6 +123,8 @@ def test_configurable_evaluation_repeats_reuse_one_policy_with_seed_isolation(
         (output_path / "model.safetensors").write_bytes(b"x")
 
     monkeypatch.setattr(learning, "_initialize_baseline_checkpoint", fake_initialize)
+    # No baseline published yet, so this run initializes one.
+    monkeypatch.setattr(learning, "_list_objects", lambda *_args: [])
     monkeypatch.setattr(
         learning,
         "_upload_directory",
@@ -280,27 +282,61 @@ def test_preflight_couples_final_checkpoint_to_configured_optimizer_steps(
     assert result["checkpoint_schedule"]["save_steps"] == steps
 
 
-def test_preflight_rejects_checkpoint_schedule_before_gpu_work() -> None:
-    with pytest.raises(
-        learning.GrootVisualizationError, match="final optimizer step must be saved"
-    ):
-        learning.preflight_rigor_contract(
-            "s3://bucket/preflight.json",
-            "run",
-            gpu_type="RTXPRO6000",
-            gpu_count=2,
-            global_batch_size=2,
-            per_device_batch_size=1,
-            gradient_accumulation_steps=1,
-            train_episodes=2,
-            validation_episodes=1,
-            final_episodes=0,
-            max_steps=8,
-            save_steps=4,
-            save_total_limit=1,
-            minimum_epochs=0.001,
-            s3_client=object(),
-        )
+def _preflight(**overrides: object) -> dict:
+    kwargs: dict = {
+        "gpu_type": "RTXPRO6000",
+        "gpu_count": 2,
+        "global_batch_size": 2,
+        "per_device_batch_size": 1,
+        "gradient_accumulation_steps": 1,
+        "train_episodes": 2,
+        "validation_episodes": 1,
+        "final_episodes": 0,
+        "max_steps": 8,
+        "save_steps": 4,
+        "save_total_limit": 2,
+        "minimum_epochs": 0.001,
+        "s3_client": object(),
+    }
+    kwargs.update(overrides)
+    return learning.preflight_rigor_contract(
+        "s3://bucket/preflight.json", "run", **kwargs
+    )
+
+
+@pytest.mark.parametrize(
+    "overrides, expected",
+    [
+        pytest.param(
+            {"save_steps": 3},
+            "must divide max_steps",
+            id="schedule-misses-the-final-step",
+        ),
+        pytest.param(
+            {"save_total_limit": 1},
+            "would discard checkpoints",
+            id="retention-drops-candidates",
+        ),
+        pytest.param({"save_steps": 0}, "must divide max_steps", id="zero-save-steps"),
+    ],
+)
+def test_preflight_rejects_checkpoint_schedule_before_gpu_work(
+    overrides: dict, expected: str
+) -> None:
+    with pytest.raises(learning.GrootVisualizationError, match=expected):
+        _preflight(**overrides)
+
+
+def test_preflight_allows_a_multi_checkpoint_schedule_to_select_from(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Selecting a checkpoint requires the intermediate ones to survive."""
+    monkeypatch.setattr(learning, "_put_json", lambda *_args, **_kwargs: {})
+    result = _preflight(max_steps=500, save_steps=100, save_total_limit=5)
+
+    schedule = result["checkpoint_schedule"]
+    assert schedule["checkpoints_saved"] == 5
+    assert schedule["selection_candidates"] == [100, 200, 300, 400, 500]
 
 
 def test_posttrain_evaluation_consumes_resolved_checkpoint_reference(
