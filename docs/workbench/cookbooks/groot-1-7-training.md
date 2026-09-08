@@ -5,6 +5,11 @@ GR00T-format LeRobot dataset through distributed optimizer work, an immutable
 checkpoint, aligned offline inference, synchronized RRD/MCAP diagnostics, S3
 publication, and the deployed NPA agent viewers.
 
+To fine-tune on your own demonstrations and get a verdict on whether the policy
+learned, use [the Encord to GR00T fine-tuning guide](../guides/encord-groot-finetune.md)
+instead. It adds Encord curation, a three-cohort split, and per-checkpoint
+selection on top of the stages below.
+
 This reference is deliberately a short plumbing validation. It does not claim
 statistically meaningful learning, a closed-loop rollout, or physical-robot
 performance. Machine-readable output keeps `pipeline_status` separate from

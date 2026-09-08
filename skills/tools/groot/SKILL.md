@@ -26,6 +26,10 @@ conversion, serving, inference, and validation.
    `npa/workflows/workbench/npa-workflows/groot-1-7-finetune.yaml`; its
    `gpu_count` is a positive single-node world size that controls both the
    scheduler allocation and the real trainer.
+   To fine-tune on a customer's own demonstrations with curation and a verdict
+   on whether it learned, load `skills/workflows/encord-groot-finetune/SKILL.md`
+   instead: that workflow owns the three-cohort contract and per-checkpoint
+   selection, which this operational spec deliberately does not have.
 3. Use `status`, `system-info`, and `list` for operational checks. Keep
    `ensure-ingress`, `register-byovm`, `reload-env`, and `cleanup-partial`
    scoped to setup and recovery flows.

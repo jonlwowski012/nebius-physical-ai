@@ -24,6 +24,7 @@ system-info  Collect and display system hardware information from the VM.
 benchmark  Run a benchmark suite: collect system info, train each model at each num_workers value, upload results to S3.
 profile-train  Profile training. Modes: wallclock (throughput), profiler (torch.profiler), or inference.
 train-student  Train a vision-only student policy via LeRobot imitation learning.
+fetch-dataset  Stage a pinned public LeRobot dataset from Hugging Face into S3.
 ```
 
 ## Options
@@ -50,6 +51,7 @@ train-student  Train a vision-only student policy via LeRobot imitation learning
 | `benchmark` | Run a benchmark suite: collect system info, train each model at each num_workers value, upload results to S3. |
 | `profile-train` | Profile training. Modes: wallclock (throughput), profiler (torch.profiler), or inference. |
 | `train-student` | Train a vision-only student policy via LeRobot imitation learning. |
+| `fetch-dataset` | Stage a pinned public LeRobot dataset from Hugging Face into S3. |
 
 ## Examples
 

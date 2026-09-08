@@ -95,6 +95,7 @@ tools.
 
 | Doc | Use when |
 | --- | --- |
+| [encord-groot-finetune.md](encord-groot-finetune.md) | **Fine-tune GR00T on your own robot demonstrations** — Encord-curated episodes, per-checkpoint selection, and an offline verdict on whether it learned |
 | [physical-ai-data-factory-deploy.md](physical-ai-data-factory-deploy.md) | **Copy-paste runbook** — from zero to a running blueprint (includes a one-block Quick start that stages input frames and submits) |
 | [physical-ai-data-factory.md](physical-ai-data-factory.md) | Conceptual guide — blueprint→stage mapping, S3 layout, viewing results |
 

@@ -16,6 +16,7 @@ workflows, and operational runbooks.
 | [cosmos3-b200-checkpoint-evaluation-20260814.md](cosmos3-b200-checkpoint-evaluation-20260814.md) | Reserved-B200, 72-image Cosmos3 checkpoint evaluation and three-seed investment decision |
 | [cosmos3-ray-serve.md](cosmos3-ray-serve.md) | Persistent Cosmos3-Nano serving through native Ray Serve batching with durable S3 outputs |
 | [leisaac-teleoperation.md](leisaac-teleoperation.md) | Capability-gated LeIsaac agent tab, RT-core launch, keyboard teleoperation, and cleanup |
+| [guides/encord-groot-finetune.md](guides/encord-groot-finetune.md) | **Fine-tune GR00T on your own robot demonstrations** — one YAML from a LeRobot dataset to an offline verdict, with Encord curating which episodes train |
 | [encord.md](encord.md) | Encord curation SaaS setup, register/upload push, headless or in-app curation, curated pull back to S3, and the fail-closed roundtrip verifier |
 | [encord-headless-curation.md](encord-headless-curation.md) | Design and live evidence for headless Encord curation: filter presets, the pinned filter shape, and the agent-driven push → curate → pull → verify loop |
 | [../architecture/oss-onboarding-ladder.md](../architecture/oss-onboarding-ladder.md) | OSS → BYOF → workflow → first-class tool promotion ladder |
