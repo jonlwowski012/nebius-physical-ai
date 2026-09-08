@@ -38,6 +38,28 @@ LEROBOT_DATA_PATH_TPL = "data/chunk-{chunk_index:03d}/file-{file_index:03d}.parq
 LEROBOT_VIDEO_PATH_TPL = "videos/{video_key}/chunk-{chunk_index:03d}/file-{file_index:03d}.mp4"
 ADAPTER_MANIFEST = "npa_groot_adapter.json"
 GENERATED_MODALITY_CONFIG = "npa_groot_modality_config.py"
+DATASET_AUDIT = "npa_dataset_audit.json"
+DATASET_AUDIT_SCHEMA = "npa.groot.dataset_audit.v1"
+
+#: The two flat vectors every GR00T embodiment reads. ``modality.json`` slices
+#: these, so a defect here is a defect in every modality group.
+AUDIT_VECTOR_KEYS = ("observation.state", "action")
+#: Relative tolerance on the recorded inter-frame interval before the timebase
+#: is reported as irregular. Recorded timestamps are float32 in LeRobot, so an
+#: exact ``1/fps`` comparison would flag every real dataset.
+AUDIT_TIMEBASE_TOLERANCE = 0.25
+#: Longest-to-shortest episode ratio before episode lengths are reported as
+#: uneven, which usually means aborted attempts are mixed in with completions.
+AUDIT_LENGTH_SPREAD = 2
+#: The conditions :func:`audit_dataset` raises on. Reaching its report means
+#: every one of them held, so they are listed rather than evaluated.
+AUDIT_FATAL_CHECKS = (
+    "every episode has a data file",
+    "declared episode length matches its data file",
+    "state and action values are finite",
+    "state and action dimensions match metadata",
+    "timestamps increase within every episode",
+)
 
 ACTION_SPACE_JOINT = "joint"
 ACTION_SPACE_CARTESIAN_XYZ = "cartesian_xyz"
@@ -167,6 +189,10 @@ def lerobot_to_groot(
         state_dim=_feature_dim(info, "observation.state"),
         action_dim=_feature_dim(info, "action"),
     )
+    # Audit the dataset we just wrote, not the one we were handed: this is the
+    # layout every later stage reads, and a defect here fails before curation
+    # and GPU time rather than after.
+    _write_json(meta_dir / DATASET_AUDIT, audit_dataset(output_dir))
     return output_dir
 
 
@@ -205,6 +231,328 @@ def groot_to_lerobot(input_dir: Path, output_dir: Path) -> Path:
     _copy_videos_groot_to_lerobot(input_dir, output_dir, info)
     _write_manifest(output_dir, "groot-to-lerobot", _manifest_embodiment(input_dir))
     return output_dir
+
+
+def audit_dataset(dataset_dir: Path) -> dict[str, Any]:
+    """Audit a GR00T-format dataset before anyone spends GPU time on it.
+
+    The report answers "is my data usable?" with an episode inventory, the
+    recorded timebase, per-dimension state/action ranges, and camera coverage.
+    Findings a human should look at are recorded as advisories. The defects no
+    optimizer can recover from raise :class:`GR00TAdapterError` instead, so a
+    broken dataset fails before curation and training rather than after.
+    """
+
+    dataset_dir = Path(dataset_dir)
+    info = _load_json(dataset_dir / "meta" / "info.json")
+    fps = float(info.get("fps") or 0.0)
+    if fps <= 0:
+        raise GR00TAdapterError(
+            f"Dataset declares no positive fps ({fps!r}); the action timebase is undefined"
+        )
+    episode_rows = _read_groot_episode_rows(dataset_dir)
+    if not episode_rows:
+        raise GR00TAdapterError(
+            f"Dataset declares no episodes: {dataset_dir / 'meta' / 'episodes.jsonl'}"
+        )
+
+    features = info.get("features") or {}
+    accumulators: dict[str, _VectorAccumulator] = {}
+    for key in AUDIT_VECTOR_KEYS:
+        if key not in features:
+            raise GR00TAdapterError(
+                f"Dataset metadata declares no {key!r} feature; GR00T cannot build a policy input"
+            )
+        accumulators[key] = _VectorAccumulator(_feature_dim(info, key))
+
+    data_tpl = str(info.get("data_path") or GROOT_DATA_PATH_TPL)
+    video_tpl = str(info.get("video_path") or GROOT_VIDEO_PATH_TPL)
+    chunk_size = int(info.get("chunks_size", 1000) or 1000)
+    camera_keys = _video_features(info)
+    # Only the byte total varies per camera: a camera missing video for any
+    # episode raises below, so every camera covers every episode.
+    camera_bytes = dict.fromkeys(camera_keys, 0)
+    # The audit reads two flat vectors and the timebase; the remaining columns
+    # (indices, task ids, and any synthetic modality columns) are dead weight.
+    wanted = (*AUDIT_VECTOR_KEYS, "timestamp")
+
+    advisories: list[dict[str, str]] = []
+    episodes: list[dict[str, Any]] = []
+    irregular_timebase = 0
+
+    for row in episode_rows:
+        episode_index = int(row.get("episode_index", len(episodes)))
+        chunk_index = episode_index // chunk_size
+        parquet = dataset_dir / data_tpl.format(
+            episode_chunk=chunk_index, episode_index=episode_index
+        )
+        if not parquet.is_file():
+            raise GR00TAdapterError(
+                f"Episode {episode_index} has no data file: {parquet}"
+            )
+        # Projecting the read is what keeps the audit affordable on a large
+        # dataset; a missing declared column still fails closed just below.
+        present = [name for name in wanted if name in pq.read_schema(parquet).names]
+        table = pq.read_table(parquet, columns=present)
+        rows = int(table.num_rows)
+        if rows <= 0:
+            raise GR00TAdapterError(f"Episode {episode_index} is empty: {parquet}")
+        # A declared length of 0 is a real mismatch, not a missing value, so
+        # distinguish absent metadata from a zero.
+        raw_length = row.get("length")
+        declared = rows if raw_length is None else int(raw_length)
+        if declared != rows:
+            raise GR00TAdapterError(
+                f"Episode {episode_index} metadata declares {declared} frames but its "
+                f"data file holds {rows}"
+            )
+
+        for key, accumulator in accumulators.items():
+            if key not in table.column_names:
+                raise GR00TAdapterError(
+                    f"Episode {episode_index} data file has no {key!r} column"
+                )
+            accumulator.add(table[key], key=key, episode=episode_index, rows=rows)
+
+        timebase = _audit_timebase(table, episode_index=episode_index, fps=fps)
+        if not timebase["regular"]:
+            irregular_timebase += 1
+
+        for camera_key in camera_keys:
+            video = dataset_dir / video_tpl.format(
+                episode_chunk=chunk_index,
+                video_key=camera_key,
+                episode_index=episode_index,
+            )
+            try:
+                size = video.stat().st_size
+            except OSError:
+                size = 0
+            if size <= 0:
+                raise GR00TAdapterError(
+                    f"Episode {episode_index} declares camera {camera_key!r} but has no "
+                    f"video bytes at {video}"
+                )
+            camera_bytes[camera_key] += size
+
+        episodes.append(
+            {
+                "episode_index": episode_index,
+                "frames": rows,
+                "duration_seconds": round(rows / fps, 6),
+                "tasks": [str(task) for task in (row.get("tasks") or []) if str(task)],
+                "cameras": list(camera_keys),
+                "timebase": timebase,
+            }
+        )
+
+    lengths = sorted(episode["frames"] for episode in episodes)
+    total_frames = sum(lengths)
+    if irregular_timebase:
+        advisories.append(
+            {
+                "finding": "irregular_timebase",
+                "detail": (
+                    f"{irregular_timebase} of {len(episodes)} episodes have recorded "
+                    f"inter-frame intervals more than {AUDIT_TIMEBASE_TOLERANCE:.0%} away "
+                    f"from 1/{fps:g}s. Check the recorder's clock before trusting action timing."
+                ),
+            }
+        )
+    if lengths[0] * AUDIT_LENGTH_SPREAD < lengths[-1]:
+        advisories.append(
+            {
+                "finding": "uneven_episode_lengths",
+                "detail": (
+                    f"episode lengths span {lengths[0]}-{lengths[-1]} frames. Very short "
+                    "episodes may be aborted attempts rather than demonstrations."
+                ),
+            }
+        )
+
+    tensors: dict[str, Any] = {}
+    for key, accumulator in accumulators.items():
+        summary = accumulator.summary()
+        tensors[key] = summary
+        constant = summary["constant_dimensions"]
+        if constant:
+            names = _feature_names(info, key)
+            labelled = [
+                names[index] if index < len(names) else str(index) for index in constant
+            ]
+            advisories.append(
+                {
+                    "finding": "constant_dimension",
+                    "detail": (
+                        f"{key} dimension(s) {labelled} never change across the dataset. "
+                        "A gripper or joint that never moves cannot be learned."
+                    ),
+                }
+            )
+
+    tasks = [
+        str(task.get("task", ""))
+        for task in _read_groot_task_rows(dataset_dir)
+        if str(task.get("task", ""))
+    ]
+    report = {
+        "schema": DATASET_AUDIT_SCHEMA,
+        "status": "audited",
+        "dataset": {
+            "codebase_version": str(info.get("codebase_version") or ""),
+            "robot_type": str(info.get("robot_type") or ""),
+            "fps": fps,
+            "episodes": len(episodes),
+            "frames": total_frames,
+            "duration_seconds": round(total_frames / fps, 6),
+            "episode_frames_min": lengths[0],
+            "episode_frames_max": lengths[-1],
+            "episode_frames_median": lengths[len(lengths) // 2],
+        },
+        "tasks": tasks,
+        "tensors": tensors,
+        "cameras": [
+            {
+                "original_key": key,
+                "episodes_with_video": len(episodes),
+                "bytes": camera_bytes[key],
+                "resolution": _audit_resolution(info, key),
+            }
+            for key in camera_keys
+        ],
+        "episodes_detail": episodes,
+        "advisories": advisories,
+        # Every fatal condition raises, so reaching this line is the proof that
+        # all of them held. The names are listed so the report says which.
+        "checks": [
+            {"name": name, "status": "passed"} for name in AUDIT_FATAL_CHECKS
+        ]
+        + [
+            {
+                "name": "every declared camera has episode video bytes",
+                "status": "passed" if camera_keys else "skipped",
+            }
+        ],
+    }
+    return report
+
+
+def _flat_float64(column: Any) -> Any:
+    """Read an Arrow column as a flat float64 array without a Python detour.
+
+    LeRobot stores the state and action vectors as ``list`` or
+    ``fixed_size_list`` of float, and scalars like ``timestamp`` plainly; both
+    flatten to one contiguous array here.
+    """
+
+    values = column.combine_chunks()
+    if pa.types.is_list(values.type) or pa.types.is_fixed_size_list(values.type):
+        values = values.flatten()
+    return values.to_numpy(zero_copy_only=False).astype(np.float64, copy=False)
+
+
+class _VectorAccumulator:
+    """Streaming per-dimension statistics for one flat LeRobot vector column."""
+
+    def __init__(self, dim: int) -> None:
+        if dim <= 0:
+            raise GR00TAdapterError(
+                f"vector feature declares a non-positive width: {dim}"
+            )
+        self.dim = int(dim)
+        self.count = 0
+        self._min = np.full(self.dim, np.inf, dtype=np.float64)
+        self._max = np.full(self.dim, -np.inf, dtype=np.float64)
+        self._sum = np.zeros(self.dim, dtype=np.float64)
+        self._sumsq = np.zeros(self.dim, dtype=np.float64)
+
+    def add(self, column: Any, *, key: str, episode: int, rows: int) -> None:
+        """Fold one episode's column in, straight from Arrow.
+
+        Going through ``to_pylist`` would build a Python list of lists per
+        episode, which dominated this audit's cost and its peak memory on a
+        real dataset. ``flatten`` handles both ``list`` and ``fixed_size_list``.
+
+        ``rows`` is required because flattening discards the nesting: comparing
+        against it is what still catches a width that divides evenly into the
+        declared one, which a modulo check would wave through.
+        """
+
+        flat = _flat_float64(column)
+        if flat.size != rows * self.dim:
+            width = flat.size / rows if rows else 0
+            raise GR00TAdapterError(
+                f"Episode {episode} {key!r} is {width:g} wide but metadata declares "
+                f"{self.dim}"
+            )
+        data = flat.reshape(rows, self.dim)
+        if not np.isfinite(data).all():
+            offending = int(np.argwhere(~np.isfinite(data))[0][0])
+            raise GR00TAdapterError(
+                f"Episode {episode} {key!r} contains non-finite values (first at frame "
+                f"{offending}); training on NaN or inf produces a broken policy"
+            )
+        self.count += int(data.shape[0])
+        self._min = np.minimum(self._min, data.min(axis=0))
+        self._max = np.maximum(self._max, data.max(axis=0))
+        self._sum += data.sum(axis=0)
+        self._sumsq += np.square(data).sum(axis=0)
+
+    def summary(self) -> dict[str, Any]:
+        mean = self._sum / self.count
+        variance = np.maximum(self._sumsq / self.count - np.square(mean), 0.0)
+        spans = self._max - self._min
+        return {
+            "dimensions": self.dim,
+            "samples": self.count,
+            "min": self._min.tolist(),
+            "max": self._max.tolist(),
+            "mean": mean.tolist(),
+            "std": np.sqrt(variance).tolist(),
+            "constant_dimensions": [
+                index for index, span in enumerate(spans.tolist()) if span == 0.0
+            ],
+        }
+
+
+def _audit_timebase(
+    table: pa.Table, *, episode_index: int, fps: float
+) -> dict[str, Any]:
+    """Check one episode's recorded timebase, failing closed on a broken clock."""
+
+    if "timestamp" not in table.column_names:
+        return {"recorded": False, "regular": True}
+    stamps = _flat_float64(table["timestamp"])
+    if not np.isfinite(stamps).all():
+        raise GR00TAdapterError(f"Episode {episode_index} has non-finite timestamps")
+    deltas = np.diff(stamps)
+    if deltas.size and float(deltas.min()) <= 0:
+        raise GR00TAdapterError(
+            f"Episode {episode_index} timestamps do not increase (minimum step "
+            f"{float(deltas.min()):g}s); observations cannot be ordered"
+        )
+    expected = 1.0 / fps
+    regular = bool(
+        deltas.size == 0
+        or np.all(np.abs(deltas - expected) <= AUDIT_TIMEBASE_TOLERANCE * expected)
+    )
+    return {
+        "recorded": True,
+        "regular": regular,
+        "first_seconds": round(float(stamps[0]), 6),
+        "last_seconds": round(float(stamps[-1]), 6),
+        "median_step_seconds": (
+            round(float(np.median(deltas)), 6) if deltas.size else 0.0
+        ),
+        "expected_step_seconds": round(expected, 6),
+    }
+
+
+def _audit_resolution(info: dict[str, Any], camera_key: str) -> str:
+    shape = ((info.get("features") or {}).get(camera_key) or {}).get("shape") or []
+    if len(shape) >= 2:
+        return f"{int(shape[1])}x{int(shape[0])}"
+    return "unknown"
 
 
 def _reset_dir(path: Path) -> None:

@@ -53,6 +53,10 @@ PUBLIC_REUSABLE_TOOLREFS: dict[str, str] = {
     "infra.soperator.deploy": "public npa.soperator deployment primitive",
     "workbench.cosmos2.transfer": "public Cosmos Transfer composition primitive",
     "workbench.foxglove.convert": "public recording-conversion primitive",
+    # Remove this entry when the Encord/GR00T fine-tuning spec lands and
+    # consumes it: a reusable-only entry must not also be reachable from a
+    # shipped spec.
+    "workflow.groot.prepare_dataset": "public LeRobot-to-GR00T dataset conversion primitive",
     "workbench.insights.record": "public lineage/metrics ingestion primitive",
     "workbench.isaac_lab.byof_repo": "public Isaac Lab BYOF primitive",
     "workbench.lerobot.eval": "public LeRobot evaluation primitive",
@@ -2283,6 +2287,30 @@ TOOL_CATALOG: dict[str, ToolEntry] = {
             "json",
         ],
     ),
+    "workflow.groot.prepare_dataset": ToolEntry(
+        name="workflow.groot.prepare_dataset",
+        description=(
+            "Convert a standard LeRobot dataset into per-episode GR00T format and "
+            "publish a fail-closed dataset audit. Per-episode media is what makes "
+            "episode-level curation and an episode-level split possible."
+        ),
+        argv_template=[
+            "python3",
+            "-m",
+            "npa.workflows.groot_learning",
+            "prepare-dataset",
+            "--source-uri",
+            "{{config.source_data_uri}}",
+            "--output-uri",
+            "{{config.prepared_data_uri}}",
+            "--audit-uri",
+            "{{config.dataset_audit_uri}}",
+            "--robot-embodiment",
+            "{{config.robot_embodiment}}",
+            "--run-id",
+            "{{run.id}}",
+        ],
+    ),
     "workbench.groot.finetune": ToolEntry(
         name="workbench.groot.finetune",
         access_capabilities=("groot",),
@@ -2453,7 +2481,18 @@ TOOL_CATALOG: dict[str, ToolEntry] = {
             "{{config.gradient_accumulation_steps}}",
             "--action-representation",
             "absolute",
+            # An Encord curation restricts which episodes are eligible. Both
+            # flags drop out when their config value is empty, so a spec that
+            # curates nothing splits the whole dataset.
+            "--curation-manifest-uri",
+            "{{config.curation_manifest_uri}}",
+            "--curation-report-uri",
+            "{{config.curation_report_uri}}",
         ],
+        omit_flags_when_empty=(
+            "--curation-manifest-uri",
+            "--curation-report-uri",
+        ),
     ),
     "workbench.groot.baseline_eval": ToolEntry(
         name="workbench.groot.baseline_eval",

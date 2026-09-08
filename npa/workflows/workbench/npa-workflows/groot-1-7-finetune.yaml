@@ -18,6 +18,11 @@ config:
   base_model: nvidia/GR00T-N1.7-3B
   robot_embodiment: NEW_EMBODIMENT
   action_representation: ABSOLUTE
+  # Optional Encord curation restricting which episodes are eligible for the
+  # split. Empty means split the whole dataset, which is what this operational
+  # pipeline does; the curated path is the Encord/GR00T fine-tuning workflow.
+  curation_manifest_uri: ""
+  curation_report_uri: ""
   # GR00T fine-tuning and offline evaluation are headless tensor workloads.
   # B200 is the canonical reserved-capacity target; no stage requires RT cores.
   gpu_type: B200
