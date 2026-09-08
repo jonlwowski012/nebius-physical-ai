@@ -155,16 +155,22 @@ config:
   publish_manifest_uri: "{{config.root_uri}}/reports/publish-manifest.json"
   workflow_uri: "{{config.root_uri}}/workflow.yaml"
 
+# Requests are sized against ALLOCATABLE capacity, not the preset name. A
+# Nebius node advertises roughly `vcpu - 0.1` CPU and about 1Gi less memory
+# after kubelet and system reserve, so a 16-vCPU node offers 15.9 and a request
+# for 16 never schedules. These values fit an 8-vCPU CPU node and both a
+# 16-vCPU H100 and a 16-vCPU L40S, so --var gpu_type=L40S still works.
+# Pinned by npa/tests/guardrails/test_encord_groot_finetune_fits_a_node.py.
 resources:
   cpu:
     cloud: kubernetes
-    cpus: 8
-    memory: 32Gi
+    cpus: 4
+    memory: 16Gi
   gpu:
     cloud: kubernetes
     accelerators: "{{config.gpu_type}}:{{config.gpu_count}}"
-    cpus: 16
-    memory: 96Gi
+    cpus: 12
+    memory: 64Gi
 
 initial: prepare-dataset
 
