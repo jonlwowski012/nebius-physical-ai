@@ -138,6 +138,20 @@ DECLARATIVE_PIP_EXTRAS = frozenset({"viz"})
 #: look for. `lerobot policy_train` needs the latter: it materialises its dataset with
 #: `huggingface_hub`, and the interpreter running npa in a vendor image is not the vendor's own
 #: venv, so the library is not necessarily importable there (live job 244).
+#: Requirements every stage that loads the real GR00T model needs. The
+#: redistributable image's uv-created Python 3.10 environment has no pip, and a
+#: source overlay can expose the current CLI while its conditional Python <3.11
+#: dependency is still absent (live job 446 failed on ``import tomli`` before
+#: the trainer started). The common installer's uv fallback targets the exact
+#: recorded interpreter.
+_GROOT_REAL_MODEL_REQUIREMENTS: tuple[tuple[str, str], ...] = (
+    ("python:tomli", "tomli>=2.0.0"),
+    (
+        'python:transformers;assert(__import__("importlib.metadata").metadata.version("transformers")=="4.57.3")',
+        "transformers==4.57.3",
+    ),
+)
+
 TOOL_REF_PIP_REQUIREMENTS: dict[str, tuple[tuple[str, str], ...]] = {
     # The OpenPI BYOF environment intentionally contains only upstream's
     # pinned runtime. Four-mode stages publish/read private object-storage
@@ -150,18 +164,14 @@ TOOL_REF_PIP_REQUIREMENTS: dict[str, tuple[tuple[str, str], ...]] = {
     # fails during import. Restore the upstream runtime exactly for real model
     # stages. A normal targeted install also restores its Hub/tokenizers closure
     # while leaving torch and the vendor GR00T package untouched.
-    "workbench.groot": (
-        # The redistributable image's uv-created Python 3.10 environment has no
-        # pip. A source overlay can expose the current CLI while its conditional
-        # Python <3.11 dependency is still absent; live job 446 then failed on
-        # ``import tomli`` before the trainer started. The common installer's uv
-        # fallback targets the exact recorded interpreter.
-        ("python:tomli", "tomli>=2.0.0"),
-        (
-            'python:transformers;assert(__import__("importlib.metadata").metadata.version("transformers")=="4.57.3")',
-            "transformers==4.57.3",
-        ),
-    ),
+    "workbench.groot": _GROOT_REAL_MODEL_REQUIREMENTS,
+    # Runs the same `_evaluate_checkpoint` -> Gr00tPolicy path as the evals, but
+    # sits under `workflow.groot`, so the `workbench.groot` prefix above does not
+    # reach it. Live job 281 imported gr00t.data.interfaces against the image's
+    # upgraded Transformers and died on
+    # `cannot import name 'is_offline_mode' from 'huggingface_hub'` -- after
+    # training had already produced all five checkpoints.
+    "workflow.groot.validate_checkpoints": _GROOT_REAL_MODEL_REQUIREMENTS,
     "workflow.groot.prepare_split": (("python:pyarrow", "pyarrow>=15,<22"),),
     "workflow.groot.compare_learning": (
         ("python:av", "av>=12,<17"),

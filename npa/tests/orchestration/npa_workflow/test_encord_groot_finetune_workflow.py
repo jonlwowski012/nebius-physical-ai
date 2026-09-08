@@ -366,3 +366,40 @@ def test_the_training_stage_is_the_one_that_needs_the_cli(
             f"{name} now shells out to the CLI and so depends on the "
             "light-workbench pin too"
         )
+
+
+def test_every_real_model_stage_pins_the_transformers_version() -> None:
+    """A stage that loads Gr00tPolicy must restore the upstream Transformers pin.
+
+    The redistributable GR00T image upgrades Transformers with `--no-deps`, so
+    the version present at runtime is newer than the 4.57.3 that GR00T commit
+    3df8b382 pins. Live job 281 ran `validate-checkpoints` without the pin and
+    died importing `gr00t.data.interfaces`:
+
+        ImportError: cannot import name 'is_offline_mode' from 'huggingface_hub'
+
+    It failed *after* training had produced all five checkpoints, which is the
+    expensive place to discover a missing dependency declaration. The pin was
+    keyed on the `workbench.groot` prefix, and `workflow.groot.*` stages that
+    run the same `_evaluate_checkpoint` path fall outside it.
+    """
+    from npa.orchestration.npa_workflow.skypilot_render import tool_pip_requirements
+
+    spec = load_spec(SPEC_PATH)
+    # Stages that build a real policy and run forward passes on a GPU.
+    real_model_states = {
+        "baseline-validation",
+        "baseline-final",
+        "train",
+        "validate-checkpoints",
+        "final-eval",
+    }
+
+    for name in sorted(real_model_states):
+        tool = spec.states[name].tool_ref
+        pinned = {spec for _probe, spec in tool_pip_requirements(tool)}
+        assert "transformers==4.57.3" in pinned, (
+            f"state {name!r} (toolRef {tool!r}) loads the real GR00T model but "
+            "does not pin transformers==4.57.3; it will import against the "
+            "image's upgraded Transformers and fail on huggingface_hub"
+        )
