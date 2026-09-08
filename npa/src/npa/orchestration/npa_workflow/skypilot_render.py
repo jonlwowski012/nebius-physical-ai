@@ -64,6 +64,14 @@ TOOL_REF_IMAGE_TOOL: dict[str, str] = {
     # must not inherit Isaac image routing or consent requirements.
     "workbench.genesis": "genesis",
     "workbench.groot": "groot",
+    # Two workflow.groot stages need the GR00T image rather than the default
+    # one the rest of that family runs on: prepare_dataset shells out to
+    # ffmpeg to split packed LeRobot v3 video, and validate_checkpoints runs
+    # real Gr00tPolicy forwards on a GPU. Exact entries, so the CPU-only
+    # members (compare_learning, the RRD/MCAP emitters) keep using the
+    # default image plus staged source.
+    "workflow.groot.prepare_dataset": "groot",
+    "workflow.groot.validate_checkpoints": "groot",
 }
 
 OPENPI_TERMS_ENV = "NPA_OPENPI_ACCEPT_GEMMA_TERMS"

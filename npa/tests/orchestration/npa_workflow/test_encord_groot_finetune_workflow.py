@@ -237,3 +237,37 @@ def test_spec_is_registered_for_live_submission() -> None:
     source = Path(submit_matrix.__file__).read_text(encoding="utf-8")
     assert "encord-groot-finetune.yaml" in source
     assert "ENCORD_SSH_KEY_B64" in source
+
+
+def test_gpu_stages_get_the_groot_image_not_the_default_one() -> None:
+    """A stage that imports gr00t or shells to ffmpeg cannot run image-less.
+
+    Caught on the way to a live submit: `workflow.groot.validate_checkpoints`
+    runs real `Gr00tPolicy` forwards and `workflow.groot.prepare_dataset` shells
+    out to ffmpeg to split packed LeRobot v3 video, yet both resolved to no
+    image and would have landed on SkyPilot's default one.
+    """
+    from npa.orchestration.npa_workflow.skypilot_render import tool_image_key
+
+    spec = load_spec(SPEC_PATH)
+    needs_groot = {
+        "prepare-dataset",
+        "baseline-validation",
+        "baseline-final",
+        "train",
+        "validate-checkpoints",
+        "final-eval",
+    }
+
+    for name in needs_groot:
+        tool = spec.states[name].tool_ref
+        assert tool_image_key(tool) == "groot", (
+            f"{name} ({tool}) must run in the GR00T image; it resolved to "
+            f"{tool_image_key(tool)!r}"
+        )
+
+    # The reporting stages deliberately stay on the default image plus staged
+    # source, which is where their [viz] extra comes from.
+    for name in ("compare", "emit-rrd", "emit-mcap", "publish", "prepare-split"):
+        tool = spec.states[name].tool_ref
+        assert tool_image_key(tool) is None, f"{name} ({tool}) should stay image-less"
