@@ -241,6 +241,12 @@ states:
       same seed under different curation is a different experiment.
     toolRef: workflow.groot.prepare_split
     resources: cpu
+    params:
+      # The cohorts must be cut from the CONVERTED dataset, not the raw input.
+      # `modality.json` is a GR00T artifact that conversion creates, so pointing
+      # this at `source_data_uri` (the catalog default, correct for a workflow
+      # with no conversion stage) fails with NoSuchKey on meta/modality.json.
+      source_data_uri: "{{config.prepared_data_uri}}"
     inputs:
       - {uri: "{{config.prepared_data_uri}}", schema: nvidia.groot.lerobot.v2}
       - {uri: "{{config.curation_manifest_uri}}", schema: npa.encord.pull_manifest.v1}

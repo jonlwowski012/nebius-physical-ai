@@ -86,6 +86,12 @@ Do not soften any of these when adapting the pipeline:
 - **The checkpoint schedule** requires `save_steps` to divide `max_steps` and
   retention to cover every checkpoint saved, because a deleted checkpoint
   cannot be selected.
+- **A declared language annotation must have task text.** When
+  `meta/modality.json` maps an annotation onto `task_index`, GR00T resolves
+  every frame's instruction through `meta/tasks.jsonl`, so empty task text
+  trains a language-conditioned policy that never sees its task. Loss still
+  falls and the run still reports an improvement, which is why this raises
+  instead of warning.
 
 ## Reading The Result
 
@@ -128,6 +134,16 @@ not measure recovery, timing, or contact, and it says nothing about hardware.
   and copies per-episode video byte-for-byte. It is idempotent, so converting
   once with `npa workbench groot convert` and pointing `source_data_uri` at the
   result makes later runs skip the work.
+- **Only `prepare-dataset` may read `source_data_uri`.** `modality.json` is a
+  GR00T artifact that conversion *creates*, so every later stage must consume
+  `prepared_data_uri`. The shared `workflow.groot.prepare_split` catalog entry
+  defaults `--source-uri` to the raw input, which is right for
+  `groot-1-7-finetune.yaml` and wrong here, so this spec overrides it with a
+  per-state `params` overlay. The spec validates and plans either way; the
+  mistake only surfaces as `NoSuchKey` minutes into a live submit.
+- **LeRobot v3 stores task text as the pandas index** of `meta/tasks.parquet`,
+  arriving as `__index_level_0__` rather than a `task` column. Reading only
+  `task` silently yields `""` for every v3 dataset.
 - **`encord_media_uri` hardcodes `chunk-000`**, correct below 1000 episodes
   since the chunk index is `episode_index // chunks_size`. A larger dataset
   needs a fan-out here.

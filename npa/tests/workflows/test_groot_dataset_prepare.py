@@ -25,6 +25,7 @@ from npa.adapter.groot import (
     DATASET_AUDIT,
     DATASET_AUDIT_SCHEMA,
     GR00TAdapterError,
+    _read_lerobot_task_rows,
     audit_dataset,
     lerobot_to_groot,
 )
@@ -935,3 +936,84 @@ def test_audit_treats_a_declared_zero_length_as_a_mismatch(tmp_path: Path) -> No
 
     with pytest.raises(GR00TAdapterError, match="declares 0 frames"):
         audit_dataset(out)
+
+
+def test_v3_task_text_survives_the_pandas_index_column(tmp_path: Path) -> None:
+    """LeRobot v3 stores task text as the pandas index, not a `task` column.
+
+    Found against the real `lerobot/svla_so100_pickplace` dataset, whose
+    `meta/tasks.parquet` has columns `['task_index', '__index_level_0__']`.
+    Reading only `task` produced an empty string for every v3 dataset, so the
+    converted dataset advertised no task at all and the audit reported
+    `tasks: []`.
+    """
+    meta = tmp_path / "meta"
+    meta.mkdir(parents=True)
+    pq.write_table(
+        pa.table(
+            {
+                "task_index": pa.array([0], type=pa.int64()),
+                "__index_level_0__": pa.array(["Pick up the cube."], type=pa.string()),
+            }
+        ),
+        meta / "tasks.parquet",
+    )
+
+    assert _read_lerobot_task_rows(tmp_path) == [
+        {"task_index": 0, "task": "Pick up the cube."}
+    ]
+
+
+def test_explicit_task_column_still_wins(tmp_path: Path) -> None:
+    """A v2.1-style `task` column must not be shadowed by the fallback."""
+    meta = tmp_path / "meta"
+    meta.mkdir(parents=True)
+    pq.write_table(
+        pa.table(
+            {
+                "task_index": pa.array([0], type=pa.int64()),
+                "task": pa.array(["real task"], type=pa.string()),
+                "__index_level_0__": pa.array(["index noise"], type=pa.string()),
+            }
+        ),
+        meta / "tasks.parquet",
+    )
+
+    assert _read_lerobot_task_rows(tmp_path)[0]["task"] == "real task"
+
+
+def test_audit_rejects_a_language_policy_with_no_task_text(tmp_path: Path) -> None:
+    """An empty instruction on a language-conditioned dataset is fatal.
+
+    Live run `encord-groot-finetune-20260908T181240Z` converted a dataset whose
+    `modality.json` maps `human.task_description` onto `task_index`, while
+    `tasks.jsonl` held `{"task_index": 0, "task": ""}` because the v3 task text
+    had been dropped. GR00T resolves the instruction through that mapping, so
+    training would have run to completion on an empty prompt and published an
+    improvement number for a policy that never saw its task. Loss still falls,
+    so nothing downstream would have caught it.
+    """
+    out = _converted(tmp_path, episodes=2, frames=3)
+    (out / "meta" / "tasks.jsonl").write_text(
+        json.dumps({"task_index": 0, "task": ""}) + "\n", encoding="utf-8"
+    )
+
+    with pytest.raises(GR00TAdapterError, match="no task text"):
+        audit_dataset(out)
+
+
+def test_audit_skips_the_language_check_without_an_annotation(tmp_path: Path) -> None:
+    """A dataset that declares no language annotation needs no task text."""
+    out = _converted(tmp_path, episodes=2, frames=3)
+    (out / "meta" / "tasks.jsonl").write_text(
+        json.dumps({"task_index": 0, "task": ""}) + "\n", encoding="utf-8"
+    )
+    _write_json(out / "meta" / "modality.json", {"state": {}, "action": {}})
+
+    report = audit_dataset(out)
+    check = next(
+        c
+        for c in report["checks"]
+        if c["name"] == "declared language annotation has task text"
+    )
+    assert check["status"] == "skipped"

@@ -24,6 +24,7 @@ import json
 import re
 import shutil
 import subprocess
+from collections.abc import Mapping
 from pathlib import Path
 from typing import Any
 
@@ -395,6 +396,15 @@ def audit_dataset(dataset_dir: Path) -> dict[str, Any]:
         for task in _read_groot_task_rows(dataset_dir)
         if str(task.get("task", ""))
     ]
+    language_annotation = _declared_language_annotation(dataset_dir)
+    if language_annotation and not tasks:
+        raise GR00TAdapterError(
+            f"Dataset declares the language annotation {language_annotation!r} in "
+            "meta/modality.json but meta/tasks.jsonl carries no task text. GR00T "
+            "would resolve every frame's instruction to an empty string and train "
+            "a language-conditioned policy that never sees its task, which still "
+            "reports a falling loss and a meaningless improvement number."
+        )
     report = {
         "schema": DATASET_AUDIT_SCHEMA,
         "status": "audited",
@@ -431,10 +441,33 @@ def audit_dataset(dataset_dir: Path) -> dict[str, Any]:
             {
                 "name": "every declared camera has episode video bytes",
                 "status": "passed" if camera_keys else "skipped",
-            }
+            },
+            {
+                "name": "declared language annotation has task text",
+                "status": "passed" if language_annotation else "skipped",
+            },
         ],
     }
     return report
+
+
+def _declared_language_annotation(dataset_dir: Path) -> str:
+    """Return the annotation key GR00T resolves to a language instruction.
+
+    `meta/modality.json` may map an annotation such as
+    ``human.task_description`` onto ``task_index``, which GR00T then resolves
+    through ``meta/tasks.jsonl``. When that mapping exists the task text is a
+    training input, not documentation, so the audit has to check it is there.
+    Returns "" when the dataset declares no language annotation.
+    """
+
+    modality_path = dataset_dir / "meta" / "modality.json"
+    if not modality_path.is_file():
+        return ""
+    annotation = _load_json(modality_path).get("annotation") or {}
+    if not isinstance(annotation, Mapping):
+        return ""
+    return next((str(key) for key in annotation if str(key)), "")
 
 
 def _flat_float64(column: Any) -> Any:
@@ -643,13 +676,32 @@ def _read_lerobot_episode_rows(input_dir: Path) -> list[dict[str, Any]]:
     return rows
 
 
+def _task_text(row: dict[str, Any]) -> str:
+    """Return the task string from a `tasks.parquet` row.
+
+    LeRobot v3 writes the task text as the *pandas index* of
+    `meta/tasks.parquet`, so it arrives as `__index_level_0__` rather than a
+    `task` column. Reading only `task` silently yielded "" for every v3
+    dataset, which then propagated into the converted `meta/tasks.jsonl` and
+    left the dataset audit reporting no tasks at all. Fall back to the lone
+    remaining string column so the text survives conversion.
+    """
+    direct = row.get("task")
+    if direct not in (None, ""):
+        return str(direct)
+    for key, value in row.items():
+        if key != "task_index" and isinstance(value, str) and value:
+            return value
+    return ""
+
+
 def _read_lerobot_task_rows(input_dir: Path) -> list[dict[str, Any]]:
     jsonl_rows = _read_jsonl(input_dir / "meta" / "tasks.jsonl")
     if jsonl_rows:
         return jsonl_rows
     rows = _table_rows(input_dir / "meta" / "tasks.parquet")
     return [
-        {"task_index": int(row.get("task_index", idx)), "task": str(row.get("task", ""))}
+        {"task_index": int(row.get("task_index", idx)), "task": _task_text(row)}
         for idx, row in enumerate(rows)
     ]
 

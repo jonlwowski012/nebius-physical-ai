@@ -271,3 +271,46 @@ def test_gpu_stages_get_the_groot_image_not_the_default_one() -> None:
     for name in ("compare", "emit-rrd", "emit-mcap", "publish", "prepare-split"):
         tool = spec.states[name].tool_ref
         assert tool_image_key(tool) is None, f"{name} ({tool}) should stay image-less"
+
+
+def test_every_dataset_reader_after_conversion_reads_the_converted_dataset() -> None:
+    """Only `prepare-dataset` may read the raw input.
+
+    Found by live run `encord-groot-finetune-20260908T181240Z`, which failed at
+    `prepare-split` with `NoSuchKey` on
+    `datasets/so100-pickplace/meta/modality.json`. `modality.json` is a GR00T
+    artifact that *conversion creates*, so a raw LeRobot v3 dataset has none.
+    The shared `workflow.groot.prepare_split` catalog entry defaults
+    `--source-uri` to `config.source_data_uri`, which is correct for
+    `groot-1-7-finetune.yaml` (already GR00T, no conversion stage) and wrong
+    here, so this spec overrides it per state.
+
+    The dangerous part is that the spec validates, plans, and renders cleanly
+    either way; the failure only appears minutes into a live submit.
+    """
+    spec = load_spec(SPEC_PATH)
+    steps = {step.state: list(step.argv) for step in build_plan(spec, run_id="conv").steps}
+
+    raw = "datasets/lerobot-source/"
+    prepared = "data/prepared/"
+
+    source = steps["prepare-dataset"]
+    assert raw in source[source.index("--source-uri") + 1], (
+        "prepare-dataset must read the raw input dataset"
+    )
+
+    split = steps["prepare-split"]
+    read = split[split.index("--source-uri") + 1]
+    assert prepared in read and raw not in read, (
+        f"prepare-split reads {read!r}; it must read the converted dataset, "
+        "because meta/modality.json only exists after conversion"
+    )
+
+    for state, argv in steps.items():
+        if state == "prepare-dataset":
+            continue
+        offenders = [value for value in argv if raw in str(value)]
+        assert not offenders, (
+            f"state {state!r} reads the raw dataset {offenders!r}; every stage "
+            "after conversion must consume the converted dataset"
+        )
