@@ -2364,17 +2364,15 @@ TOOL_CATALOG: dict[str, ToolEntry] = {
             "tune-diffusion-model=true",
             "--run-id",
             "{{run.id}}",
-            # W&B is the live view of a training run. `enabled` stays on and the
-            # mode carries the switch, so a spec opts out with
-            # `--var wandb_mode=disabled` without the argv template changing.
-            "--wandb",
+            # W&B is opt-in per workflow, not a GR00T-wide default: both flags
+            # drop out when their config value is empty, so a spec that says
+            # nothing trains exactly as before. Naming a mode is the switch.
             "--wandb-mode",
             "{{config.wandb_mode}}",
             "--wandb-project",
             "{{config.wandb_project}}",
-            "--wandb-run-name",
-            "{{run.id}}",
         ],
+        omit_flags_when_empty=("--wandb-mode", "--wandb-project"),
     ),
     "workflow.groot.validate_checkpoints": ToolEntry(
         name="workflow.groot.validate_checkpoints",

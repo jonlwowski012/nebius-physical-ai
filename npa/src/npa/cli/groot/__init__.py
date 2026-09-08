@@ -3442,7 +3442,12 @@ def finetune_cmd(
     wandb_project: str = typer.Option("", "--wandb-project", help="W&B project name."),
     wandb_run_name: str = typer.Option("", "--wandb-run-name", help="W&B run name."),
     wandb_mode: str = typer.Option(
-        "offline", "--wandb-mode", help="W&B mode such as online, offline, or disabled."
+        "",
+        "--wandb-mode",
+        help=(
+            "W&B mode: online, offline, or disabled. Naming any mode but disabled "
+            "enables W&B, so --wandb is not also required."
+        ),
     ),
     checkpoint_s3_uri: str = typer.Option(
         "", "--checkpoint-s3-uri", help="S3 URI for checkpoint upload."
@@ -3544,11 +3549,15 @@ def finetune_cmd(
                 "--global-batch-size must equal num_gpus * per-device-batch-size * "
                 f"gradient-accumulation-steps; expected {effective}, got {global_batch_size}"
             )
+    # Naming a mode is itself the switch, so a workflow argv can carry the
+    # decision in a droppable valued flag rather than a bare --wandb, which a
+    # fixed argv template could never leave out.
+    wandb_on = wandb_enabled or wandb_mode.strip().lower() not in {"", "disabled"}
     try:
         training_config = build_training_config(
             data_path=data_path,
             overrides=override,
-            wandb_enabled=wandb_enabled,
+            wandb_enabled=wandb_on,
             wandb_project=wandb_project,
             wandb_run_name=wandb_run_name,
             wandb_mode=wandb_mode,
@@ -3573,7 +3582,7 @@ def finetune_cmd(
             training_config = build_training_config(
                 data_path=effective_input_path,
                 overrides=override,
-                wandb_enabled=wandb_enabled,
+                wandb_enabled=wandb_on,
                 wandb_project=wandb_project,
                 wandb_run_name=wandb_run_name,
                 wandb_mode=wandb_mode,

@@ -379,3 +379,42 @@ def test_validation_rejects_a_non_finite_candidate_error(
 
     with pytest.raises(GrootVisualizationError, match="non-finite validation error"):
         _run(client)
+
+
+# --------------------------------------------------------------------------
+# W&B is opt-in per workflow, not a GR00T-wide default
+# --------------------------------------------------------------------------
+
+
+def test_wandb_flags_are_declared_droppable_not_always_on() -> None:
+    """A GR00T workflow that says nothing about W&B must train as before."""
+    from npa.orchestration.npa_workflow.catalog import TOOL_CATALOG
+
+    entry = TOOL_CATALOG["workbench.groot.finetune"]
+    # No bare enable flag: a fixed argv template could never drop one, which
+    # would make W&B a default for every GR00T workflow.
+    assert "--wandb" not in entry.argv_template
+    assert "--wandb-mode" in entry.argv_template
+    assert set(entry.omit_flags_when_empty) == {"--wandb-mode", "--wandb-project"}
+
+
+@pytest.mark.parametrize(
+    "flag, mode, expected_mode, expected_enabled",
+    [
+        pytest.param(False, "", "disabled", "0", id="nothing-requested-stays-off"),
+        pytest.param(True, "", "offline", "1", id="bare-flag-unchanged"),
+        pytest.param(False, "online", "online", "1", id="mode-alone-enables"),
+        pytest.param(False, "disabled", "disabled", "0", id="disabled-mode-stays-off"),
+    ],
+)
+def test_naming_a_mode_is_the_switch(
+    flag: bool, mode: str, expected_mode: str, expected_enabled: str
+) -> None:
+    """The CLI derives enablement from the mode so a valued flag can carry it."""
+    from npa.workbench.training_config import build_training_config
+
+    enabled = flag or mode.strip().lower() not in {"", "disabled"}
+    env = build_training_config(wandb_enabled=enabled, wandb_mode=mode).wandb.env()
+
+    assert env["WANDB_MODE"] == expected_mode
+    assert env["NPA_TRAINING_WANDB_ENABLED"] == expected_enabled
