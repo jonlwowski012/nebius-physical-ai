@@ -38,7 +38,7 @@ def test_fetch_dataset_requires_an_immutable_revision(revision: str) -> None:
             REPO,
             "--revision",
             revision,
-            "--output-uri",
+            "--output-path",
             "s3://bucket/datasets/so100/",
         ],
     )
@@ -78,11 +78,11 @@ def test_fetch_dataset_stages_and_records_provenance(tmp_path: Path, mocker) -> 
             REPO,
             "--revision",
             REVISION,
-            "--output-uri",
+            "--output-path",
             "s3://bucket/datasets/so100/",
             "--license",
             "apache-2.0",
-            "--output",
+            "--output-format",
             "json",
         ],
     )
@@ -138,7 +138,7 @@ def test_fetch_dataset_reports_a_rejected_dataset_without_staging(
             REPO,
             "--revision",
             REVISION,
-            "--output-uri",
+            "--output-path",
             "s3://bucket/datasets/so100/",
         ],
     )

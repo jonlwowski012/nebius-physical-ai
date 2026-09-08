@@ -232,6 +232,8 @@ def _split_candidates(
     if candidates is None:
         return list(range(int(episode_count)))
     resolved = [int(index) for index in candidates]
+    if not resolved:
+        raise GrootVisualizationError("no episodes are eligible for the split")
     if len(resolved) != len(set(resolved)):
         raise GrootVisualizationError("eligible episode ids contain duplicates")
     outside = sorted(
@@ -242,8 +244,6 @@ def _split_candidates(
             f"eligible episode ids fall outside the dataset's {episode_count} "
             f"episodes: {outside}"
         )
-    if not resolved:
-        raise GrootVisualizationError("no episodes are eligible for the split")
     return resolved
 
 
@@ -763,29 +763,6 @@ def _materialize_split(
 DATASET_PREPARE_SCHEMA = "npa.groot.dataset_prepare.v1"
 
 
-def _upload_dataset(client: Any, directory: Path, uri: str) -> dict[str, Any]:
-    """Upload a dataset directory verbatim.
-
-    Deliberately not :func:`_upload_directory`: that one derives checkpoint
-    weight identity and fails closed when a directory holds no model weights,
-    which is exactly what a dataset is.
-    """
-
-    ref = _split_s3(uri, require_key=False)
-    prefix = ref.key.rstrip("/")
-    objects = 0
-    total = 0
-    for path in sorted(item for item in directory.rglob("*") if item.is_file()):
-        relative = path.relative_to(directory).as_posix()
-        key = "/".join(part for part in (prefix, relative) if part)
-        record = _put_bytes(client, _object_uri(ref.bucket, key), path.read_bytes())
-        objects += 1
-        total += int(record["bytes"])
-    if not objects:
-        raise GrootVisualizationError(f"prepared dataset is empty: {directory}")
-    return {"uri": uri, "objects": objects, "bytes": total}
-
-
 def prepare_dataset(
     source_uri: str,
     output_uri: str,
@@ -807,7 +784,6 @@ def prepare_dataset(
     from npa.adapter.groot import (
         DATASET_AUDIT,
         GR00TAdapterError,
-        audit_dataset,
         lerobot_to_groot,
     )
 
@@ -815,23 +791,22 @@ def prepare_dataset(
     with tempfile.TemporaryDirectory(prefix="npa-groot-prepare-") as tmp:
         root = Path(tmp)
         source = root / "source"
-        source.mkdir(parents=True, exist_ok=True)
-        downloaded = _download_prefix(client, source_uri, source)
-        if not downloaded:
-            raise GrootVisualizationError(
-                f"source dataset is empty or unreadable: {source_uri}"
-            )
+        # _download_prefix fails closed on an empty prefix and creates parents.
+        _download_prefix(client, source_uri, source)
         try:
             converted = lerobot_to_groot(
                 source, root / "prepared", robot_embodiment=robot_embodiment
             )
-            audit = audit_dataset(converted)
         except GR00TAdapterError as exc:
             # The adapter's fail-closed messages name the offending episode or
             # feature; keep them verbatim rather than a generic stage failure.
             raise GrootVisualizationError(str(exc)) from exc
-        uploaded = _upload_dataset(client, converted, output_uri)
+        uploaded = _upload_tree(client, converted, output_uri, label="prepared dataset")
+        # Conversion already audited what it wrote and serialized it here, so
+        # read those exact bytes rather than auditing the directory a second
+        # time: the published digest then matches the copy inside the dataset.
         audit_bytes = (converted / "meta" / DATASET_AUDIT).read_bytes()
+        audit = json.loads(audit_bytes)
 
     published = _put_bytes(
         client, audit_uri, audit_bytes, content_type="application/json"
@@ -844,13 +819,13 @@ def prepare_dataset(
         "output_uri": output_uri,
         "audit_uri": audit_uri,
         "robot_embodiment": robot_embodiment,
-        "objects_uploaded": int(uploaded.get("objects") or 0),
+        "objects_uploaded": uploaded["objects"],
         "dataset": audit["dataset"],
         "tasks": audit["tasks"],
         "cameras": audit["cameras"],
         "advisories": audit["advisories"],
-        "audit_sha256": _sha256_bytes(audit_bytes),
-        "audit_bytes": int(published.get("bytes") or 0),
+        "audit_sha256": published["sha256"],
+        "audit_bytes": published["bytes"],
     }
     print(json.dumps(result, indent=2, sort_keys=True))
     return result
@@ -876,70 +851,74 @@ def curated_episode_ids(
     change the experiment's training set.
     """
 
+    from pydantic import ValidationError
+
     from npa.workbench.encord.schemas import (
         PULL_MANIFEST_SCHEMA,
         ROUNDTRIP_REPORT_SCHEMA,
+        PullManifest,
+        RoundtripReport,
     )
 
-    schema = str(manifest.get("schema") or "")
-    if schema != PULL_MANIFEST_SCHEMA:
+    # The Encord tool owns these contracts, so validate through its models
+    # rather than walking raw dicts: they forbid unknown fields, which a
+    # hand-rolled `.get()` walk would silently read as empty.
+    if str(manifest.get("schema") or "") != PULL_MANIFEST_SCHEMA:
         raise GrootVisualizationError(
-            f"curation manifest is not a {PULL_MANIFEST_SCHEMA}: {schema or 'unknown'}"
+            f"curation manifest is not a {PULL_MANIFEST_SCHEMA}: "
+            f"{manifest.get('schema') or 'unknown'}"
         )
+    try:
+        pulled = PullManifest.model_validate(dict(manifest))
+    except ValidationError as exc:
+        raise GrootVisualizationError(f"curation manifest is malformed: {exc}") from exc
     if report is not None:
-        report_schema = str(report.get("schema") or "")
-        if report_schema != ROUNDTRIP_REPORT_SCHEMA:
+        if str(report.get("schema") or "") != ROUNDTRIP_REPORT_SCHEMA:
             raise GrootVisualizationError(
                 f"curation report is not a {ROUNDTRIP_REPORT_SCHEMA}: "
-                f"{report_schema or 'unknown'}"
+                f"{report.get('schema') or 'unknown'}"
             )
-        if str(report.get("status") or "") != "passed":
+        try:
+            verified = RoundtripReport.model_validate(dict(report))
+        except ValidationError as exc:
+            raise GrootVisualizationError(
+                f"curation report is malformed: {exc}"
+            ) from exc
+        if verified.status != "passed":
             raise GrootVisualizationError(
                 "curation roundtrip report did not pass; refusing to train on media "
                 "whose identity was not verified"
             )
-    items = manifest.get("items") or []
-    if not isinstance(items, Sequence) or not items:
+    if not pulled.items:
         raise GrootVisualizationError("curation manifest selected no items")
     attributed: list[dict[str, Any]] = []
     episode_ids: set[int] = set()
-    for position, item in enumerate(items):
-        if not isinstance(item, Mapping):
+    for position, item in enumerate(pulled.items):
+        if item.error:
             raise GrootVisualizationError(
-                f"curation manifest item {position} is not an object"
+                f"curation manifest item {position} failed: {item.error}"
             )
-        error = str(item.get("error") or "")
-        if error:
-            raise GrootVisualizationError(
-                f"curation manifest item {position} failed: {error}"
-            )
-        identity = str(item.get("source_uri") or "")
-        name = str(item.get("name") or "")
-        match = _EPISODE_MEDIA.search(identity) or _EPISODE_MEDIA.search(name)
+        # Identity is the registered npa.source_uri, never the display name --
+        # the Encord tool's identity module is explicit that a title is not
+        # identity, so an item without one fails closed rather than guessing.
+        match = _EPISODE_MEDIA.search(item.source_uri)
         if match is None:
             raise GrootVisualizationError(
                 "curation manifest item cannot be attributed to a dataset episode "
-                f"(source_uri={identity or 'empty'!r}, name={name or 'empty'!r}); "
-                "expected converted media named episode_<index>.<ext>"
+                f"(source_uri={item.source_uri or 'empty'!r}); expected converted "
+                "media named episode_<index>.<ext>"
             )
         episode_index = int(match.group(1))
         episode_ids.add(episode_index)
         attributed.append(
             {
                 "episode_index": episode_index,
-                "item_uuid": str(item.get("item_uuid") or ""),
-                "source_uri": identity,
-                "name": name,
-                "attributed_by": "source_uri"
-                if _EPISODE_MEDIA.search(identity)
-                else "name",
+                "item_uuid": item.item_uuid,
+                "source_uri": item.source_uri,
+                "name": item.name,
             }
         )
-    return {
-        "episode_ids": sorted(episode_ids),
-        "items": attributed,
-        "items_total": len(attributed),
-    }
+    return {"episode_ids": sorted(episode_ids), "items": attributed}
 
 
 def prepare_split(
@@ -1001,6 +980,20 @@ def prepare_split(
             ),
         )
         candidates = list(curation["episode_ids"])
+    eligible = candidates if candidates is not None else list(range(count))
+    selection: dict[str, Any] = {
+        "source": "encord-curation" if curation is not None else "whole-dataset",
+        "eligible_episodes": len(eligible),
+        "eligible_source_episode_ids": eligible,
+        "excluded_by_curation": sorted(set(range(count)) - set(eligible)),
+        "encord_items": curation["items"] if curation is not None else [],
+    }
+    if curation is not None:
+        selection |= {
+            "curation_manifest_uri": curation_manifest_uri,
+            "curation_report_uri": curation_report_uri,
+            "roundtrip_verified": bool(curation_report_uri),
+        }
     if final_episodes:
         if not final_uri:
             raise GrootVisualizationError("final episode split requires a final URI")
@@ -1102,9 +1095,7 @@ def prepare_split(
         # Curation changes which episodes were eligible, so it must change the
         # split identity: two runs with the same seed and different curation are
         # different experiments.
-        "curation_eligible_episode_ids": (
-            list(curation["episode_ids"]) if curation is not None else None
-        ),
+        "curation_eligible_episode_ids": candidates,
     }
     split_hash = _sha256_bytes(_json_bytes(split_core))
     action_shape = (info.get("features") or {}).get("action", {}).get("shape") or []
@@ -1158,28 +1149,7 @@ def prepare_split(
             "source_episode_ids": split["excluded"],
             "reason": "outside the deterministic experiment cohort",
         },
-        "selection": (
-            {
-                "source": "encord-curation",
-                "curation_manifest_uri": curation_manifest_uri,
-                "curation_report_uri": curation_report_uri,
-                "roundtrip_verified": bool(curation_report_uri),
-                "eligible_episodes": len(curation["episode_ids"]),
-                "eligible_source_episode_ids": curation["episode_ids"],
-                "excluded_by_curation": sorted(
-                    set(range(count)) - set(curation["episode_ids"])
-                ),
-                "encord_items": curation["items"],
-            }
-            if curation is not None
-            else {
-                "source": "whole-dataset",
-                "eligible_episodes": count,
-                "eligible_source_episode_ids": list(range(count)),
-                "excluded_by_curation": [],
-                "encord_items": [],
-            }
-        ),
+        "selection": selection,
         "integrity": {
             "episode_overlap": [],
             "leakage_free": True,
@@ -1238,24 +1208,41 @@ def _download_prefix(client: Any, uri: str, destination: Path) -> list[Path]:
     return downloaded
 
 
-def _upload_directory(client: Any, directory: Path, uri: str) -> dict[str, Any]:
+def _upload_tree(
+    client: Any, directory: Path, uri: str, *, label: str = "directory"
+) -> dict[str, Any]:
+    """Upload every file under ``directory``, failing closed on an empty tree.
+
+    This is the plain transfer. :func:`_upload_directory` layers checkpoint
+    weight identity on top, which a dataset must not be judged by.
+    """
+
     ref = _split_s3(uri, require_key=False)
     prefix = ref.key.rstrip("/")
     objects: list[dict[str, Any]] = []
     for path in sorted(item for item in directory.rglob("*") if item.is_file()):
         relative = path.relative_to(directory).as_posix()
         key = "/".join(part for part in (prefix, relative) if part)
-        payload = path.read_bytes()
-        record = _put_bytes(client, _object_uri(ref.bucket, key), payload)
+        record = _put_bytes(client, _object_uri(ref.bucket, key), path.read_bytes())
         record["relative_path"] = relative
         objects.append(record)
     if not objects:
-        raise GrootVisualizationError(f"checkpoint directory is empty: {directory}")
-    local_identity = _checkpoint_identity(directory)
+        raise GrootVisualizationError(f"{label} is empty: {directory}")
     return {
         "uri": uri,
         "objects": len(objects),
         "bytes": sum(int(item["bytes"]) for item in objects),
+        "files": objects,
+    }
+
+
+def _upload_directory(client: Any, directory: Path, uri: str) -> dict[str, Any]:
+    uploaded = _upload_tree(client, directory, uri, label="checkpoint directory")
+    local_identity = _checkpoint_identity(directory)
+    return {
+        "uri": uri,
+        "objects": uploaded["objects"],
+        "bytes": uploaded["bytes"],
         **{
             key: value
             for key, value in local_identity.items()

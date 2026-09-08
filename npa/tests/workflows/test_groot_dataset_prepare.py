@@ -55,7 +55,6 @@ def _v3_dataset(
     episodes: int = 4,
     frames: int = 3,
     fps: int = 20,
-    state_dim: int = 3,
     constant_action_dim: bool = False,
     timestamps: list[float] | None = None,
     cameras: bool = False,
@@ -77,15 +76,13 @@ def _v3_dataset(
     for episode in range(episodes):
         for frame in range(frames):
             base = float(episode * frames + frame)
-            states.append([base + offset for offset in range(state_dim)])
+            states.append([base, base + 1, base + 2])
             last = 0.0 if constant_action_dim else float(frame % 2)
             actions.append([base * 0.1, base * 0.2, last])
             stamps.append(timestamps[frame] if timestamps is not None else frame / fps)
     data = pa.table(
         {
-            "observation.state": pa.array(
-                states, type=pa.list_(pa.float32(), state_dim)
-            ),
+            "observation.state": pa.array(states, type=pa.list_(pa.float32(), 3)),
             "action": pa.array(actions, type=pa.list_(pa.float32(), 3)),
             "episode_index": pa.array(
                 [episode for episode in range(episodes) for _ in range(frames)],
@@ -143,7 +140,7 @@ def _v3_dataset(
         root / "meta" / "tasks.parquet",
     )
     features: dict[str, Any] = {
-        "observation.state": {"dtype": "float32", "shape": [state_dim], "names": None},
+        "observation.state": {"dtype": "float32", "shape": [3], "names": None},
         "action": {
             "dtype": "float32",
             "shape": [3],
@@ -216,7 +213,7 @@ def test_conversion_publishes_an_audit_of_the_dataset_it_wrote(tmp_path: Path) -
 
 
 def test_audit_reports_per_dimension_ranges_a_company_can_read(tmp_path: Path) -> None:
-    out = _converted(tmp_path, episodes=2, frames=2, state_dim=3)
+    out = _converted(tmp_path, episodes=2, frames=2)
 
     audit = audit_dataset(out)
     state = audit["tensors"]["observation.state"]
@@ -255,7 +252,9 @@ def test_audit_flags_an_irregular_timebase_without_blocking(tmp_path: Path) -> N
     assert audit["dataset"]["episodes"] == 4
 
 
-def test_audit_records_camera_coverage(tmp_path: Path) -> None:
+def test_audit_records_camera_coverage(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
     source = _v3_dataset(tmp_path / "source", episodes=2, frames=2)
     info_path = source / "meta" / "info.json"
     info = json.loads(info_path.read_text())
@@ -270,19 +269,16 @@ def test_audit_records_camera_coverage(tmp_path: Path) -> None:
     _write_json(info_path, info)
     episodes_path = source / "meta" / "episodes" / "chunk-000" / "file-000.parquet"
     episodes = pq.read_table(episodes_path)
-    for column, values in (
-        ("videos/observation.images.top/chunk_index", [0, 0]),
-        ("videos/observation.images.top/file_index", [0, 0]),
+    # Both episodes live in one packed video file, at different offsets.
+    for suffix, values, dtype in (
+        ("chunk_index", [0, 0], pa.int64()),
+        ("file_index", [0, 0], pa.int64()),
+        ("from_timestamp", [0.0, 0.1], pa.float64()),
+        ("to_timestamp", [0.1, 0.2], pa.float64()),
     ):
-        episodes = episodes.append_column(column, pa.array(values, type=pa.int64()))
-    episodes = episodes.append_column(
-        "videos/observation.images.top/from_timestamp",
-        pa.array([0.0, 0.1], type=pa.float64()),
-    )
-    episodes = episodes.append_column(
-        "videos/observation.images.top/to_timestamp",
-        pa.array([0.1, 0.2], type=pa.float64()),
-    )
+        episodes = episodes.append_column(
+            f"videos/{CAMERA}/{suffix}", pa.array(values, type=dtype)
+        )
     pq.write_table(episodes, episodes_path)
     packed = source / "videos" / "observation.images.top" / "chunk-000" / "file-000.mp4"
     packed.parent.mkdir(parents=True)
@@ -291,19 +287,13 @@ def test_audit_records_camera_coverage(tmp_path: Path) -> None:
     def fake_run(command: list[str], **_kwargs: object) -> None:
         Path(command[-1]).write_bytes(b"episode-video")
 
-    import npa.adapter.groot as adapter
-
-    original_which = adapter.shutil.which
-    original_run = adapter.subprocess.run
-    adapter.shutil.which = lambda name: f"/usr/bin/{name}"  # type: ignore[assignment]
-    adapter.subprocess.run = fake_run  # type: ignore[assignment]
-    try:
-        out = lerobot_to_groot(
-            source, tmp_path / "groot", robot_embodiment="NEW_EMBODIMENT"
-        )
-    finally:
-        adapter.shutil.which = original_which  # type: ignore[assignment]
-        adapter.subprocess.run = original_run  # type: ignore[assignment]
+    monkeypatch.setattr(
+        "npa.adapter.groot.shutil.which", lambda name: "/usr/bin/ffmpeg"
+    )
+    monkeypatch.setattr("npa.adapter.groot.subprocess.run", fake_run)
+    out = lerobot_to_groot(
+        source, tmp_path / "groot", robot_embodiment="NEW_EMBODIMENT"
+    )
 
     audit = json.loads((out / "meta" / DATASET_AUDIT).read_text())
     cameras = {camera["original_key"]: camera for camera in audit["cameras"]}
@@ -317,36 +307,100 @@ def test_audit_records_camera_coverage(tmp_path: Path) -> None:
     )
 
 
+def _episode_parquet(root: Path, episode: int = 0) -> Path:
+    return root / "data" / "chunk-000" / f"episode_{episode:06d}.parquet"
+
+
+def _patch_info(root: Path, mutate: Any) -> None:
+    """Rewrite meta/info.json through ``mutate``."""
+    path = root / "meta" / "info.json"
+    info = json.loads(path.read_text())
+    mutate(info)
+    _write_json(path, info)
+
+
+def _set_column(root: Path, name: str, values: Any, dtype: Any) -> None:
+    """Replace one column of episode 0's data file."""
+    path = _episode_parquet(root)
+    table = pq.read_table(path)
+    position = table.schema.get_field_index(name)
+    table = table.set_column(position, name, pa.array(values, type=dtype))
+    pq.write_table(table, path)
+
+
+def _declare_length(root: Path, length: int) -> None:
+    path = root / "meta" / "episodes.jsonl"
+    rows = [json.loads(line) for line in path.read_text().splitlines() if line.strip()]
+    rows[0]["length"] = length
+    path.write_text("".join(json.dumps(row) + "\n" for row in rows))
+
+
+#: A camera declared in metadata whose bytes were never recorded.
+_PHANTOM_CAMERA = {
+    "dtype": "video",
+    "shape": [48, 64, 3],
+    "names": ["height", "width", "channel"],
+}
+
+
 @pytest.mark.parametrize(
     "mutate, expected",
     [
         pytest.param(
-            lambda root: _corrupt_action(root, float("nan")),
+            lambda root: _set_column(
+                root,
+                "action",
+                [[0.0, 0.0, 0.0], [float("nan"), 0.0, 0.0], [0.0, 0.0, 0.0]],
+                pa.list_(pa.float32(), 3),
+            ),
             "non-finite",
             id="non-finite-action",
         ),
         pytest.param(
-            lambda root: _corrupt_declared_length(root),
+            lambda root: _declare_length(root, 99),
             "declares 99 frames",
             id="length-mismatch",
         ),
         pytest.param(
-            lambda root: _corrupt_timestamps(root),
+            # A zero is metadata claiming an empty episode, not a missing value.
+            lambda root: _declare_length(root, 0),
+            "declares 0 frames",
+            id="zero-declared-length",
+        ),
+        pytest.param(
+            lambda root: _set_column(root, "timestamp", [0.0, 0.2, 0.1], pa.float32()),
             "do not increase",
             id="non-monotonic-timestamps",
         ),
         pytest.param(
-            lambda root: _corrupt_fps(root),
+            lambda root: _patch_info(root, lambda info: info.update(fps=0)),
             "no positive fps",
             id="zero-fps",
         ),
         pytest.param(
-            lambda root: _corrupt_declared_dim(root),
+            lambda root: _patch_info(
+                root, lambda info: info["features"]["action"].update(shape=[7])
+            ),
             "metadata declares 7",
             id="declared-dimension-mismatch",
         ),
         pytest.param(
-            lambda root: _remove_episode_data(root),
+            lambda root: _patch_info(root, lambda info: info["features"].pop("action")),
+            "declares no 'action' feature",
+            id="missing-action-feature",
+        ),
+        pytest.param(
+            lambda root: _patch_info(
+                root,
+                lambda info: info["features"].update(
+                    {"observation.images.side": _PHANTOM_CAMERA}
+                ),
+            ),
+            "no video bytes",
+            id="declared-camera-without-bytes",
+        ),
+        pytest.param(
+            lambda root: _episode_parquet(root, 1).unlink(),
             "has no data file",
             id="missing-episode-data",
         ),
@@ -363,82 +417,16 @@ def test_audit_fails_closed_on_data_no_optimizer_can_recover_from(
     assert expected in str(excinfo.value)
 
 
-def _episode_parquet(root: Path, episode: int = 0) -> Path:
-    return root / "data" / "chunk-000" / f"episode_{episode:06d}.parquet"
-
-
-def _corrupt_action(root: Path, value: float) -> None:
-    path = _episode_parquet(root)
-    table = pq.read_table(path)
-    actions = table["action"].to_pylist()
-    actions[1] = [value, 0.0, 0.0]
-    position = table.schema.get_field_index("action")
-    table = table.set_column(
-        position, "action", pa.array(actions, type=pa.list_(pa.float32(), 3))
+def test_audit_rejects_a_width_that_divides_into_the_declared_one(
+    tmp_path: Path,
+) -> None:
+    """A modulo check would wave this through; the row count catches it."""
+    out = _converted(tmp_path, episodes=2, frames=3)
+    _patch_info(
+        root=out, mutate=lambda info: info["features"]["action"].update(shape=[1])
     )
-    pq.write_table(table, path)
 
-
-def _corrupt_declared_length(root: Path) -> None:
-    path = root / "meta" / "episodes.jsonl"
-    rows = [json.loads(line) for line in path.read_text().splitlines() if line.strip()]
-    rows[0]["length"] = 99
-    path.write_text("".join(json.dumps(row) + "\n" for row in rows))
-
-
-def _corrupt_timestamps(root: Path) -> None:
-    path = _episode_parquet(root)
-    table = pq.read_table(path)
-    position = table.schema.get_field_index("timestamp")
-    table = table.set_column(
-        position,
-        "timestamp",
-        pa.array([0.0, 0.2, 0.1], type=pa.float32()),
-    )
-    pq.write_table(table, path)
-
-
-def _corrupt_fps(root: Path) -> None:
-    path = root / "meta" / "info.json"
-    info = json.loads(path.read_text())
-    info["fps"] = 0
-    _write_json(path, info)
-
-
-def _corrupt_declared_dim(root: Path) -> None:
-    path = root / "meta" / "info.json"
-    info = json.loads(path.read_text())
-    info["features"]["action"]["shape"] = [7]
-    _write_json(path, info)
-
-
-def _remove_episode_data(root: Path) -> None:
-    _episode_parquet(root, 1).unlink()
-
-
-def test_audit_requires_a_state_and_action_feature(tmp_path: Path) -> None:
-    out = _converted(tmp_path, episodes=2, frames=2)
-    info_path = out / "meta" / "info.json"
-    info = json.loads(info_path.read_text())
-    del info["features"]["action"]
-    _write_json(info_path, info)
-
-    with pytest.raises(GR00TAdapterError, match="declares no 'action' feature"):
-        audit_dataset(out)
-
-
-def test_audit_fails_closed_when_a_declared_camera_has_no_bytes(tmp_path: Path) -> None:
-    out = _converted(tmp_path, episodes=2, frames=2)
-    info_path = out / "meta" / "info.json"
-    info = json.loads(info_path.read_text())
-    info["features"]["observation.images.top"] = {
-        "dtype": "video",
-        "shape": [48, 64, 3],
-        "names": ["height", "width", "channel"],
-    }
-    _write_json(info_path, info)
-
-    with pytest.raises(GR00TAdapterError, match="no video bytes"):
+    with pytest.raises(GR00TAdapterError, match="is 3 wide but metadata declares 1"):
         audit_dataset(out)
 
 
@@ -460,79 +448,107 @@ def _item(
     return item
 
 
-def test_curation_resolves_episodes_across_every_pushed_camera() -> None:
-    manifest = {
+def _manifest(items: list[dict[str, Any]], **overrides: Any) -> dict[str, Any]:
+    """A complete pull manifest. The Encord model rejects a partial one."""
+    payload: dict[str, Any] = {
         "schema": PULL_SCHEMA,
-        "items": [
-            _item(3),
-            _item(7),
-            _item(3, camera="observation.images.wrist"),
-        ],
+        "generated_at": "2026-09-08T00:00:00Z",
+        "encord_domain": "app.encord.com",
+        "source_kind": "collection",
+        "source_id": "npa-curated-run-1",
+        "output_uri": "s3://bucket/curate/",
+        "items": items,
     }
+    payload.update(overrides)
+    return payload
 
-    resolved = curated_episode_ids(manifest)
+
+def _report(status: str = "passed", **overrides: Any) -> dict[str, Any]:
+    payload: dict[str, Any] = {
+        "schema": REPORT_SCHEMA,
+        "generated_at": "2026-09-08T00:00:00Z",
+        "receipt_uri": "s3://bucket/push/push_receipt.json",
+        "manifest_uri": "s3://bucket/curate/manifest.json",
+        "status": status,
+    }
+    payload.update(overrides)
+    return payload
+
+
+def test_curation_resolves_episodes_across_every_pushed_camera() -> None:
+    resolved = curated_episode_ids(
+        _manifest([_item(3), _item(7), _item(3, camera="observation.images.wrist")])
+    )
+
     assert resolved["episode_ids"] == [3, 7]
-    assert resolved["items_total"] == 3
-    assert {item["attributed_by"] for item in resolved["items"]} == {"source_uri"}
+    assert [item["episode_index"] for item in resolved["items"]] == [3, 7, 3]
 
 
 def test_curation_accepts_a_passing_roundtrip_report() -> None:
-    manifest = {"schema": PULL_SCHEMA, "items": [_item(1)]}
-    report = {"schema": REPORT_SCHEMA, "status": "passed"}
+    resolved = curated_episode_ids(_manifest([_item(1)]), report=_report())
 
-    assert curated_episode_ids(manifest, report=report)["episode_ids"] == [1]
-
-
-def test_curation_falls_back_to_the_item_name_when_identity_is_absent() -> None:
-    manifest = {
-        "schema": PULL_SCHEMA,
-        "items": [_item(5, source_uri="")],
-    }
-
-    resolved = curated_episode_ids(manifest)
-    assert resolved["episode_ids"] == [5]
-    assert resolved["items"][0]["attributed_by"] == "name"
+    assert resolved["episode_ids"] == [1]
 
 
 @pytest.mark.parametrize(
     "manifest, report, expected",
     [
         pytest.param(
-            {"schema": "npa.encord.push_receipt.v1", "items": [_item(0)]},
+            _manifest([_item(0)], schema="npa.encord.push_receipt.v1"),
             None,
             "not a npa.encord.pull_manifest.v1",
             id="wrong-artifact",
         ),
         pytest.param(
-            {"schema": PULL_SCHEMA, "items": []},
+            {"schema": PULL_SCHEMA, "items": [_item(0)]},
             None,
-            "selected no items",
-            id="zero-selection",
+            "manifest is malformed",
+            id="incomplete-manifest",
         ),
         pytest.param(
-            {
-                "schema": PULL_SCHEMA,
-                "items": [{"name": "clip.mp4", "source_uri": "s3://b/clip.mp4"}],
-            },
+            _manifest([_item(0), {"unexpected": "field"}]),
+            None,
+            "manifest is malformed",
+            id="unknown-item-field",
+        ),
+        pytest.param(_manifest([]), None, "selected no items", id="zero-selection"),
+        pytest.param(
+            _manifest(
+                [
+                    {
+                        "item_uuid": "u",
+                        "name": "clip.mp4",
+                        "source_uri": "s3://b/clip.mp4",
+                    }
+                ]
+            ),
             None,
             "cannot be attributed",
             id="unattributable-item",
         ),
         pytest.param(
-            {"schema": PULL_SCHEMA, "items": [_item(0, error="download failed")]},
+            # A display name is never identity, so an item whose registered
+            # source_uri is absent fails closed rather than parsing its title.
+            _manifest([_item(5, source_uri="")]),
+            None,
+            "cannot be attributed",
+            id="identity-absent",
+        ),
+        pytest.param(
+            _manifest([_item(0, error="download failed")]),
             None,
             "failed: download failed",
             id="errored-item",
         ),
         pytest.param(
-            {"schema": PULL_SCHEMA, "items": [_item(0)]},
-            {"schema": REPORT_SCHEMA, "status": "failed"},
+            _manifest([_item(0)]),
+            _report(status="failed"),
             "did not pass",
             id="failed-roundtrip",
         ),
         pytest.param(
-            {"schema": PULL_SCHEMA, "items": [_item(0)]},
-            {"schema": "npa.encord.pull_manifest.v1", "status": "passed"},
+            _manifest([_item(0)]),
+            _report(schema=PULL_SCHEMA),
             "not a npa.encord.roundtrip_report.v1",
             id="wrong-report-artifact",
         ),
@@ -680,16 +696,9 @@ def curated_source(tmp_path: Path) -> tuple[FakeS3, str]:
     client.seed_json(
         "bucket",
         "curate/manifest.json",
-        {
-            "schema": PULL_SCHEMA,
-            "items": [_item(episode) for episode in (0, 2, 3, 5)],
-        },
+        _manifest([_item(episode) for episode in (0, 2, 3, 5)]),
     )
-    client.seed_json(
-        "bucket",
-        "curate/roundtrip_report.json",
-        {"schema": REPORT_SCHEMA, "status": "passed"},
-    )
+    client.seed_json("bucket", "curate/roundtrip_report.json", _report())
     return client, "s3://bucket/prepared"
 
 
@@ -731,6 +740,7 @@ def test_prepare_split_trains_only_on_curated_episodes(
     assert selection["excluded_by_curation"] == [1, 4]
     assert selection["roundtrip_verified"] is True
     assert len(selection["encord_items"]) == 4
+    assert [item["episode_index"] for item in selection["encord_items"]] == [0, 2, 3, 5]
 
     used = (
         result["train"]["source_episode_ids"]
@@ -789,11 +799,7 @@ def test_prepare_split_fails_closed_when_curation_leaves_too_few_episodes(
     curated_source: tuple[FakeS3, str],
 ) -> None:
     client, source = curated_source
-    client.seed_json(
-        "bucket",
-        "curate/thin.json",
-        {"schema": PULL_SCHEMA, "items": [_item(2)]},
-    )
+    client.seed_json("bucket", "curate/thin.json", _manifest([_item(2)]))
 
     with pytest.raises(GrootVisualizationError, match="too few episodes"):
         _split(client, source, curation_manifest_uri="s3://bucket/curate/thin.json")

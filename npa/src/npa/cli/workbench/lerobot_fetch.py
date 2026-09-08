@@ -17,7 +17,7 @@ import re
 import tempfile
 from enum import Enum
 from pathlib import Path
-from typing import Any
+from typing import Any, NoReturn
 
 import typer
 
@@ -47,14 +47,17 @@ def fetch_dataset_cmd(
         "--revision",
         help="Immutable 40-character commit SHA. A branch or tag is not reproducible.",
     ),
-    output_uri: str = typer.Option(
-        ..., "--output-uri", help="S3 URI prefix the dataset is staged to."
+    output_path: str = typer.Option(
+        ...,
+        "--output-path",
+        "--output-uri",
+        help="S3 URI prefix the dataset is staged to.",
     ),
     dataset_license: str = typer.Option(
         "", "--license", help="License recorded in the provenance receipt."
     ),
     output: OutputFormat = typer.Option(
-        OutputFormat.text, "--output", help="Output format."
+        OutputFormat.text, "--output-format", help="Output format."
     ),
 ) -> None:
     """Stage a pinned public LeRobot dataset from Hugging Face into S3."""
@@ -66,16 +69,17 @@ def fetch_dataset_cmd(
         summarize_lerobot_dataset,
     )
 
-    if not _COMMIT_SHA.match(revision.strip()):
+    revision = revision.strip()
+    if not _COMMIT_SHA.match(revision):
         _fail(
             "--revision must be a full 40-character commit SHA so the staged "
             f"dataset is reproducible; got {revision!r}"
         )
     try:
         staged = validate_write_path(
-            output_uri,
+            output_path,
             tool="LeRobot fetch-dataset",
-            option="--output-uri",
+            option="--output-path",
             required=True,
         )
     except PathContractError as exc:
@@ -118,7 +122,7 @@ def fetch_dataset_cmd(
     _emit({"status": "staged", "output_uri": staged_to, **provenance}, output)
 
 
-def _fail(message: str) -> None:
+def _fail(message: str) -> NoReturn:
     typer.echo(f"Error: {message}", err=True)
     raise typer.Exit(code=1)
 

@@ -2481,7 +2481,18 @@ TOOL_CATALOG: dict[str, ToolEntry] = {
             "{{config.gradient_accumulation_steps}}",
             "--action-representation",
             "absolute",
+            # An Encord curation restricts which episodes are eligible. Both
+            # flags drop out when their config value is empty, so a spec that
+            # curates nothing splits the whole dataset.
+            "--curation-manifest-uri",
+            "{{config.curation_manifest_uri}}",
+            "--curation-report-uri",
+            "{{config.curation_report_uri}}",
         ],
+        omit_flags_when_empty=(
+            "--curation-manifest-uri",
+            "--curation-report-uri",
+        ),
     ),
     "workbench.groot.baseline_eval": ToolEntry(
         name="workbench.groot.baseline_eval",
