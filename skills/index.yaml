@@ -1064,6 +1064,23 @@ skills:
           - npa/workflows/workbench/npa-workflows/sonic-export.yaml
           - npa/workflows/workbench/npa-workflows/sonic-export-eval.yaml
           - npa/workflows/workbench/npa-workflows/sonic-locomotion-finetuning.yaml
+  - name: encord-groot-finetune
+    category: workflows
+    when_to_use: "Fine-tune GR00T N1.7 on a customer's own LeRobot demonstrations with Encord curating which episodes train: the three-cohort contract (train, validation selects a checkpoint, final is read once), per-checkpoint selection, and reading whether the policy actually learned."
+    path: skills/workflows/encord-groot-finetune/SKILL.md
+    smoke:
+      - type: npa_workflow_yaml
+        paths:
+          - npa/workflows/workbench/npa-workflows/encord-groot-finetune.yaml
+      - type: cli_help
+        args:
+          - workbench
+          - lerobot
+          - fetch-dataset
+          - --help
+        contains: "--output-path"
+      - type: file_exists
+        path: docs/workbench/guides/encord-groot-finetune.md
   - name: physical-ai-data-factory
     category: workflows
     when_to_use: "Author, run, submit, or view the NVIDIA Physical AI Data Factory blueprint on Nebius + SkyPilot (no OSMO): annotate -> Cosmos Transfer augment -> Cosmos Evaluator gate -> re-label -> Cosmos Curator + FiftyOne curate -> Rerun visualize."

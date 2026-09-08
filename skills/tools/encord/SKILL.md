@@ -17,6 +17,11 @@ manifest; `verify` joins the push receipt to the pull manifest by exact
 identity and fails closed on anything missing, resized, or
 checksum-mismatched.
 
+> Training consumer: `skills/workflows/encord-groot-finetune/SKILL.md`
+> curates robot episodes with these verbs and turns the verified pull into
+> a GR00T training cohort. It relies on `npa.source_uri` identity, never a
+> display name, so keep that contract intact.
+
 ## Three-access pattern
 
 Implementation lives in `npa/src/npa/workbench/encord/`: one module per verb
