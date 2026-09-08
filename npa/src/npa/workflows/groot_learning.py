@@ -219,16 +219,46 @@ def _json_bytes(payload: Mapping[str, Any]) -> bytes:
     return (json.dumps(dict(payload), indent=2, sort_keys=True) + "\n").encode()
 
 
+def _split_candidates(
+    episode_count: int, candidates: Sequence[int] | None
+) -> list[int]:
+    """Resolve the eligible episode ids a split may draw from.
+
+    ``None`` means the whole dataset. An explicit sequence is a curation
+    allowlist: it must be a set of real episode ids, because silently dropping
+    an id the caller believed was eligible would change the experiment.
+    """
+
+    if candidates is None:
+        return list(range(int(episode_count)))
+    resolved = [int(index) for index in candidates]
+    if len(resolved) != len(set(resolved)):
+        raise GrootVisualizationError("eligible episode ids contain duplicates")
+    outside = sorted(
+        index for index in resolved if index < 0 or index >= int(episode_count)
+    )
+    if outside:
+        raise GrootVisualizationError(
+            f"eligible episode ids fall outside the dataset's {episode_count} "
+            f"episodes: {outside}"
+        )
+    if not resolved:
+        raise GrootVisualizationError("no episodes are eligible for the split")
+    return resolved
+
+
 def deterministic_episode_split(
     episode_count: int,
     *,
     train_episodes: int,
     heldout_episodes: int,
     seed: str,
+    candidates: Sequence[int] | None = None,
 ) -> dict[str, list[int]]:
     """Select a stable disjoint experiment cohort at episode granularity."""
 
-    if episode_count < train_episodes + heldout_episodes:
+    eligible = _split_candidates(episode_count, candidates)
+    if len(eligible) < train_episodes + heldout_episodes:
         raise GrootVisualizationError(
             "dataset has too few episodes for requested split"
         )
@@ -237,7 +267,7 @@ def deterministic_episode_split(
             "train and held-out episode counts must be positive"
         )
     order = sorted(
-        range(episode_count),
+        eligible,
         key=lambda index: hashlib.sha256(f"{seed}:{index}".encode()).hexdigest(),
     )
     heldout = order[:heldout_episodes]
@@ -258,20 +288,22 @@ def deterministic_experiment_split(
     validation_episodes: int,
     final_episodes: int,
     seed: str,
+    candidates: Sequence[int] | None = None,
 ) -> dict[str, list[int]]:
     """Create a stable train/validation/final split without episode leakage."""
 
+    eligible = _split_candidates(episode_count, candidates)
     requested = int(train_episodes) + int(validation_episodes) + int(final_episodes)
     if min(train_episodes, validation_episodes, final_episodes) < 1:
         raise GrootVisualizationError(
             "train, validation, and final episode counts must be positive"
         )
-    if requested > int(episode_count):
+    if requested > len(eligible):
         raise GrootVisualizationError(
             "dataset has too few episodes for train/validation/final split"
         )
     order = sorted(
-        range(int(episode_count)),
+        eligible,
         key=lambda index: hashlib.sha256(f"{seed}:{index}".encode()).hexdigest(),
     )
     validation_end = int(validation_episodes)
@@ -728,6 +760,188 @@ def _materialize_split(
     }, content_records
 
 
+DATASET_PREPARE_SCHEMA = "npa.groot.dataset_prepare.v1"
+
+
+def _upload_dataset(client: Any, directory: Path, uri: str) -> dict[str, Any]:
+    """Upload a dataset directory verbatim.
+
+    Deliberately not :func:`_upload_directory`: that one derives checkpoint
+    weight identity and fails closed when a directory holds no model weights,
+    which is exactly what a dataset is.
+    """
+
+    ref = _split_s3(uri, require_key=False)
+    prefix = ref.key.rstrip("/")
+    objects = 0
+    total = 0
+    for path in sorted(item for item in directory.rglob("*") if item.is_file()):
+        relative = path.relative_to(directory).as_posix()
+        key = "/".join(part for part in (prefix, relative) if part)
+        record = _put_bytes(client, _object_uri(ref.bucket, key), path.read_bytes())
+        objects += 1
+        total += int(record["bytes"])
+    if not objects:
+        raise GrootVisualizationError(f"prepared dataset is empty: {directory}")
+    return {"uri": uri, "objects": objects, "bytes": total}
+
+
+def prepare_dataset(
+    source_uri: str,
+    output_uri: str,
+    audit_uri: str,
+    run_id: str,
+    *,
+    robot_embodiment: str = "NEW_EMBODIMENT",
+    s3_client: Any | None = None,
+) -> dict[str, Any]:
+    """Convert a standard LeRobot dataset into per-episode GR00T format.
+
+    Two things make this the first stage rather than a convenience. Encord
+    curates media items, so episode-level curation needs one video per episode
+    instead of the single packed file LeRobot v3 writes. And the audit the
+    conversion publishes is what tells an operator the data is usable before
+    any curation or GPU time is spent on it.
+    """
+
+    from npa.adapter.groot import (
+        DATASET_AUDIT,
+        GR00TAdapterError,
+        audit_dataset,
+        lerobot_to_groot,
+    )
+
+    client = _s3_client(s3_client)
+    with tempfile.TemporaryDirectory(prefix="npa-groot-prepare-") as tmp:
+        root = Path(tmp)
+        source = root / "source"
+        source.mkdir(parents=True, exist_ok=True)
+        downloaded = _download_prefix(client, source_uri, source)
+        if not downloaded:
+            raise GrootVisualizationError(
+                f"source dataset is empty or unreadable: {source_uri}"
+            )
+        try:
+            converted = lerobot_to_groot(
+                source, root / "prepared", robot_embodiment=robot_embodiment
+            )
+            audit = audit_dataset(converted)
+        except GR00TAdapterError as exc:
+            # The adapter's fail-closed messages name the offending episode or
+            # feature; keep them verbatim rather than a generic stage failure.
+            raise GrootVisualizationError(str(exc)) from exc
+        uploaded = _upload_dataset(client, converted, output_uri)
+        audit_bytes = (converted / "meta" / DATASET_AUDIT).read_bytes()
+
+    published = _put_bytes(
+        client, audit_uri, audit_bytes, content_type="application/json"
+    )
+    result = {
+        "schema": DATASET_PREPARE_SCHEMA,
+        "status": "prepared",
+        "run_id": run_id,
+        "source_uri": source_uri,
+        "output_uri": output_uri,
+        "audit_uri": audit_uri,
+        "robot_embodiment": robot_embodiment,
+        "objects_uploaded": int(uploaded.get("objects") or 0),
+        "dataset": audit["dataset"],
+        "tasks": audit["tasks"],
+        "cameras": audit["cameras"],
+        "advisories": audit["advisories"],
+        "audit_sha256": _sha256_bytes(audit_bytes),
+        "audit_bytes": int(published.get("bytes") or 0),
+    }
+    print(json.dumps(result, indent=2, sort_keys=True))
+    return result
+
+
+#: One converted episode's video, e.g.
+#: ``videos/chunk-000/observation.images.top/episode_000007.mp4``. The adapter
+#: preserves the source episode id in the filename, which is what makes an
+#: Encord item attributable back to a training episode.
+_EPISODE_MEDIA = re.compile(r"episode_(\d+)\.[A-Za-z0-9]+$")
+
+
+def curated_episode_ids(
+    manifest: Mapping[str, Any],
+    *,
+    report: Mapping[str, Any] | None = None,
+) -> dict[str, Any]:
+    """Resolve which dataset episodes an Encord curation actually selected.
+
+    This fails closed. A pulled item that cannot be attributed to an episode, a
+    failed transfer, or a roundtrip report that did not pass all mean the
+    curation result is not trustworthy, and training on a guess would silently
+    change the experiment's training set.
+    """
+
+    from npa.workbench.encord.schemas import (
+        PULL_MANIFEST_SCHEMA,
+        ROUNDTRIP_REPORT_SCHEMA,
+    )
+
+    schema = str(manifest.get("schema") or "")
+    if schema != PULL_MANIFEST_SCHEMA:
+        raise GrootVisualizationError(
+            f"curation manifest is not a {PULL_MANIFEST_SCHEMA}: {schema or 'unknown'}"
+        )
+    if report is not None:
+        report_schema = str(report.get("schema") or "")
+        if report_schema != ROUNDTRIP_REPORT_SCHEMA:
+            raise GrootVisualizationError(
+                f"curation report is not a {ROUNDTRIP_REPORT_SCHEMA}: "
+                f"{report_schema or 'unknown'}"
+            )
+        if str(report.get("status") or "") != "passed":
+            raise GrootVisualizationError(
+                "curation roundtrip report did not pass; refusing to train on media "
+                "whose identity was not verified"
+            )
+    items = manifest.get("items") or []
+    if not isinstance(items, Sequence) or not items:
+        raise GrootVisualizationError("curation manifest selected no items")
+    attributed: list[dict[str, Any]] = []
+    episode_ids: set[int] = set()
+    for position, item in enumerate(items):
+        if not isinstance(item, Mapping):
+            raise GrootVisualizationError(
+                f"curation manifest item {position} is not an object"
+            )
+        error = str(item.get("error") or "")
+        if error:
+            raise GrootVisualizationError(
+                f"curation manifest item {position} failed: {error}"
+            )
+        identity = str(item.get("source_uri") or "")
+        name = str(item.get("name") or "")
+        match = _EPISODE_MEDIA.search(identity) or _EPISODE_MEDIA.search(name)
+        if match is None:
+            raise GrootVisualizationError(
+                "curation manifest item cannot be attributed to a dataset episode "
+                f"(source_uri={identity or 'empty'!r}, name={name or 'empty'!r}); "
+                "expected converted media named episode_<index>.<ext>"
+            )
+        episode_index = int(match.group(1))
+        episode_ids.add(episode_index)
+        attributed.append(
+            {
+                "episode_index": episode_index,
+                "item_uuid": str(item.get("item_uuid") or ""),
+                "source_uri": identity,
+                "name": name,
+                "attributed_by": "source_uri"
+                if _EPISODE_MEDIA.search(identity)
+                else "name",
+            }
+        )
+    return {
+        "episode_ids": sorted(episode_ids),
+        "items": attributed,
+        "items_total": len(attributed),
+    }
+
+
 def prepare_split(
     source_uri: str,
     train_uri: str,
@@ -748,6 +962,8 @@ def prepare_split(
     per_device_batch_size: int | None = None,
     gradient_accumulation_steps: int | None = None,
     action_representation: str = "source",
+    curation_manifest_uri: str = "",
+    curation_report_uri: str = "",
     s3_client: Any | None = None,
 ) -> dict[str, Any]:
     """Materialize a deterministic train/held-out split with train-only stats."""
@@ -769,6 +985,22 @@ def prepare_split(
         raise GrootVisualizationError(
             "action representation must be source or absolute"
         )
+    curation: dict[str, Any] | None = None
+    candidates: list[int] | None = None
+    if curation_report_uri and not curation_manifest_uri:
+        raise GrootVisualizationError(
+            "a curation report needs the curation manifest it verifies"
+        )
+    if curation_manifest_uri:
+        curation = curated_episode_ids(
+            _read_s3_json(client, curation_manifest_uri),
+            report=(
+                _read_s3_json(client, curation_report_uri)
+                if curation_report_uri
+                else None
+            ),
+        )
+        candidates = list(curation["episode_ids"])
     if final_episodes:
         if not final_uri:
             raise GrootVisualizationError("final episode split requires a final URI")
@@ -778,6 +1010,7 @@ def prepare_split(
             validation_episodes=heldout_episodes,
             final_episodes=final_episodes,
             seed=seed,
+            candidates=candidates,
         )
         split = {
             "train": experiment_split["train"],
@@ -791,6 +1024,7 @@ def prepare_split(
             train_episodes=train_episodes,
             heldout_episodes=heldout_episodes,
             seed=seed,
+            candidates=candidates,
         )
     with tempfile.TemporaryDirectory(prefix="npa-groot-split-") as tmp:
         train, train_content = _materialize_split(
@@ -865,6 +1099,12 @@ def prepare_split(
         "train_content": train_content,
         "heldout_content": heldout_content,
         "final_content": final_content,
+        # Curation changes which episodes were eligible, so it must change the
+        # split identity: two runs with the same seed and different curation are
+        # different experiments.
+        "curation_eligible_episode_ids": (
+            list(curation["episode_ids"]) if curation is not None else None
+        ),
     }
     split_hash = _sha256_bytes(_json_bytes(split_core))
     action_shape = (info.get("features") or {}).get("action", {}).get("shape") or []
@@ -918,6 +1158,28 @@ def prepare_split(
             "source_episode_ids": split["excluded"],
             "reason": "outside the deterministic experiment cohort",
         },
+        "selection": (
+            {
+                "source": "encord-curation",
+                "curation_manifest_uri": curation_manifest_uri,
+                "curation_report_uri": curation_report_uri,
+                "roundtrip_verified": bool(curation_report_uri),
+                "eligible_episodes": len(curation["episode_ids"]),
+                "eligible_source_episode_ids": curation["episode_ids"],
+                "excluded_by_curation": sorted(
+                    set(range(count)) - set(curation["episode_ids"])
+                ),
+                "encord_items": curation["items"],
+            }
+            if curation is not None
+            else {
+                "source": "whole-dataset",
+                "eligible_episodes": count,
+                "eligible_source_episode_ids": list(range(count)),
+                "excluded_by_curation": [],
+                "encord_items": [],
+            }
+        ),
         "integrity": {
             "episode_overlap": [],
             "leakage_free": True,
@@ -3630,6 +3892,13 @@ def build_parser() -> argparse.ArgumentParser:
     preflight.add_argument("--save-total-limit", type=int, required=True)
     preflight.add_argument("--minimum-epochs", type=float, required=True)
 
+    prepare = subparsers.add_parser("prepare-dataset")
+    prepare.add_argument("--source-uri", required=True)
+    prepare.add_argument("--output-uri", required=True)
+    prepare.add_argument("--audit-uri", required=True)
+    prepare.add_argument("--run-id", required=True)
+    prepare.add_argument("--robot-embodiment", default="NEW_EMBODIMENT")
+
     split = subparsers.add_parser("prepare-split")
     split.add_argument("--source-uri", required=True)
     split.add_argument("--train-uri", required=True)
@@ -3649,6 +3918,19 @@ def build_parser() -> argparse.ArgumentParser:
     split.add_argument("--gradient-accumulation-steps", type=int)
     split.add_argument(
         "--action-representation", choices=("source", "absolute"), default="source"
+    )
+    split.add_argument(
+        "--curation-manifest-uri",
+        default="",
+        help=(
+            "Encord pull manifest whose selected items restrict the eligible "
+            "episodes; empty splits the whole dataset."
+        ),
+    )
+    split.add_argument(
+        "--curation-report-uri",
+        default="",
+        help="Encord roundtrip report that must have passed for that curation.",
     )
     split.add_argument(
         "--max-steps",
@@ -3739,6 +4021,8 @@ def main(argv: Sequence[str] | None = None) -> int:
     command = values.pop("command")
     if command == "preflight-rigor":
         preflight_rigor_contract(**values)
+    elif command == "prepare-dataset":
+        prepare_dataset(**values)
     elif command == "prepare-split":
         prepare_split(**values)
     elif command == "baseline-eval":

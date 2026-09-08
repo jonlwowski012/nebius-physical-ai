@@ -20,6 +20,7 @@ from rich.console import Console
 
 from npa.cli._error_formatting import format_error_for_user
 from npa.cli.path_contract import PathContractError, validate_read_path, validate_write_path
+from npa.cli.workbench.lerobot_fetch import fetch_dataset_cmd
 from npa.clients.config import (
     APP_STATUS_HEALTHY,
     APP_STATUS_INSTALL_FAILED,
@@ -3426,3 +3427,9 @@ def train_student_cmd(
     finally:
         for tmp in temp_dirs:
             tmp.cleanup()
+
+
+# Dataset staging lives in its own module (it touches Hugging Face and object
+# storage, not this module's VM/SSH machinery) and is registered here so it
+# appears as `npa workbench lerobot fetch-dataset`.
+app.command("fetch-dataset")(fetch_dataset_cmd)
