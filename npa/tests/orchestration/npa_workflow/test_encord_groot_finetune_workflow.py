@@ -314,3 +314,55 @@ def test_every_dataset_reader_after_conversion_reads_the_converted_dataset() -> 
             f"state {state!r} reads the raw dataset {offenders!r}; every stage "
             "after conversion must consume the converted dataset"
         )
+
+
+def test_capability_image_stages_pin_the_light_workbench_tool(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A stage running in a capability image must be told which CLI to expose.
+
+    The GR00T image bakes `NPA_SKIP_EAGER_IMPORTS`, so `npa workbench` builds
+    a dependency-minimal tree that exposes exactly one tool group, chosen by
+    `NPA_LIGHT_WORKBENCH_TOOL`. Unset, it falls back to the cosmos2 surface, so
+    `npa workbench groot finetune` failed with "No such command 'groot'" while
+    running *inside the GR00T image* (live job 264).
+
+    Only `workbench.groot.finetune` shells out to `npa`; every other GR00T
+    toolRef invokes `python3 -m npa.workflows...` and bypasses the CLI, which
+    is why both baseline evaluations passed and training did not. That
+    asymmetry is what made this survive every offline check.
+    """
+    rendered = _rendered("light-cli", monkeypatch)
+
+    for name, task in rendered.items():
+        image = str((task.get("resources") or {}).get("image_id") or "")
+        pinned = (task.get("envs") or {}).get("NPA_LIGHT_WORKBENCH_TOOL", "")
+        if "npa-groot" in image:
+            assert pinned == "groot", (
+                f"stage {name!r} runs in the GR00T image but does not pin "
+                "NPA_LIGHT_WORKBENCH_TOOL, so any `npa workbench groot` call "
+                "would resolve against the cosmos2 surface"
+            )
+        else:
+            assert not pinned, (
+                f"stage {name!r} is not on a capability image yet pins "
+                f"NPA_LIGHT_WORKBENCH_TOOL={pinned!r}"
+            )
+
+
+def test_the_training_stage_is_the_one_that_needs_the_cli(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Pin the asymmetry that hid the bug, so a refactor cannot silently undo it."""
+    spec = load_spec(SPEC_PATH)
+    steps = {s.state: list(s.argv) for s in build_plan(spec, run_id="cli-shape").steps}
+
+    assert steps["train"][0] == "npa", (
+        "train no longer shells out to the npa CLI; if that changed, the "
+        "light-CLI pin may no longer be what keeps this stage working"
+    )
+    for name in ("baseline-validation", "baseline-final", "final-eval"):
+        assert steps[name][0] == "python3", (
+            f"{name} now shells out to the CLI and so depends on the "
+            "light-workbench pin too"
+        )

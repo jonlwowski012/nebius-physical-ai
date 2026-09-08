@@ -1910,6 +1910,17 @@ def build_skypilot_task_doc(
         envs["AWS_ENDPOINT_URL"] = options.aws_endpoint_url
     if image:
         envs["NPA_TASK_IMAGE"] = image.removeprefix("docker:")
+        # A capability image ships a dependency-minimal `npa workbench` that
+        # exposes exactly ONE tool group, selected by this env. With
+        # NPA_SKIP_EAGER_IMPORTS baked in and this unset, that light CLI falls
+        # back to the cosmos2 surface, so `npa workbench groot finetune` dies
+        # with "No such command 'groot'" *inside the GR00T image itself*. Only
+        # the toolRefs whose argv shells out to `npa` are affected; the ones
+        # that invoke `python3 -m npa.workflows...` bypass the CLI entirely,
+        # which is why the eval stages passed while training failed.
+        light_tool = tool_image_key(str(scheduler_task.get("tool_ref") or ""))
+        if light_tool:
+            envs["NPA_LIGHT_WORKBENCH_TOOL"] = light_tool
     if expected_source_sha:
         if len(expected_source_sha) != 40 or any(
             char not in "0123456789abcdef" for char in expected_source_sha
