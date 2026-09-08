@@ -172,9 +172,20 @@ def preflight_rigor_contract(
         raise GrootVisualizationError(
             "pipeline validation requires at least two optimizer steps and positive coverage"
         )
-    if int(save_steps) != int(max_steps) or int(save_total_limit) < 1:
+    # The final step must always land as a checkpoint, but a run that selects a
+    # checkpoint needs the intermediate ones too, so any schedule that divides
+    # the budget evenly is allowed. Retention has to cover what it saves,
+    # otherwise the trainer deletes candidates before they can be evaluated.
+    if int(save_steps) < 1 or int(max_steps) % int(save_steps):
         raise GrootVisualizationError(
-            "the final optimizer step must be saved as an available checkpoint"
+            f"save_steps={save_steps} must divide max_steps={max_steps} so the final "
+            "optimizer step is saved as an available checkpoint"
+        )
+    saved = int(max_steps) // int(save_steps)
+    if int(save_total_limit) < saved:
+        raise GrootVisualizationError(
+            f"save_total_limit={save_total_limit} would discard checkpoints: this "
+            f"schedule saves {saved}, and every one is a selection candidate"
         )
     result = {
         "schema": "npa.groot.rigor_preflight.v1",
@@ -196,6 +207,10 @@ def preflight_rigor_contract(
             "save_steps": int(save_steps),
             "save_total_limit": int(save_total_limit),
             "final_step_checkpoint_required": True,
+            "checkpoints_saved": saved,
+            "selection_candidates": [
+                int(save_steps) * index for index in range(1, saved + 1)
+            ],
         },
         "minimum_epochs": float(minimum_epochs),
         "validation_mode": "operational_pipeline_smoke",
@@ -2049,6 +2064,238 @@ def posttrain_eval(
         expected_checkpoint_step=checkpoint_step,
         **kwargs,
     )
+
+
+VALIDATION_CURVE_SCHEMA = "npa.groot.validation_curve.v1"
+CHECKPOINT_SELECTION_SCHEMA = "npa.groot.checkpoint_selection.v1"
+
+
+def select_checkpoint(
+    candidates: Sequence[Mapping[str, Any]],
+    *,
+    baseline_mse: float,
+    minimum_relative_improvement: float,
+) -> dict[str, Any]:
+    """Pick the validation-best checkpoint that genuinely beats the base model.
+
+    Lowest validation error wins, and a tie goes to the earlier step: the same
+    error from less training is the cheaper and less overfit model. A candidate
+    has to clear the baseline by the configured margin to be eligible at all,
+    so a run where nothing learned selects nothing rather than crowning the
+    least bad checkpoint.
+    """
+
+    if not candidates:
+        raise GrootVisualizationError(
+            "checkpoint selection needs at least one candidate"
+        )
+    if not math.isfinite(baseline_mse) or baseline_mse <= 0:
+        raise GrootVisualizationError(
+            f"baseline validation error must be finite and positive: {baseline_mse!r}"
+        )
+    if not 0.0 <= float(minimum_relative_improvement) < 1.0:
+        raise GrootVisualizationError(
+            "minimum relative improvement must be at least zero and below one"
+        )
+    ceiling = baseline_mse * (1.0 - float(minimum_relative_improvement))
+    ranked = sorted(
+        (
+            (float(item["mse"]), int(item["step"]))
+            for item in candidates
+            if math.isfinite(float(item["mse"]))
+        ),
+        key=lambda pair: (pair[0], pair[1]),
+    )
+    eligible = [pair for pair in ranked if pair[0] <= ceiling]
+    result: dict[str, Any] = {
+        "baseline_mse": baseline_mse,
+        "minimum_relative_improvement": float(minimum_relative_improvement),
+        "eligibility_ceiling_mse": ceiling,
+        "rule": (
+            "lowest validation MSE that beats the baseline by the configured "
+            "margin; ties resolve to the earlier optimizer step"
+        ),
+        "candidates_considered": len(ranked),
+    }
+    if not eligible:
+        best = ranked[0] if ranked else None
+        result.update(
+            selected_step=None,
+            selected_mse=None,
+            relative_improvement=None,
+            outcome="none_beat_baseline",
+            detail=(
+                "no checkpoint beat the baseline by the required margin"
+                + (
+                    f"; the closest was step {best[1]} at MSE {best[0]:g} against a "
+                    f"ceiling of {ceiling:g}"
+                    if best is not None
+                    else ""
+                )
+            ),
+        )
+        return result
+    mse, step = eligible[0]
+    result.update(
+        selected_step=step,
+        selected_mse=mse,
+        relative_improvement=(baseline_mse - mse) / baseline_mse,
+        outcome="selected",
+        detail=f"step {step} had the lowest eligible validation MSE ({mse:g})",
+    )
+    return result
+
+
+def validate_checkpoints(
+    split_manifest_uri: str,
+    training_manifest_uri: str,
+    checkpoint_uri: str,
+    baseline_eval_uri: str,
+    validation_uri: str,
+    curve_uri: str,
+    selection_uri: str,
+    run_id: str,
+    robot_embodiment: str,
+    *,
+    action_horizon: int = 16,
+    validation_repeats: int = 1,
+    minimum_relative_improvement: float = DEFAULT_MINIMUM_RELATIVE_IMPROVEMENT,
+    evaluation_seed: int = 1701,
+    s3_client: Any | None = None,
+) -> dict[str, Any]:
+    """Score every saved checkpoint on the validation split and select one.
+
+    This is deliberately separate from :func:`evaluate`: that one proves a
+    single checkpoint's result with trivial-predictor floors and a repeat-noise
+    determinism check, which is what a final comparison needs. Here the job is
+    to rank candidates against each other, so every candidate is measured the
+    same way and the final split is never touched.
+    """
+
+    client = _s3_client(s3_client)
+    split = _read_s3_json(client, split_manifest_uri)
+    manifest = _read_s3_json(client, training_manifest_uri)
+    baseline = _read_s3_json(client, baseline_eval_uri)
+    if split.get("schema") != SPLIT_SCHEMA or split.get("run_id") != run_id:
+        raise GrootVisualizationError(
+            "checkpoint validation requires this run's split manifest"
+        )
+    if (
+        manifest.get("schema") != "npa.groot.finetune.v1"
+        or manifest.get("status") != "completed"
+        or manifest.get("run_id") != run_id
+    ):
+        raise GrootVisualizationError(
+            "checkpoint validation requires this run's completed training manifest"
+        )
+    validate_evaluation(baseline, phase="baseline", run_id=run_id)
+    steps = sorted({int(value) for value in manifest.get("checkpoint_steps") or []})
+    if not steps:
+        raise GrootVisualizationError("training manifest records no saved checkpoints")
+    if int(validation_repeats) < 1:
+        raise GrootVisualizationError(
+            "validation needs at least one pass per candidate"
+        )
+    baseline_mse = float((baseline.get("metrics") or {}).get("mse"))
+
+    candidates: list[dict[str, Any]] = []
+    with tempfile.TemporaryDirectory(prefix="npa-groot-validate-") as tmp:
+        root = Path(tmp)
+        heldout_path = root / "validation"
+        _download_prefix(client, str(split["heldout"]["uri"]), heldout_path)
+        for step in steps:
+            step_uri = checkpoint_uri.rstrip("/") + f"/checkpoint-{step}/"
+            step_path = root / f"checkpoint-{step}"
+            _download_prefix(client, step_uri, step_path)
+            identity = _checkpoint_identity(step_path)
+            checkpoint_model_config_contract(step_path)
+            passes = [
+                _evaluate_checkpoint(
+                    checkpoint_path=step_path,
+                    heldout_path=heldout_path,
+                    embodiment=robot_embodiment,
+                    action_horizon=int(action_horizon),
+                    seed=int(evaluation_seed) + index,
+                )
+                for index in range(int(validation_repeats))
+            ]
+            mses = [float(item["metrics"]["mse"]) for item in passes]
+            maes = [float(item["metrics"]["mae"]) for item in passes]
+            if not all(math.isfinite(value) for value in (*mses, *maes)):
+                raise GrootVisualizationError(
+                    f"checkpoint {step} produced non-finite validation error"
+                )
+            record = {
+                "step": step,
+                "checkpoint_uri": step_uri,
+                "sha256": identity.get("sha256"),
+                "weights_sha256": identity.get("weights_sha256"),
+                "mse": sum(mses) / len(mses),
+                "mae": sum(maes) / len(maes),
+                "passes": int(validation_repeats),
+                "beats_baseline": (sum(mses) / len(mses)) < baseline_mse,
+            }
+            published = _put_json(
+                client,
+                validation_uri.rstrip("/") + f"/checkpoint-{step}/evaluation.json",
+                {
+                    "schema": EVAL_SCHEMA,
+                    "status": "completed",
+                    "run_id": run_id,
+                    "phase": "validation",
+                    "split_hash": split["split_hash"],
+                    "validation_data_uri": split["heldout"]["uri"],
+                    "action_horizon": int(action_horizon),
+                    "checkpoint": {"uri": step_uri, **identity},
+                    "metrics": {"mse": record["mse"], "mae": record["mae"]},
+                    "per_pass_mse": mses,
+                    "per_pass_mae": maes,
+                },
+            )
+            record["evaluation_uri"] = published["uri"]
+            candidates.append(record)
+
+    selection = select_checkpoint(
+        candidates,
+        baseline_mse=baseline_mse,
+        minimum_relative_improvement=float(minimum_relative_improvement),
+    )
+    curve = {
+        "schema": VALIDATION_CURVE_SCHEMA,
+        "status": "measured",
+        "run_id": run_id,
+        "split_hash": split["split_hash"],
+        "validation_data_uri": split["heldout"]["uri"],
+        "baseline": {"uri": baseline_eval_uri, "mse": baseline_mse},
+        "action_horizon": int(action_horizon),
+        "passes_per_candidate": int(validation_repeats),
+        "candidates": candidates,
+    }
+    _put_json(client, curve_uri, curve)
+    result = {
+        "schema": CHECKPOINT_SELECTION_SCHEMA,
+        "status": "selected" if selection["selected_step"] is not None else "none",
+        "run_id": run_id,
+        "split_hash": split["split_hash"],
+        "training_manifest_uri": training_manifest_uri,
+        "curve_uri": curve_uri,
+        "checkpoint_steps": steps,
+        **selection,
+    }
+    if selection["selected_step"] is not None:
+        chosen = next(
+            item for item in candidates if item["step"] == selection["selected_step"]
+        )
+        result["selected_checkpoint"] = {
+            "uri": chosen["checkpoint_uri"],
+            "resolved_checkpoint_step": chosen["step"],
+            "sha256": chosen["sha256"],
+            "weights_sha256": chosen["weights_sha256"],
+            "evaluation_uri": chosen["evaluation_uri"],
+        }
+    _put_json(client, selection_uri, result)
+    print(json.dumps(result, indent=2, sort_keys=True))
+    return result
 
 
 def validate_evaluation(payload: Mapping[str, Any], *, phase: str, run_id: str) -> None:
@@ -3947,6 +4194,25 @@ def build_parser() -> argparse.ArgumentParser:
     posttrain.add_argument("--action-horizon", type=int, default=16)
     posttrain.add_argument("--evaluation-repeats", type=int, default=5)
 
+    validate = subparsers.add_parser("validate-checkpoints")
+    validate.add_argument("--split-manifest-uri", required=True)
+    validate.add_argument("--training-manifest-uri", required=True)
+    validate.add_argument("--checkpoint-uri", required=True)
+    validate.add_argument("--baseline-eval-uri", required=True)
+    validate.add_argument("--validation-uri", required=True)
+    validate.add_argument("--curve-uri", required=True)
+    validate.add_argument("--selection-uri", required=True)
+    validate.add_argument("--robot-embodiment", required=True)
+    validate.add_argument("--run-id", required=True)
+    validate.add_argument("--action-horizon", type=int, default=16)
+    validate.add_argument("--validation-repeats", type=int, default=1)
+    validate.add_argument(
+        "--minimum-relative-improvement",
+        type=float,
+        default=DEFAULT_MINIMUM_RELATIVE_IMPROVEMENT,
+    )
+    validate.add_argument("--evaluation-seed", type=int, default=1701)
+
     compare = subparsers.add_parser("compare-learning")
     compare.add_argument("--split-manifest-uri", required=True)
     compare.add_argument("--baseline-uri", required=True)
@@ -4014,6 +4280,8 @@ def main(argv: Sequence[str] | None = None) -> int:
         prepare_split(**values)
     elif command == "baseline-eval":
         baseline_eval(**values)
+    elif command == "validate-checkpoints":
+        validate_checkpoints(**values)
     elif command == "posttrain-eval":
         posttrain_eval(**values)
     elif command == "compare-learning":

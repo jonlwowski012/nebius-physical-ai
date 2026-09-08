@@ -14,6 +14,7 @@ from pathlib import Path
 from typing import Any, Sequence
 
 from npa.workflows.groot_learning import (
+    CHECKPOINT_SELECTION_SCHEMA,
     GROOT_MODEL_CONFIG_CONTRACT,
     GrootVisualizationError,
     _checkpoint_identity,
@@ -41,6 +42,7 @@ def resolve_trained_checkpoint(
     expected_max_steps: int,
     expected_save_steps: int,
     expected_save_total_limit: int,
+    selection_uri: str = "",
     s3_client: Any | None = None,
 ) -> dict[str, Any]:
     """Resolve the exact final checkpoint-N under a validated save contract."""
@@ -87,9 +89,10 @@ def resolve_trained_checkpoint(
         int(expected_max_steps) < 2
         or configured_steps != int(expected_max_steps)
         or completed_steps != configured_steps
-        or int(expected_save_steps) != configured_steps
+        or int(expected_save_steps) < 1
+        or configured_steps % int(expected_save_steps)
         or save_steps != int(expected_save_steps)
-        or int(expected_save_total_limit) < 1
+        or int(expected_save_total_limit) < configured_steps // int(expected_save_steps)
         or save_total_limit != int(expected_save_total_limit)
     ):
         raise GrootVisualizationError(
@@ -100,6 +103,26 @@ def resolve_trained_checkpoint(
     )
     if completed_steps not in checkpoint_steps:
         raise GrootVisualizationError("trainer lacks its final checkpoint")
+    selected_step: int | None = None
+    if selection_uri:
+        selection = _read_s3_json(client, selection_uri)
+        if (
+            selection.get("schema") != CHECKPOINT_SELECTION_SCHEMA
+            or selection.get("run_id") != run_id
+        ):
+            raise GrootVisualizationError(
+                "checkpoint selection must come from this run's validation stage"
+            )
+        if selection.get("status") != "selected":
+            raise GrootVisualizationError(
+                "validation selected no checkpoint: "
+                f"{selection.get('detail') or 'no candidate beat the baseline'}"
+            )
+        selected_step = int(selection.get("selected_step") or 0)
+        if selected_step not in checkpoint_steps:
+            raise GrootVisualizationError(
+                f"selected checkpoint step {selected_step} is not one the trainer saved"
+            )
 
     training_plan = split.get("training_plan") or {}
     per_device_batch = int(manifest.get("per_device_batch_size") or 0)
@@ -122,14 +145,24 @@ def resolve_trained_checkpoint(
     with tempfile.TemporaryDirectory(prefix="npa-groot-checkpoint-ref-") as tmp:
         root = Path(tmp)
         candidate_root = root / "candidate"
-        _download_prefix(client, checkpoint_uri, candidate_root)
-        checkpoint_path, checkpoint_step = _resolve_highest_checkpoint_directory(
-            candidate_root
-        )
-        if checkpoint_step != completed_steps:
-            raise GrootVisualizationError(
-                "latest uploaded checkpoint does not equal the completed optimizer step"
+        if selected_step is not None:
+            # A validation-selected step is deliberately not the newest one, so
+            # fetch exactly it rather than resolving the highest.
+            _download_prefix(
+                client,
+                checkpoint_uri.rstrip("/") + f"/checkpoint-{selected_step}/",
+                candidate_root,
             )
+            checkpoint_path, checkpoint_step = candidate_root, selected_step
+        else:
+            _download_prefix(client, checkpoint_uri, candidate_root)
+            checkpoint_path, checkpoint_step = _resolve_highest_checkpoint_directory(
+                candidate_root
+            )
+            if checkpoint_step != completed_steps:
+                raise GrootVisualizationError(
+                    "latest uploaded checkpoint does not equal the completed optimizer step"
+                )
         identity = _checkpoint_identity(checkpoint_path)
         checkpoint_model_config_contract(checkpoint_path)
         baseline_path = root / "baseline"
@@ -150,6 +183,10 @@ def resolve_trained_checkpoint(
         },
         "baseline_checkpoint": {"uri": baseline_checkpoint_uri, **baseline_identity},
         "weights_differ": True,
+        "selection": {
+            "source": "validation" if selected_step is not None else "final-step",
+            "selection_uri": selection_uri,
+        },
         "model_config_contract": GROOT_MODEL_CONFIG_CONTRACT,
         "training_manifest_uri": training_manifest_uri,
         "split_manifest_uri": split_manifest_uri,
@@ -199,6 +236,11 @@ def build_parser() -> argparse.ArgumentParser:
     command.add_argument("--expected-max-steps", type=int, required=True)
     command.add_argument("--expected-save-steps", type=int, required=True)
     command.add_argument("--expected-save-total-limit", type=int, required=True)
+    command.add_argument(
+        "--selection-uri",
+        default="",
+        help="Validation selection to resolve; empty resolves the final step.",
+    )
     return parser
 
 

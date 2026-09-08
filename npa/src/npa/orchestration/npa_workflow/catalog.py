@@ -53,10 +53,10 @@ PUBLIC_REUSABLE_TOOLREFS: dict[str, str] = {
     "infra.soperator.deploy": "public npa.soperator deployment primitive",
     "workbench.cosmos2.transfer": "public Cosmos Transfer composition primitive",
     "workbench.foxglove.convert": "public recording-conversion primitive",
-    # Remove this entry when the Encord/GR00T fine-tuning spec lands and
-    # consumes it: a reusable-only entry must not also be reachable from a
-    # shipped spec.
+    # Remove these two when the Encord/GR00T fine-tuning spec lands and consumes
+    # them: a reusable-only entry must not also be reachable from a shipped spec.
     "workflow.groot.prepare_dataset": "public LeRobot-to-GR00T dataset conversion primitive",
+    "workflow.groot.validate_checkpoints": "public per-checkpoint validation and selection primitive",
     "workbench.insights.record": "public lineage/metrics ingestion primitive",
     "workbench.isaac_lab.byof_repo": "public Isaac Lab BYOF primitive",
     "workbench.lerobot.eval": "public LeRobot evaluation primitive",
@@ -2364,6 +2364,54 @@ TOOL_CATALOG: dict[str, ToolEntry] = {
             "tune-diffusion-model=true",
             "--run-id",
             "{{run.id}}",
+            # W&B is the live view of a training run. `enabled` stays on and the
+            # mode carries the switch, so a spec opts out with
+            # `--var wandb_mode=disabled` without the argv template changing.
+            "--wandb",
+            "--wandb-mode",
+            "{{config.wandb_mode}}",
+            "--wandb-project",
+            "{{config.wandb_project}}",
+            "--wandb-run-name",
+            "{{run.id}}",
+        ],
+    ),
+    "workflow.groot.validate_checkpoints": ToolEntry(
+        name="workflow.groot.validate_checkpoints",
+        access_capabilities=("groot",),
+        description=(
+            "Score every saved checkpoint on the validation split and select the "
+            "one that beats the base model, or select none."
+        ),
+        argv_template=[
+            "python3",
+            "-m",
+            "npa.workflows.groot_learning",
+            "validate-checkpoints",
+            "--split-manifest-uri",
+            "{{config.split_manifest_uri}}",
+            "--training-manifest-uri",
+            "{{config.training_manifest_uri}}",
+            "--checkpoint-uri",
+            "{{config.candidate_checkpoint_uri}}",
+            "--baseline-eval-uri",
+            "{{config.offline_baseline_eval_uri}}",
+            "--validation-uri",
+            "{{config.validation_uri}}",
+            "--curve-uri",
+            "{{config.validation_curve_uri}}",
+            "--selection-uri",
+            "{{config.checkpoint_selection_uri}}",
+            "--robot-embodiment",
+            "{{config.robot_embodiment}}",
+            "--action-horizon",
+            "{{config.action_horizon}}",
+            "--validation-repeats",
+            "{{config.validation_repeats}}",
+            "--minimum-relative-improvement",
+            "{{config.minimum_relative_improvement}}",
+            "--run-id",
+            "{{run.id}}",
         ],
     ),
     "workflow.groot.resolve_trained_checkpoint": ToolEntry(
@@ -2397,7 +2445,12 @@ TOOL_CATALOG: dict[str, ToolEntry] = {
             "{{config.save_steps}}",
             "--expected-save-total-limit",
             "{{config.save_total_limit}}",
+            # Empty resolves the final step, which is what a run without a
+            # validation stage wants.
+            "--selection-uri",
+            "{{config.checkpoint_selection_uri}}",
         ],
+        omit_flags_when_empty=("--selection-uri",),
     ),
     "workflow.groot.preflight_rigor": ToolEntry(
         name="workflow.groot.preflight_rigor",

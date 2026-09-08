@@ -23,6 +23,14 @@ config:
   # pipeline does; the curated path is the Encord/GR00T fine-tuning workflow.
   curation_manifest_uri: ""
   curation_report_uri: ""
+  # This pipeline is an operational smoke, so it keeps W&B off and relies on the
+  # S3 evidence it already publishes. The Encord/GR00T fine-tuning workflow sets
+  # wandb_mode=online to get live curves.
+  wandb_mode: disabled
+  wandb_project: npa-groot
+  # Empty resolves the final checkpoint. Populated only by a workflow that runs
+  # the per-checkpoint validation stage and selects among candidates.
+  checkpoint_selection_uri: ""
   # GR00T fine-tuning and offline evaluation are headless tensor workloads.
   # B200 is the canonical reserved-capacity target; no stage requires RT cores.
   gpu_type: B200

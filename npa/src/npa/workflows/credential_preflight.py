@@ -25,7 +25,14 @@ from npa.workflows.sim2real_health import (
 )
 
 # Canonical order a customer should reason about credentials in.
-CREDENTIAL_CHECKS: tuple[str, ...] = ("hf", "ngc", "s3", "token_factory", "encord")
+CREDENTIAL_CHECKS: tuple[str, ...] = (
+    "hf",
+    "ngc",
+    "s3",
+    "token_factory",
+    "encord",
+    "wandb",
+)
 
 
 @dataclass
@@ -260,6 +267,32 @@ def check_token_factory(credentials: Any, probes: CredentialProbes) -> CheckResu
     )
 
 
+def check_wandb(credentials: Any, probes: CredentialProbes) -> CheckResult:
+    """Check a Weights & Biases key is present for live training curves.
+
+    A warning rather than a failure: training publishes its durable metrics to
+    S3 either way, and an absent key only costs the live dashboard.
+    """
+
+    tokens = getattr(credentials, "tokens", {}) or {}
+    if not str(tokens.get("WANDB_API_KEY") or "").strip():
+        return CheckResult(
+            name="wandb",
+            status=WARN,
+            summary="WANDB_API_KEY is not set, so training curves stay offline.",
+            remedy=(
+                "Required only for live W&B curves during training. Copy your key "
+                "from https://wandb.ai/authorize and set tokens: WANDB_API_KEY in "
+                "~/.npa/credentials.yaml, or run with wandb_mode=disabled."
+            ),
+        )
+    return CheckResult(
+        name="wandb",
+        status=PASS,
+        summary="WANDB_API_KEY is set (not verified against W&B).",
+    )
+
+
 def check_encord(credentials: Any, probes: CredentialProbes) -> CheckResult:
     """Check an Encord credential is present and (optionally) authenticates.
 
@@ -330,6 +363,7 @@ _CHECK_FUNCS: dict[str, Callable[[Any, CredentialProbes], CheckResult]] = {
     "s3": check_s3,
     "token_factory": check_token_factory,
     "encord": check_encord,
+    "wandb": check_wandb,
 }
 
 
@@ -360,6 +394,7 @@ __all__ = [
     "check_ngc",
     "check_s3",
     "check_token_factory",
+    "check_wandb",
     "has_failure",
     "run_credential_preflight",
 ]
