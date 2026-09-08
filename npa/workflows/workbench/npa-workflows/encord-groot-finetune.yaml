@@ -1,0 +1,390 @@
+apiVersion: npa.workflow/v0.0.1
+kind: Workflow
+
+# Fine-tune GR00T N1.7 on your own robot demonstrations, with Encord curating
+# which episodes train and an offline evaluation that says whether it helped.
+#
+# Guide: docs/workbench/guides/encord-groot-finetune.md
+#
+#   npa workbench workflow submit \
+#     npa/workflows/workbench/npa-workflows/encord-groot-finetune.yaml \
+#     --run-id <unique-id> --max-wait-seconds 0 \
+#     --var bucket=<bucket> \
+#     --var source_data_uri=s3://<bucket>/datasets/<your-lerobot-dataset>/ \
+#     --var encord_integration=<your-encord-integration-title> \
+#     --registry <registry>/npa-groot:<validated-tag> \
+#     --secret-env HF_TOKEN --secret-env ENCORD_SSH_KEY_B64 \
+#     --secret-env WANDB_API_KEY
+#
+# --max-wait-seconds 0 is required: the runtime's default one-hour per-wave
+# deadline does not survive a cold image pull plus model download plus training.
+#
+# WHAT THIS ESTABLISHES, AND WHAT IT DOES NOT
+# Three cohorts, and the difference between them is the whole point.
+#   train       the episodes the optimizer sees.
+#   validation  scores every saved checkpoint and picks one. Because it informs
+#               that choice, it cannot also be the evidence the choice was good.
+#   final       touched exactly once, by two stages: the base model and the
+#               selected checkpoint. That comparison is the headline number.
+# An `improved` outcome is evidence the policy learned to predict held-out
+# actions better than the base model. It is not a closed-loop success rate and
+# not a claim about hardware. See the guide's evidence section.
+metadata:
+  name: encord-groot-finetune
+  description: >
+    Convert and audit a LeRobot dataset, curate its episodes in Encord, train
+    GR00T N1.7 with live W&B curves, score every saved checkpoint on a
+    validation cohort, and compare the selected checkpoint against the base
+    model on a final cohort touched exactly once.
+
+config:
+  bucket: example-bucket
+  prefix: "encord-groot-finetune/{{run.id}}"
+  root_uri: "s3://{{config.bucket}}/{{config.prefix}}"
+
+  # --- Your data -----------------------------------------------------------
+  # A standard LeRobot dataset (v3.0 or v2.1). Stage a pinned public one with
+  # `npa workbench lerobot fetch-dataset`, or sync your own recordings.
+  source_data_uri: "s3://{{config.bucket}}/datasets/lerobot-source/"
+  robot_embodiment: NEW_EMBODIMENT
+  base_model: nvidia/GR00T-N1.7-3B
+  action_representation: ABSOLUTE
+  # The camera Encord curates on. Conversion writes one video per episode per
+  # camera; training still uses every camera the dataset declares.
+  camera_key: observation.images.top
+
+  # --- Cohorts -------------------------------------------------------------
+  # heldout is the validation cohort. final is reported on once.
+  train_episodes: "36"
+  heldout_episodes: "7"
+  final_episodes: "7"
+  split_seed: encord-groot-finetune-v1
+
+  # --- Encord curation -----------------------------------------------------
+  # register keeps the bytes in your bucket; Encord references them through the
+  # named cloud integration. --var encord_transfer=upload copies them instead.
+  encord_integration: ""
+  encord_transfer: register
+  encord_media_filter: videos-images
+  encord_poll_timeout_seconds: "1800"
+  encord_folder: "npa-groot-{{run.id}}"
+  encord_dataset: "npa-groot-{{run.id}}"
+  encord_collection: "npa-groot-curated-{{run.id}}"
+  # Width is intrinsic, so this evaluates on any folder without precomputed
+  # metrics. It is an identity-and-plumbing gate, NOT a task-quality filter.
+  # Point it at app-computed metrics (brightness, sharpness, blur) once they
+  # exist for the folder, or curate by hand: see the guide's manual variant.
+  encord_curate_filters: "width:32:16384"
+  encord_curate_poll_seconds: "300"
+  encord_source: collection
+  encord_source_id: "{{config.encord_collection}}"
+
+  # --- Training ------------------------------------------------------------
+  gpu_type: H100
+  gpu_count: "1"
+  per_device_batch_size: "8"
+  gradient_accumulation_steps: "2"
+  global_batch_size: "16"
+  minimum_effective_global_batch: "1"
+  minimum_epochs: "0.001"
+  nccl_transport: auto
+  dataloader_num_workers: "4"
+  logging_steps: "10"
+  max_steps: "500"
+  # Every save is a selection candidate, so retention must cover them all.
+  save_steps: "100"
+  save_total_limit: "5"
+  # W&B is the live view of this run. WANDB_API_KEY comes in as a runtime
+  # secret; --var wandb_mode="" turns tracking off without changing anything
+  # else, and the S3 evidence below lands either way.
+  wandb_mode: online
+  wandb_project: npa-groot
+
+  # --- Evaluation ----------------------------------------------------------
+  action_horizon: "16"
+  # One pass per candidate keeps ranking affordable; the final comparison uses
+  # the full repeat contract with its determinism and noise checks.
+  validation_repeats: "1"
+  evaluation_repeats: "5"
+  minimum_relative_improvement: "0.10"
+  minimum_skill_score: "0.05"
+  repeat_noise_multiple: "3.0"
+  max_dimension_regression: "0.0"
+  loss_decrease_tolerance: "0.01"
+
+  # --- Artifacts -----------------------------------------------------------
+  prepared_data_uri: "{{config.root_uri}}/data/prepared/"
+  dataset_audit_uri: "{{config.root_uri}}/reports/dataset-audit.json"
+  encord_media_uri: "{{config.prepared_data_uri}}videos/chunk-000/{{config.camera_key}}/"
+  encord_receipt_uri: "{{config.root_uri}}/encord/push/"
+  encord_curate_receipt_uri: "{{config.root_uri}}/encord/curate/"
+  encord_pull_uri: "{{config.root_uri}}/encord/pull/"
+  encord_verify_uri: "{{config.root_uri}}/encord/verify/"
+  curation_manifest_uri: "{{config.encord_pull_uri}}manifest.json"
+  curation_report_uri: "{{config.encord_verify_uri}}roundtrip_report.json"
+  train_data_uri: "{{config.root_uri}}/data/train/"
+  heldout_data_uri: "{{config.root_uri}}/data/validation/"
+  final_data_uri: "{{config.root_uri}}/data/final/"
+  data_uri: "{{config.train_data_uri}}"
+  split_manifest_uri: "{{config.root_uri}}/reports/split.json"
+  rigor_preflight_uri: "{{config.root_uri}}/reports/preflight.json"
+  baseline_checkpoint_uri: "{{config.root_uri}}/checkpoints/baseline/"
+  candidate_checkpoint_uri: "{{config.root_uri}}/checkpoints/candidate/"
+  training_manifest_uri: "{{config.candidate_checkpoint_uri}}npa_groot_finetune_manifest.json"
+  candidate_checkpoint_ref_uri: "{{config.root_uri}}/reports/selected-checkpoint-ref.json"
+  # The validation-cohort baseline is the selection ceiling only. It is kept
+  # apart from the final-cohort baseline so the ceiling cannot encode anything
+  # from the cohort that reports the headline number.
+  validation_baseline_eval_uri: "{{config.root_uri}}/validation/baseline/evaluation.json"
+  validation_baseline_arrays_uri: "{{config.root_uri}}/validation/baseline/actions.npz"
+  validation_uri: "{{config.root_uri}}/validation"
+  validation_curve_uri: "{{config.root_uri}}/validation/curve.json"
+  checkpoint_selection_uri: "{{config.root_uri}}/reports/selected-checkpoint.json"
+  offline_baseline_eval_uri: "{{config.root_uri}}/offline/baseline/evaluation.json"
+  offline_baseline_arrays_uri: "{{config.root_uri}}/offline/baseline/actions.npz"
+  offline_candidate_eval_uri: "{{config.root_uri}}/offline/trained/evaluation.json"
+  offline_candidate_arrays_uri: "{{config.root_uri}}/offline/trained/actions.npz"
+  evaluation_split_role: final
+  learning_report_uri: "{{config.root_uri}}/reports/learning-report.json"
+  offline_comparison_video_uri: "{{config.root_uri}}/reports/offline-comparison.mp4"
+  comparison_video_uri: "{{config.offline_comparison_video_uri}}"
+  rrd_uri: "{{config.root_uri}}/reports/groot-offline-evaluation.rrd"
+  mcap_uri: "{{config.root_uri}}/reports/groot-offline-evaluation.mcap"
+  offline_rrd_uri: "{{config.rrd_uri}}"
+  offline_mcap_uri: "{{config.mcap_uri}}"
+  publish_manifest_uri: "{{config.root_uri}}/reports/publish-manifest.json"
+  workflow_uri: "{{config.root_uri}}/workflow.yaml"
+
+resources:
+  cpu:
+    cloud: kubernetes
+    cpus: 8
+    memory: 32Gi
+  gpu:
+    cloud: kubernetes
+    accelerators: "{{config.gpu_type}}:{{config.gpu_count}}"
+    cpus: 16
+    memory: 96Gi
+
+initial: prepare-dataset
+
+states:
+  prepare-dataset:
+    description: >
+      Convert the LeRobot dataset to per-episode GR00T format and publish a
+      fail-closed audit. This runs first because Encord curates media items:
+      LeRobot v3 packs every episode into one file per camera, so curation at
+      episode granularity is impossible until they are split. The audit is also
+      the cheapest place to learn the data cannot train.
+    toolRef: workflow.groot.prepare_dataset
+    resources: cpu
+    inputs:
+      - {uri: "{{config.source_data_uri}}", schema: nvidia.groot.lerobot.v2}
+    outputs:
+      - {uri: "{{config.prepared_data_uri}}", schema: nvidia.groot.lerobot.v2}
+      - {uri: "{{config.dataset_audit_uri}}", schema: npa.groot.dataset_audit.v1}
+    next: push
+
+  push:
+    description: Register the selected camera's per-episode videos in place; bytes stay in your bucket.
+    toolRef: workbench.encord.push
+    resources: cpu
+    outputs:
+      - {uri: "{{config.encord_receipt_uri}}push_receipt.json", schema: npa.encord.push_receipt.v1}
+    next: curate
+
+  curate:
+    description: >
+      Select episodes into a run-scoped Collection. The default width filter is
+      an intrinsic gate, not a quality classifier; the guide covers pointing it
+      at app-computed metrics or pausing here for a human pass.
+    toolRef: workbench.encord.curate
+    resources: cpu
+    inputs:
+      - {uri: "{{config.encord_receipt_uri}}push_receipt.json", schema: npa.encord.push_receipt.v1}
+    outputs:
+      - {uri: "{{config.encord_curate_receipt_uri}}curate_receipt.json", schema: npa.encord.curate_receipt.v1}
+    next: pull
+
+  pull:
+    description: Materialize the curated Collection back to S3 with a lineage manifest.
+    toolRef: workbench.encord.pull
+    resources: cpu
+    inputs:
+      - {uri: "{{config.encord_curate_receipt_uri}}curate_receipt.json", schema: npa.encord.curate_receipt.v1}
+    outputs:
+      - {uri: "{{config.curation_manifest_uri}}", schema: npa.encord.pull_manifest.v1}
+    next: verify
+
+  verify:
+    description: Join the push receipt to the pull manifest and prove identity, size and checksum. Fails closed.
+    toolRef: workbench.encord.verify
+    resources: cpu
+    inputs:
+      - {uri: "{{config.encord_receipt_uri}}push_receipt.json", schema: npa.encord.push_receipt.v1}
+      - {uri: "{{config.curation_manifest_uri}}", schema: npa.encord.pull_manifest.v1}
+    outputs:
+      - {uri: "{{config.curation_report_uri}}", schema: npa.encord.roundtrip_report.v1}
+    next: prepare-split
+
+  prepare-split:
+    description: >
+      Split the curated episodes into train, validation and final cohorts with
+      train-only statistics. Only episodes that survived curation and checksum
+      verification are eligible, and the selection enters the split hash, so the
+      same seed under different curation is a different experiment.
+    toolRef: workflow.groot.prepare_split
+    resources: cpu
+    inputs:
+      - {uri: "{{config.prepared_data_uri}}", schema: nvidia.groot.lerobot.v2}
+      - {uri: "{{config.curation_manifest_uri}}", schema: npa.encord.pull_manifest.v1}
+      - {uri: "{{config.curation_report_uri}}", schema: npa.encord.roundtrip_report.v1}
+    outputs:
+      - {uri: "{{config.train_data_uri}}", schema: nvidia.groot.lerobot.v2.train-split}
+      - {uri: "{{config.heldout_data_uri}}", schema: nvidia.groot.lerobot.v2.heldout-split}
+      - {uri: "{{config.split_manifest_uri}}", schema: npa.groot.episode_split.v1}
+    next: preflight
+
+  preflight:
+    description: Check the GPU, batch, cohort and checkpoint-schedule contract before any GPU stage.
+    toolRef: workflow.groot.preflight_rigor
+    resources: cpu
+    outputs:
+      - {uri: "{{config.rigor_preflight_uri}}", schema: npa.groot.rigor_preflight.v1}
+    next: baseline-validation
+
+  baseline-validation:
+    description: >
+      Score the untrained base model on the validation cohort. This is the
+      ceiling checkpoint selection has to beat, and nothing else reads it.
+    toolRef: workbench.groot.baseline_eval
+    resources: gpu
+    params:
+      evaluation_split_role: heldout
+      offline_baseline_eval_uri: "{{config.validation_baseline_eval_uri}}"
+      offline_baseline_arrays_uri: "{{config.validation_baseline_arrays_uri}}"
+    inputs:
+      - {uri: "{{config.split_manifest_uri}}", schema: npa.groot.episode_split.v1}
+    outputs:
+      - {uri: "{{config.baseline_checkpoint_uri}}", schema: nvidia.groot.n1.7.custom-embodiment-checkpoint}
+      - {uri: "{{config.validation_baseline_eval_uri}}", schema: npa.groot.offline_eval.v1}
+    next: baseline-final
+
+  baseline-final:
+    description: >
+      Score the same base weights on the final cohort. This is one half of the
+      headline comparison; it reuses the checkpoint the previous stage
+      published rather than rebuilding a 3B-parameter model.
+    toolRef: workbench.groot.baseline_eval
+    resources: gpu
+    inputs:
+      - {uri: "{{config.split_manifest_uri}}", schema: npa.groot.episode_split.v1}
+      - {uri: "{{config.baseline_checkpoint_uri}}", schema: nvidia.groot.n1.7.custom-embodiment-checkpoint}
+    outputs:
+      - {uri: "{{config.offline_baseline_eval_uri}}", schema: npa.groot.offline_eval.v1}
+      - {uri: "{{config.offline_baseline_arrays_uri}}", schema: numpy.npz}
+    next: train
+
+  train:
+    description: >
+      Fine-tune GR00T on the curated train cohort, saving a checkpoint every
+      save_steps. Live curves go to W&B; loss, learning rate and the checkpoint
+      inventory also land in the trainer manifest.
+    toolRef: workbench.groot.finetune
+    resources: gpu
+    inputs:
+      - {uri: "{{config.train_data_uri}}", schema: nvidia.groot.lerobot.v2.train-split}
+      - {uri: "{{config.split_manifest_uri}}", schema: npa.groot.episode_split.v1}
+    outputs:
+      - {uri: "{{config.candidate_checkpoint_uri}}", schema: nvidia.groot.n1.7.finetuned-checkpoint}
+      - {uri: "{{config.training_manifest_uri}}", schema: npa.groot.finetune.v1}
+    next: validate-checkpoints
+
+  validate-checkpoints:
+    description: >
+      Score every saved checkpoint on the validation cohort and select the one
+      that beats the base model by the configured margin. Ties go to the earlier
+      step. If none qualifies, the run selects nothing and still publishes its
+      curve, which is a real outcome and not a failure to report.
+    toolRef: workflow.groot.validate_checkpoints
+    resources: gpu
+    inputs:
+      - {uri: "{{config.training_manifest_uri}}", schema: npa.groot.finetune.v1}
+      - {uri: "{{config.validation_baseline_eval_uri}}", schema: npa.groot.offline_eval.v1}
+    outputs:
+      - {uri: "{{config.validation_curve_uri}}", schema: npa.groot.validation_curve.v1}
+      - {uri: "{{config.checkpoint_selection_uri}}", schema: npa.groot.checkpoint_selection.v1}
+    next: resolve-checkpoint
+
+  resolve-checkpoint:
+    description: Resolve the selected step to an immutable checkpoint reference and prove its weights differ from the baseline.
+    toolRef: workflow.groot.resolve_trained_checkpoint
+    resources: cpu
+    inputs:
+      - {uri: "{{config.checkpoint_selection_uri}}", schema: npa.groot.checkpoint_selection.v1}
+      - {uri: "{{config.training_manifest_uri}}", schema: npa.groot.finetune.v1}
+    outputs:
+      - {uri: "{{config.candidate_checkpoint_ref_uri}}", schema: npa.groot.checkpoint_ref.v1}
+    next: final-eval
+
+  final-eval:
+    description: >
+      Score the selected checkpoint on the final cohort, the only stage besides
+      baseline-final that reads it. The validation cohort chose this checkpoint,
+      so it cannot also be the evidence the choice was good.
+    toolRef: workbench.groot.posttrain_eval
+    resources: gpu
+    inputs:
+      - {uri: "{{config.candidate_checkpoint_ref_uri}}", schema: npa.groot.checkpoint_ref.v1}
+    outputs:
+      - {uri: "{{config.offline_candidate_eval_uri}}", schema: npa.groot.offline_eval.v1}
+      - {uri: "{{config.offline_candidate_arrays_uri}}", schema: numpy.npz}
+    next: compare
+
+  compare:
+    description: >
+      Compare the selected checkpoint against the base model on the final
+      cohort, with trivial-predictor floors and repeat-noise evidence, and
+      classify improved or not_improved. A not_improved run still reaches
+      publication; the guide explains what to change next.
+    toolRef: workflow.groot.compare_learning
+    resources: cpu
+    inputs:
+      - {uri: "{{config.offline_baseline_eval_uri}}", schema: npa.groot.offline_eval.v1}
+      - {uri: "{{config.offline_candidate_eval_uri}}", schema: npa.groot.offline_eval.v1}
+    outputs:
+      - {uri: "{{config.learning_report_uri}}", schema: npa.groot.learning.v1}
+      - {uri: "{{config.comparison_video_uri}}", schema: video.mp4.offline-heldout-comparison}
+    next: emit-rrd
+
+  emit-rrd:
+    description: Emit a Rerun recording of the real final-cohort frames, actions and errors.
+    toolRef: workflow.groot.emit_learning_rrd
+    resources: cpu
+    inputs:
+      - {uri: "{{config.learning_report_uri}}", schema: npa.groot.learning.v1}
+    outputs:
+      - {uri: "{{config.rrd_uri}}", schema: rerun.rrd.v1}
+    next: emit-mcap
+
+  emit-mcap:
+    description: Emit the equivalent MCAP topics on the same timebase.
+    toolRef: workflow.groot.emit_learning_mcap
+    resources: cpu
+    inputs:
+      - {uri: "{{config.learning_report_uri}}", schema: npa.groot.learning.v1}
+    outputs:
+      - {uri: "{{config.mcap_uri}}", schema: mcap.v1}
+    next: publish
+
+  publish:
+    description: Hash and publish every artifact with the machine-readable run summary.
+    toolRef: workflow.groot.publish_learning
+    resources: cpu
+    inputs:
+      - {uri: "{{config.learning_report_uri}}", schema: npa.groot.learning.v1}
+      - {uri: "{{config.rrd_uri}}", schema: rerun.rrd.v1}
+      - {uri: "{{config.mcap_uri}}", schema: mcap.v1}
+    outputs:
+      - {uri: "{{config.publish_manifest_uri}}", schema: npa.groot.learning_publish.v1}
+    terminal: true
