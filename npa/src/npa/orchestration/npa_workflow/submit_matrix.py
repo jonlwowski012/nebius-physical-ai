@@ -664,6 +664,28 @@ SUBMIT_LIVE_MATRIX: tuple[SubmitLiveCase, ...] = (
             "status; it is not closed-loop or physical-robot task evidence."
         ),
     ),
+    SubmitLiveCase(
+        "encord-groot-finetune.yaml",
+        "multi",
+        secret_envs=(
+            "AWS_ACCESS_KEY_ID",
+            "AWS_SECRET_ACCESS_KEY",
+            "HF_TOKEN",
+            "ENCORD_SSH_KEY_B64",
+            "WANDB_API_KEY",
+        ),
+        image_tool="groot",
+        notes=(
+            "Converts and audits a LeRobot dataset, curates its episodes through "
+            "Encord, trains GR00T N1.7 with live W&B curves, scores every saved "
+            "checkpoint on a validation cohort, and compares the selected "
+            "checkpoint against the base model on a final cohort read exactly "
+            "once. Needs --max-wait-seconds 0: a cold image pull plus model "
+            "download plus training exceeds the default per-wave deadline. The "
+            "outcome is offline held-out action error, not a closed-loop success "
+            "rate and not physical-robot evidence."
+        ),
+    ),
     # --- Multi-stage GPU ---
     SubmitLiveCase(
         "sonic-export-eval.yaml",

@@ -53,10 +53,6 @@ PUBLIC_REUSABLE_TOOLREFS: dict[str, str] = {
     "infra.soperator.deploy": "public npa.soperator deployment primitive",
     "workbench.cosmos2.transfer": "public Cosmos Transfer composition primitive",
     "workbench.foxglove.convert": "public recording-conversion primitive",
-    # Remove these two when the Encord/GR00T fine-tuning spec lands and consumes
-    # them: a reusable-only entry must not also be reachable from a shipped spec.
-    "workflow.groot.prepare_dataset": "public LeRobot-to-GR00T dataset conversion primitive",
-    "workflow.groot.validate_checkpoints": "public per-checkpoint validation and selection primitive",
     "workbench.insights.record": "public lineage/metrics ingestion primitive",
     "workbench.isaac_lab.byof_repo": "public Isaac Lab BYOF primitive",
     "workbench.lerobot.eval": "public LeRobot evaluation primitive",
@@ -2392,8 +2388,11 @@ TOOL_CATALOG: dict[str, ToolEntry] = {
             "{{config.training_manifest_uri}}",
             "--checkpoint-uri",
             "{{config.candidate_checkpoint_uri}}",
+            # The validation-cohort baseline, not the final one: the selection
+            # ceiling must not encode anything from the split that reports the
+            # headline number.
             "--baseline-eval-uri",
-            "{{config.offline_baseline_eval_uri}}",
+            "{{config.validation_baseline_eval_uri}}",
             "--validation-uri",
             "{{config.validation_uri}}",
             "--curve-uri",
