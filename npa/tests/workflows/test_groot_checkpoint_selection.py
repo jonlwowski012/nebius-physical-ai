@@ -418,3 +418,143 @@ def test_naming_a_mode_is_the_switch(
 
     assert env["WANDB_MODE"] == expected_mode
     assert env["NPA_TRAINING_WANDB_ENABLED"] == expected_enabled
+
+
+# --------------------------------------------------------------------------
+# Which cohort a run reports on
+# --------------------------------------------------------------------------
+
+
+def test_evaluate_defaults_to_the_validation_cohort() -> None:
+    """Existing callers must keep measuring the split they always measured."""
+    import inspect
+
+    from npa.workflows.groot_learning import evaluate
+
+    assert inspect.signature(evaluate).parameters["split_role"].default == "heldout"
+
+
+def test_evaluate_rejects_an_unknown_cohort() -> None:
+    from npa.workflows.groot_learning import evaluate
+
+    with pytest.raises(GrootVisualizationError, match="heldout or final"):
+        evaluate(
+            "s3://bucket/split.json",
+            "",
+            "s3://bucket/out.json",
+            "s3://bucket/out.npz",
+            RUN_ID,
+            "baseline",
+            robot_embodiment="NEW_EMBODIMENT",
+            split_role="train",
+        )
+
+
+def test_evaluate_fails_closed_when_the_cohort_was_never_materialised(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A spec asking for `final` on a split that made none must not fall back."""
+    client = FakeS3()
+    client.seed_json(
+        "bucket",
+        "split.json",
+        {
+            "schema": learning.SPLIT_SCHEMA,
+            "status": "prepared",
+            "run_id": RUN_ID,
+            "split_hash": "s" * 64,
+            "train": {"uri": "s3://bucket/data/train/"},
+            "heldout": {"uri": "s3://bucket/data/validation/"},
+            "final": None,
+            "integrity": {"leakage_free": True},
+        },
+    )
+    monkeypatch.setattr(learning, "_download_prefix", lambda *_a, **_k: [Path("x")])
+
+    with pytest.raises(GrootVisualizationError, match="no 'final' cohort"):
+        learning.evaluate(
+            "s3://bucket/split.json",
+            "s3://bucket/checkpoints/candidate/checkpoint-1/",
+            "s3://bucket/out.json",
+            "s3://bucket/out.npz",
+            RUN_ID,
+            "posttrain",
+            robot_embodiment="NEW_EMBODIMENT",
+            split_role="final",
+            s3_client=client,
+        )
+
+
+def test_both_eval_toolrefs_expose_a_droppable_cohort() -> None:
+    """An existing spec renders no --split-role and keeps measuring validation."""
+    from npa.orchestration.npa_workflow.catalog import TOOL_CATALOG
+
+    for name in ("workbench.groot.baseline_eval", "workbench.groot.posttrain_eval"):
+        entry = TOOL_CATALOG[name]
+        assert "--split-role" in entry.argv_template, name
+        assert entry.omit_flags_when_empty == ("--split-role",), name
+
+
+def test_baseline_reuses_published_weights_instead_of_rebuilding(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Measuring the base model on two cohorts must not build it twice."""
+    client = FakeS3()
+    client.seed_json(
+        "bucket",
+        "split.json",
+        {
+            "schema": learning.SPLIT_SCHEMA,
+            "status": "prepared",
+            "run_id": RUN_ID,
+            "split_hash": "s" * 64,
+            "train": {"uri": "s3://bucket/data/train/"},
+            "heldout": {"uri": "s3://bucket/data/validation/"},
+            "final": {"uri": "s3://bucket/data/final/"},
+            "integrity": {"leakage_free": True},
+        },
+    )
+    monkeypatch.setattr(learning, "_download_prefix", lambda *_a, **_k: [Path("x")])
+    monkeypatch.setattr(
+        learning,
+        "_checkpoint_identity",
+        lambda path: {"sha256": "a" * 64, "weights_sha256": "b" * 64},
+    )
+    # A baseline is already published under the prefix.
+    monkeypatch.setattr(
+        learning, "_list_objects", lambda _client, _uri: [{"key": "k", "size": 10}]
+    )
+    built: list[str] = []
+    monkeypatch.setattr(
+        learning,
+        "_initialize_baseline_checkpoint",
+        lambda **_k: built.append("built"),
+    )
+    uploaded: list[str] = []
+    monkeypatch.setattr(
+        learning, "_upload_directory", lambda *_a, **_k: uploaded.append("up") or {}
+    )
+    # Stop before the GPU work; the baseline decision has already been made.
+    monkeypatch.setattr(
+        learning,
+        "checkpoint_model_config_contract",
+        lambda _path: (_ for _ in ()).throw(GrootVisualizationError("stop here")),
+    )
+
+    with pytest.raises(GrootVisualizationError, match="stop here"):
+        learning.evaluate(
+            "s3://bucket/split.json",
+            "",
+            "s3://bucket/out.json",
+            "s3://bucket/out.npz",
+            RUN_ID,
+            "baseline",
+            robot_embodiment="NEW_EMBODIMENT",
+            base_model="nvidia/GR00T-N1.7-3B",
+            baseline_checkpoint_uri="s3://bucket/checkpoints/baseline/",
+            split_role="final",
+            s3_client=client,
+        )
+
+    assert built == [], "a published baseline must not be rebuilt"
+    assert uploaded == [], "a reused baseline must not be re-uploaded"

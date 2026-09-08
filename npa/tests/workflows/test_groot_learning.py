@@ -123,6 +123,8 @@ def test_configurable_evaluation_repeats_reuse_one_policy_with_seed_isolation(
         (output_path / "model.safetensors").write_bytes(b"x")
 
     monkeypatch.setattr(learning, "_initialize_baseline_checkpoint", fake_initialize)
+    # No baseline published yet, so this run initializes one.
+    monkeypatch.setattr(learning, "_list_objects", lambda *_args: [])
     monkeypatch.setattr(
         learning,
         "_upload_directory",

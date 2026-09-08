@@ -1793,14 +1793,24 @@ def evaluate(
     evaluation_repeats: int = 5,
     expected_checkpoint_sha256: str = "",
     expected_checkpoint_step: int = 0,
+    split_role: str = "heldout",
     s3_client: Any | None = None,
 ) -> dict[str, Any]:
-    """Initialize (baseline only) and evaluate a real checkpoint on held-out data."""
+    """Initialize (baseline only) and evaluate a real checkpoint on a held-out split.
+
+    ``split_role`` picks which cohort to measure on. It defaults to ``heldout``,
+    the validation cohort every existing caller uses. A run that selects a
+    checkpoint must report its headline number on ``final`` instead, because the
+    validation cohort already informed that selection and cannot also be the
+    evidence that the selection was good.
+    """
 
     import numpy as np
 
     if phase not in {"baseline", "posttrain"}:
         raise GrootVisualizationError("evaluation phase must be baseline or posttrain")
+    if split_role not in {"heldout", "final"}:
+        raise GrootVisualizationError("evaluation split role must be heldout or final")
     client = _s3_client(s3_client)
     split = _read_s3_json(client, split_manifest_uri)
     if split.get("schema") != SPLIT_SCHEMA or split.get("run_id") != run_id:
@@ -1820,7 +1830,13 @@ def evaluate(
         train_path = root / "train"
         heldout_path = root / "heldout"
         _download_prefix(client, str(split["train"]["uri"]), train_path)
-        _download_prefix(client, str(split["heldout"]["uri"]), heldout_path)
+        cohort = split.get(split_role)
+        if not isinstance(cohort, Mapping) or not str(cohort.get("uri") or ""):
+            raise GrootVisualizationError(
+                f"split manifest has no {split_role!r} cohort to evaluate on; the "
+                "split stage must materialise it first"
+            )
+        _download_prefix(client, str(cohort["uri"]), heldout_path)
         checkpoint_path = root / "checkpoint"
         checkpoint_artifact: dict[str, Any]
         resolved_checkpoint_uri = checkpoint_uri
@@ -1829,15 +1845,32 @@ def evaluate(
                 raise GrootVisualizationError(
                     "baseline evaluation requires base model and baseline checkpoint URI"
                 )
-            _initialize_baseline_checkpoint(
-                train_path=train_path,
-                output_path=checkpoint_path,
-                base_model=base_model,
-                embodiment=embodiment,
-            )
-            checkpoint_artifact = _upload_directory(
-                client, checkpoint_path, baseline_checkpoint_uri
-            )
+            # A run that measures the base model on more than one cohort must
+            # measure the same weights each time. Reuse an already-published
+            # baseline rather than rebuilding a multi-billion-parameter model,
+            # which also makes this stage cheap to resume.
+            published = [
+                item
+                for item in _list_objects(client, baseline_checkpoint_uri)
+                if int(item["size"]) > 0
+            ]
+            if published:
+                _download_prefix(client, baseline_checkpoint_uri, checkpoint_path)
+                checkpoint_artifact = {
+                    "uri": baseline_checkpoint_uri,
+                    "reused": True,
+                    **_checkpoint_identity(checkpoint_path),
+                }
+            else:
+                _initialize_baseline_checkpoint(
+                    train_path=train_path,
+                    output_path=checkpoint_path,
+                    base_model=base_model,
+                    embodiment=embodiment,
+                )
+                checkpoint_artifact = _upload_directory(
+                    client, checkpoint_path, baseline_checkpoint_uri
+                )
             resolved_checkpoint_uri = baseline_checkpoint_uri
         else:
             _download_prefix(client, checkpoint_uri, checkpoint_path)
@@ -1946,7 +1979,8 @@ def evaluate(
         "offline_label": "Offline held-out policy evaluation",
         "split_manifest_uri": split_manifest_uri,
         "split_hash": split["split_hash"],
-        "heldout_data_uri": split["heldout"]["uri"],
+        "split_role": split_role,
+        "heldout_data_uri": cohort["uri"],
         "checkpoint": checkpoint_artifact,
         "checkpoint_uri": resolved_checkpoint_uri,
         "engine": "NVIDIA Isaac-GR00T Gr00tPolicy.get_action",
@@ -4183,6 +4217,14 @@ def build_parser() -> argparse.ArgumentParser:
     baseline.add_argument("--run-id", required=True)
     baseline.add_argument("--action-horizon", type=int, default=16)
     baseline.add_argument("--evaluation-repeats", type=int, default=5)
+    baseline.add_argument(
+        "--split-role",
+        default="heldout",
+        # Deliberately not argparse `choices`: the value arrives from a config
+        # token, and evaluate() already rejects an unknown role with a message
+        # naming both. One validation, not two.
+        help="Cohort to measure on: heldout or final (the once-touched split).",
+    )
 
     posttrain = subparsers.add_parser("posttrain-eval")
     posttrain.add_argument("--split-manifest-uri", required=True)
@@ -4193,6 +4235,14 @@ def build_parser() -> argparse.ArgumentParser:
     posttrain.add_argument("--run-id", required=True)
     posttrain.add_argument("--action-horizon", type=int, default=16)
     posttrain.add_argument("--evaluation-repeats", type=int, default=5)
+    posttrain.add_argument(
+        "--split-role",
+        default="heldout",
+        # Deliberately not argparse `choices`: the value arrives from a config
+        # token, and evaluate() already rejects an unknown role with a message
+        # naming both. One validation, not two.
+        help="Cohort to measure on: heldout or final (the once-touched split).",
+    )
 
     validate = subparsers.add_parser("validate-checkpoints")
     validate.add_argument("--split-manifest-uri", required=True)

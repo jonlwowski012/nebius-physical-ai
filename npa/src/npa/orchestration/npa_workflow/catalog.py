@@ -2575,7 +2575,12 @@ TOOL_CATALOG: dict[str, ToolEntry] = {
             "{{config.action_horizon}}",
             "--evaluation-repeats",
             "{{config.evaluation_repeats}}",
+            # Empty measures the validation cohort, which is what a pipeline
+            # without a once-touched final split wants.
+            "--split-role",
+            "{{config.evaluation_split_role}}",
         ],
+        omit_flags_when_empty=("--split-role",),
     ),
     "workbench.groot.posttrain_eval": ToolEntry(
         name="workbench.groot.posttrain_eval",
@@ -2602,7 +2607,12 @@ TOOL_CATALOG: dict[str, ToolEntry] = {
             "{{config.action_horizon}}",
             "--evaluation-repeats",
             "{{config.evaluation_repeats}}",
+            # Empty measures the validation cohort, which is what a pipeline
+            # without a once-touched final split wants.
+            "--split-role",
+            "{{config.evaluation_split_role}}",
         ],
+        omit_flags_when_empty=("--split-role",),
     ),
     "workflow.groot.compare_learning": ToolEntry(
         name="workflow.groot.compare_learning",
