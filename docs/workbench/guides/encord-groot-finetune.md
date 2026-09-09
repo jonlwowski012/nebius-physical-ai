@@ -508,26 +508,47 @@ cluster ownership from that name, so renaming it orphans the existing jobs
 controller with
 `ClusterOwnerIdentityMismatchError`.
 
-**The durable fix: use a service-account token.** SkyPilot's own setup already
-created `skypilot-service-account` in `default`, holding the pods, `pods/exec`,
-services, nodes and RBAC permissions the launcher needs. Mint a bearer token for
-it and put that in the kubeconfig -- no subprocess per call, no session to
-expire, and a lifetime you choose:
+**The durable direction is a service-account token**, but the service account
+SkyPilot ships is **not sufficient as-is**, and this is worth getting right
+before you try it.
 
 ```bash
 kubectl --context <ctx> create token skypilot-service-account \
   -n default --duration=2160h        # 90 days; this cluster allows up to 8760h
 ```
 
-Write it into the `user` entry for your context, **keeping the entry's name
-unchanged**, then `sky api stop && sky api start` so the server stops serving
-the credential it booted with. Verified on this cluster: `kubectl` and
-`sky jobs queue` both work and the ownership check passes, because ownership is
-derived from the kubeconfig user name and not from the token's subject.
+That token authenticates, passes SkyPilot's ownership check (ownership derives
+from the kubeconfig *user entry name*, not the token subject, so keep the entry
+name unchanged), and serves `sky jobs queue` correctly. It then fails
+provisioning:
 
-Rotate before expiry with the same command. Prefer 90 days over a year: a run
-takes hours, so a shorter lifetime costs nothing and a long-lived token sitting
-in a plaintext kubeconfig is a real credential.
+```
+pods is forbidden: User "system:serviceaccount:default:skypilot-service-account"
+cannot list resource "pods" in API group "" at the cluster scope
+```
+
+`skypilot-service-account` is bound namespace-scoped in `default`, so
+`list pods -n default` is allowed and `list pods --all-namespaces` is not --
+and SkyPilot's GPU discovery lists cluster-wide. The failure surfaces as
+`accelerator readiness failed: Timed out after 600s waiting for SkyPilot to
+discover a compatible GPU`, which reads like a capacity problem and is a
+permissions problem.
+
+Before adopting a service account, grant it cluster-scoped read on the
+resources SkyPilot discovers against (`pods`, `nodes`) and **verify with
+`sky gpus list --infra k8s`, not just `kubectl` and `sky jobs queue`.** A
+credential can pass every check you thought to run and still fail the one the
+launcher makes.
+
+Until that binding exists, keep the user-account token and rotate it:
+
+```bash
+nebius mk8s v1 cluster get-token --profile <profile> --format json
+```
+
+Either way, restart the API server afterwards (`sky api stop && sky api
+start`) -- it serves the credential it booted with. Prefer 90 days over a year
+for any long-lived token in a plaintext kubeconfig.
 
 ## Curating by hand
 

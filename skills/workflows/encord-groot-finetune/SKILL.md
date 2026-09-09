@@ -223,8 +223,13 @@ or documented, and all of them rendered, validated and planned cleanly first.
   in the rank process to force `NPA_TRAINING_WANDB_PROJECT` (and the run name
   when set), guarded by `NPA_TRAINING_WANDB_ENABLED` and fail-soft, because
   tracking must never kill a multi-hour job.
-- **Prefer a service-account token over the exec-plugin kubeconfig.**
-  `skypilot-service-account` already has the needed RBAC;
-  `kubectl create token skypilot-service-account -n default --duration=2160h`
-  removes the per-call subprocess entirely. Keep the kubeconfig user entry name
-  unchanged (ownership derives from it) and restart the API server afterwards.
+- **A service-account token is the right direction but needs cluster-scoped
+  read first.** `skypilot-service-account` is bound namespace-scoped in
+  `default`, so it authenticates, passes the ownership check and serves
+  `sky jobs queue`, then fails provisioning with `pods is forbidden ... at the
+  cluster scope` -- which surfaces as `accelerator readiness failed: Timed out
+  after 600s waiting for SkyPilot to discover a compatible GPU` and reads like a
+  capacity problem. Grant cluster-scoped read on `pods` and `nodes`, and verify
+  with `sky gpus list --infra k8s`, not only `kubectl` and `sky jobs queue`.
+  Keep the kubeconfig user entry name unchanged (ownership derives from it) and
+  restart the API server, which serves the credential it booted with.
