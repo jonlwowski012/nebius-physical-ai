@@ -223,6 +223,14 @@ or documented, and all of them rendered, validated and planned cleanly first.
   in the rank process to force `NPA_TRAINING_WANDB_PROJECT` (and the run name
   when set), guarded by `NPA_TRAINING_WANDB_ENABLED` and fail-soft, because
   tracking must never kill a multi-hour job.
+- **A user-account token's expiry is pinned to the Nebius CLI session.**
+  Minting at 01:12 and again at 12:56 both returned `13:12`, so re-minting
+  cannot extend it and a multi-hour run can outlive the session. The symptoms
+  split: `sky jobs queue` still works (the API server holds a credential in
+  memory) while `kubectl` returns `Unauthorized`, and because the submit path
+  uses `kubectl` for GPU-readiness checks the next wave fails with
+  `managed-job launch indeterminate`. The queue looks healthy while nothing can
+  launch.
 - **A service-account token is the right direction but needs cluster-scoped
   read first.** `skypilot-service-account` is bound namespace-scoped in
   `default`, so it authenticates, passes the ownership check and serves

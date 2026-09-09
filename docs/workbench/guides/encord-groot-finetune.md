@@ -540,11 +540,28 @@ resources SkyPilot discovers against (`pods`, `nodes`) and **verify with
 credential can pass every check you thought to run and still fail the one the
 launcher makes.
 
-Until that binding exists, keep the user-account token and rotate it:
+**The expiry is pinned to your Nebius session, not to when you mint.** This is
+the part that makes a user-account token unsuitable for a long run. Minting at
+01:12 returned a token expiring 13:12; minting again at 12:56 returned the same
+13:12. So the ceiling is the CLI session, and no amount of re-minting moves it:
 
 ```bash
+# both of these return the identical expirationTimestamp
 nebius mk8s v1 cluster get-token --profile <profile> --format json
 ```
+
+When the session lapses mid-run the symptoms are split and confusing:
+`sky jobs queue` keeps working, because the API server holds a credential in
+memory, while `kubectl` returns `Unauthorized` -- and the submit path needs
+`kubectl` for its GPU-readiness and API-stability checks, so the next wave
+launch fails with `managed-job launch indeterminate`. A run can therefore look
+healthy in the job queue and be unable to start another stage.
+
+A service-account token has no such ceiling, which is the real argument for it
+over convenience. Until the cluster-scoped binding exists, either re-login to
+Nebius before a long submit and accept the session window, or restore the
+exec-plugin kubeconfig, which at least re-mints per call for the life of the
+session instead of freezing one token:
 
 Either way, restart the API server afterwards (`sky api stop && sky api
 start`) -- it serves the credential it booted with. Prefer 90 days over a year
