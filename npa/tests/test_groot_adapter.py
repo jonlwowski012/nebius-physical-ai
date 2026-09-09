@@ -441,16 +441,19 @@ def test_lerobot_to_groot_splits_shared_v3_video_file(
         robot_embodiment="NEW_EMBODIMENT",
     )
 
-    assert len(commands) == 2
-    assert [command[command.index("-ss") + 1] for command in commands] == [
+    # The audit now probes each written video with ffprobe, so filter to the
+    # ffmpeg split invocations this test is actually about.
+    splits = [c for c in commands if "ffmpeg" in str(c[0])]
+    assert len(splits) == 2
+    assert [command[command.index("-ss") + 1] for command in splits] == [
         "0.000000000",
         "0.100000000",
     ]
-    assert [command[command.index("-t") + 1] for command in commands] == [
+    assert [command[command.index("-t") + 1] for command in splits] == [
         "0.100000000",
         "0.100000000",
     ]
-    assert all(command[command.index("-i") + 1] == str(source_video) for command in commands)
+    assert all(command[command.index("-i") + 1] == str(source_video) for command in splits)
     assert (
         out / "videos" / "chunk-000" / "observation.image" / "episode_000000.mp4"
     ).read_bytes() == b"episode-video"

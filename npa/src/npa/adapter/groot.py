@@ -54,6 +54,10 @@ AUDIT_TIMEBASE_TOLERANCE = 0.25
 AUDIT_LENGTH_SPREAD = 2
 #: The conditions :func:`audit_dataset` raises on. Reaching its report means
 #: every one of them held, so they are listed rather than evaluated.
+#: Frame-count slack between a video and its declared episode length. Re-encoding
+#: can legitimately round by a frame; it cannot lose a third of the episode.
+AUDIT_FRAME_COUNT_SLACK = 1
+
 AUDIT_FATAL_CHECKS = (
     "every episode has a data file",
     "declared episode length matches its data file",
@@ -273,6 +277,9 @@ def audit_dataset(dataset_dir: Path) -> dict[str, Any]:
     # Only the byte total varies per camera: a camera missing video for any
     # episode raises below, so every camera covers every episode.
     camera_bytes = dict.fromkeys(camera_keys, 0)
+    #: Cameras whose video was actually opened, so the report can say whether
+    #: the geometry check ran or ffprobe was simply unavailable.
+    probed_cameras: set[str] = set()
     # The audit reads two flat vectors and the timebase; the remaining columns
     # (indices, task ids, and any synthetic modality columns) are dead weight.
     wanted = (*AUDIT_VECTOR_KEYS, "timestamp")
@@ -335,6 +342,38 @@ def audit_dataset(dataset_dir: Path) -> dict[str, Any]:
                     f"video bytes at {video}"
                 )
             camera_bytes[camera_key] += size
+            # Open the file. `info.json` declaring 96x96 at 10fps while the
+            # stored video is 1280x720 at 24fps passes every metadata-only
+            # check and silently puts the action timebase off by 2.4x.
+            geometry = _probe_video_geometry(video)
+            if geometry is not None:
+                probed_cameras.add(camera_key)
+                declared_w, declared_h = _audit_declared_geometry(info, camera_key)
+                actual_w, actual_h = geometry["width"], geometry["height"]
+                if declared_w and declared_h and (declared_w, declared_h) != (
+                    actual_w,
+                    actual_h,
+                ):
+                    raise GR00TAdapterError(
+                        f"Episode {episode_index} camera {camera_key!r} video is "
+                        f"{actual_w}x{actual_h} but metadata declares "
+                        f"{declared_w}x{declared_h}: {video}"
+                    )
+                actual_frames = int(geometry["frames"] or 0)
+                if actual_frames and abs(actual_frames - rows) > AUDIT_FRAME_COUNT_SLACK:
+                    raise GR00TAdapterError(
+                        f"Episode {episode_index} camera {camera_key!r} video has "
+                        f"{actual_frames} frames but the episode declares {rows}; "
+                        "actions cannot be aligned to frames that do not exist"
+                    )
+                actual_fps = float(geometry["fps"] or 0.0)
+                if actual_fps and abs(actual_fps - fps) > AUDIT_TIMEBASE_TOLERANCE:
+                    raise GR00TAdapterError(
+                        f"Episode {episode_index} camera {camera_key!r} video runs at "
+                        f"{actual_fps:g}fps but the dataset declares {fps:g}fps; the "
+                        "action timebase for this episode would be wrong by "
+                        f"{actual_fps / fps:.2f}x"
+                    )
 
         episodes.append(
             {
@@ -445,6 +484,10 @@ def audit_dataset(dataset_dir: Path) -> dict[str, Any]:
             {
                 "name": "declared language annotation has task text",
                 "status": "passed" if language_annotation else "skipped",
+            },
+            {
+                "name": "camera video geometry matches metadata",
+                "status": "passed" if probed_cameras else "skipped",
             },
         ],
     }
@@ -579,6 +622,86 @@ def _audit_timebase(
         ),
         "expected_step_seconds": round(expected, 6),
     }
+
+
+def _probe_video_geometry(path: Path) -> dict[str, Any] | None:
+    """Return the video's real width, height, fps and frame count.
+
+    `info.json` is metadata, not evidence: a dataset can declare 96x96 at 10fps
+    and store 1280x720 at 24fps. Cosmos-augmented episodes did exactly that
+    (run cosmos-check-20260909T173508Z), which puts the action timebase off by
+    2.4x for those episodes while every metadata-only check still passes.
+
+    Counts packets rather than decoding frames, so probing a 50-episode
+    two-camera dataset stays cheap. Returns None when ffprobe is unavailable,
+    so the audit degrades to "skipped" rather than failing a usable dataset.
+    """
+
+    ffprobe = shutil.which("ffprobe")
+    if ffprobe is None:
+        return None
+    command = [
+        ffprobe,
+        "-v",
+        "error",
+        "-select_streams",
+        "v:0",
+        "-count_packets",
+        "-show_entries",
+        "stream=width,height,r_frame_rate,nb_frames,nb_read_packets",
+        "-of",
+        "json",
+        str(path),
+    ]
+    try:
+        completed = subprocess.run(command, check=True, capture_output=True, text=True)
+        # A stubbed or unusual runner can return something without stdout; an
+        # unprobeable video degrades the check to "skipped", it never crashes
+        # an otherwise valid audit.
+        stdout = getattr(completed, "stdout", None)
+        if not stdout:
+            return None
+        streams = (json.loads(stdout) or {}).get("streams") or []
+    except (
+        subprocess.CalledProcessError,
+        json.JSONDecodeError,
+        OSError,
+        TypeError,
+        ValueError,
+    ):
+        return None
+    if not streams:
+        return None
+    stream = streams[0]
+    frames = 0
+    for key in ("nb_frames", "nb_read_packets"):
+        try:
+            frames = int(stream.get(key) or 0)
+        except (TypeError, ValueError):
+            frames = 0
+        if frames:
+            break
+    rate = str(stream.get("r_frame_rate") or "0/1")
+    try:
+        numerator, _, denominator = rate.partition("/")
+        fps = float(numerator) / float(denominator or 1)
+    except (TypeError, ValueError, ZeroDivisionError):
+        fps = 0.0
+    return {
+        "width": int(stream.get("width") or 0),
+        "height": int(stream.get("height") or 0),
+        "fps": fps,
+        "frames": frames,
+    }
+
+
+def _audit_declared_geometry(info: dict[str, Any], camera_key: str) -> tuple[int, int]:
+    """Return the (width, height) `info.json` declares for a camera."""
+
+    shape = ((info.get("features") or {}).get(camera_key) or {}).get("shape") or []
+    if len(shape) >= 2:
+        return int(shape[1]), int(shape[0])
+    return 0, 0
 
 
 def _audit_resolution(info: dict[str, Any], camera_key: str) -> str:

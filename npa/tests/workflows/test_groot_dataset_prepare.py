@@ -1017,3 +1017,113 @@ def test_audit_skips_the_language_check_without_an_annotation(tmp_path: Path) ->
         if c["name"] == "declared language annotation has task text"
     )
     assert check["status"] == "skipped"
+
+
+def _with_camera(
+    dataset: Path, *, episodes: int, frames: int, fps: int,
+    width: int = 96, height: int = 96,
+    override: dict[int, tuple[int, int, int, int]] | None = None,
+) -> None:
+    """Declare a video camera on a converted dataset and write real videos.
+
+    `_converted` produces a video-less dataset, so the audit's camera checks
+    are skipped. These tests need a camera whose *stored* geometry can be made
+    to disagree with `info.json`.
+
+    `override` maps an episode index to (width, height, fps, frames) for the
+    file actually written, leaving the declared metadata untouched.
+    """
+    import shutil as _shutil
+    import subprocess as _subprocess
+
+    ffmpeg = _shutil.which("ffmpeg")
+    if ffmpeg is None:  # pragma: no cover - environment without ffmpeg
+        pytest.skip("ffmpeg is required to synthesise camera video")
+
+    key = "observation.images.top"
+    tpl = "videos/chunk-{episode_chunk:03d}/{video_key}/episode_{episode_index:06d}.mp4"
+    info_path = dataset / "meta" / "info.json"
+    info = json.loads(info_path.read_text())
+    info.setdefault("features", {})[key] = {
+        "dtype": "video",
+        "shape": [height, width, 3],
+        "names": ["height", "width", "channel"],
+    }
+    info["video_path"] = tpl
+    _write_json(info_path, info)
+
+    for episode in range(episodes):
+        w, h, f, n = override.get(episode, (width, height, fps, frames)) if override else (
+            width, height, fps, frames
+        )
+        target = dataset / tpl.format(
+            episode_chunk=0, video_key=key, episode_index=episode
+        )
+        target.parent.mkdir(parents=True, exist_ok=True)
+        _subprocess.run(
+            [
+                ffmpeg, "-y", "-f", "lavfi",
+                "-i", f"testsrc=size={w}x{h}:rate={f}:duration={n / f}",
+                "-pix_fmt", "yuv420p", str(target),
+            ],
+            check=True, capture_output=True,
+        )
+
+
+def test_audit_passes_when_stored_video_matches_metadata(tmp_path: Path) -> None:
+    out = _converted(tmp_path, episodes=2, frames=10, fps=10)
+    _with_camera(out, episodes=2, frames=10, fps=10)
+
+    report = audit_dataset(out)
+    check = next(
+        c for c in report["checks"]
+        if c["name"] == "camera video geometry matches metadata"
+    )
+    assert check["status"] == "passed", (
+        "a dataset whose videos match its metadata must satisfy the check, "
+        "otherwise the check is inert"
+    )
+
+
+def test_audit_rejects_video_resolution_that_contradicts_metadata(tmp_path: Path) -> None:
+    """A camera video must actually be the size `info.json` claims.
+
+    Found on live run cosmos-check-20260909T173508Z: `materialize-training-data`
+    folded Cosmos-augmented episodes into a pusht dataset without conforming
+    them, so `info.json` declared `observation.image` as 96x96 at 10fps while
+    episodes 3 and 4 were stored at 1280x720 and 24fps. Frame *counts* matched
+    the declared lengths, so every metadata-only check passed and the defect
+    reached training.
+    """
+    out = _converted(tmp_path, episodes=2, frames=10, fps=10)
+    _with_camera(
+        out, episodes=2, frames=10, fps=10,
+        override={1: (320, 240, 10, 10)},   # declared 96x96, stored 320x240
+    )
+
+    with pytest.raises(GR00TAdapterError, match="but metadata declares"):
+        audit_dataset(out)
+
+
+def test_audit_rejects_video_frame_rate_that_contradicts_metadata(tmp_path: Path) -> None:
+    """The stored fps drives the action timebase, so a mismatch skews it."""
+    out = _converted(tmp_path, episodes=2, frames=10, fps=10)
+    _with_camera(
+        out, episodes=2, frames=10, fps=10,
+        override={1: (96, 96, 24, 10)},     # declared 10fps, stored 24fps
+    )
+
+    with pytest.raises(GR00TAdapterError, match="action timebase"):
+        audit_dataset(out)
+
+
+def test_audit_rejects_video_missing_most_of_its_episode(tmp_path: Path) -> None:
+    """61 frames for a 161-frame episode is what Cosmos actually produced."""
+    out = _converted(tmp_path, episodes=2, frames=20, fps=10)
+    _with_camera(
+        out, episodes=2, frames=20, fps=10,
+        override={1: (96, 96, 10, 6)},      # episode declares 20 frames
+    )
+
+    with pytest.raises(GR00TAdapterError, match="frames that do not exist"):
+        audit_dataset(out)
