@@ -167,7 +167,55 @@ the template: which stages carry `--split-role final`, and that
 
 ## Status
 
-The spec validates and plans and its stages have unit and guardrail coverage.
-**No end-to-end live run has been performed**, so the guide quotes no measured
-numbers and the defaults are a starting recipe rather than a tuned one. Do not
-add measured claims to the guide without citing a run id.
+**Validated end to end.** All 17 stages succeeded on run
+`encord-groot-finetune-20260908T222914Z` (L40S, `max_steps=1000`,
+`save_steps=200`, `lerobot/svla_so100_pickplace`). Final cohort: action MSE
+1734.28 -> 39.88, MAE 31.531 -> 4.471, skill score -2.902 -> +0.910,
+`gate_passed: true` with the improvement 12.7x the repeat-noise band and no
+per-dimension regressions. About 90 minutes and ~91 GB of artifacts.
+
+Do not add further measured claims without citing a run id.
+
+## Live-run Traps
+
+Five defects and three operational traps were found by that run; all are fixed
+or documented, and all of them rendered, validated and planned cleanly first.
+
+- **Only `prepare-dataset` may read `config.source_data_uri`.** `modality.json`
+  is a GR00T artifact conversion creates, so later stages consume
+  `prepared_data_uri`. The shared `prepare_split` catalog entry defaults to the
+  raw input; this spec overrides it per state.
+- **LeRobot v3 stores task text as the pandas index** of `meta/tasks.parquet`
+  (`__index_level_0__`). Reading only `task` yielded `""`, which would have
+  trained a language-conditioned policy on an empty instruction while loss fell
+  normally. The audit now fails closed on a declared language annotation with no
+  task text.
+- **Capability images ship a one-group `npa workbench`.** The renderer pins
+  `NPA_LIGHT_WORKBENCH_TOOL` from `tool_image_key`; without it the CLI falls back
+  to the cosmos2 surface and `npa workbench groot|encord` does not exist. Only
+  `workbench.groot.finetune` shells out to `npa`; every other GR00T toolRef uses
+  `python3 -m npa.workflows...` and is unaffected, which is what hid it.
+- **Every real-model stage needs `transformers==4.57.3`.** The requirement is
+  keyed on `workbench.groot`, which does not reach
+  `workflow.groot.validate_checkpoints`; it failed *after* training, on
+  `is_offline_mode` from `huggingface_hub`.
+- **`compare_learning` sources media by the evaluations' `split_role`.**
+  Cohorts re-index episodes from 0, so validation episode 0 (365 frames) is not
+  final episode 0 (382). Hardcoding heldout media paired final actions with
+  validation video; equal-length cohorts would have rendered a silently wrong
+  video instead of failing.
+- **`--resume-run` takes the ORIGINAL run id.** The wave-scoped id in
+  `operator_remedy` becomes a new run and restarts from stage 1. A wave that
+  failed before SkyPilot assigned a `job_id` records
+  `resume_block_terminal_or_legacy_absence` and is unrecoverable -- start fresh.
+- **`--image-override TOOL_REF=IMAGE`, not `--registry` or `--image`.**
+  `--registry` appends its own tag; `--image` pins every stage and breaks the
+  Encord stages.
+- **Kubeconfig exec plugins and cached tokens.** `KUBECONFIG` is ignored
+  (SkyPilot reads `~/.kube/config` directly), the API server caches the
+  credential it started with, and the controller cannot mint a replacement. See
+  the guide's credential table.
+
+W&B logs to the trainer's own project (`finetune-gr00t-n1d7`), not
+`--wandb-project`; read `checkpoints/candidate/wandb_config.json`. Not yet
+fixed.
