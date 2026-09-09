@@ -216,6 +216,15 @@ or documented, and all of them rendered, validated and planned cleanly first.
   credential it started with, and the controller cannot mint a replacement. See
   the guide's credential table.
 
-W&B logs to the trainer's own project (`finetune-gr00t-n1d7`), not
-`--wandb-project`; read `checkpoints/candidate/wandb_config.json`. Not yet
-fixed.
+- **W&B project is now pinned in the rank wrapper.** The vendor trainer calls
+  `wandb.init(project=...)` with its own name, and an explicit argument beats
+  `WANDB_PROJECT`, so run 20260908T222914Z asked for `npa-groot` and logged to
+  `finetune-gr00t-n1d7`. `render_training_rank_wrapper` now wraps `wandb.init`
+  in the rank process to force `NPA_TRAINING_WANDB_PROJECT` (and the run name
+  when set), guarded by `NPA_TRAINING_WANDB_ENABLED` and fail-soft, because
+  tracking must never kill a multi-hour job.
+- **Prefer a service-account token over the exec-plugin kubeconfig.**
+  `skypilot-service-account` already has the needed RBAC;
+  `kubectl create token skypilot-service-account -n default --duration=2160h`
+  removes the per-call subprocess entirely. Keep the kubeconfig user entry name
+  unchanged (ownership derives from it) and restart the API server afterwards.

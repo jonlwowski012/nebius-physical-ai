@@ -508,11 +508,26 @@ cluster ownership from that name, so renaming it orphans the existing jobs
 controller with
 `ClusterOwnerIdentityMismatchError`.
 
-The durable fix is a service-account token for the cluster rather than a
-kubeconfig wrapping a developer-machine binary path. Until then, a long run will
-stall whenever the token ages out, and the controller pod cannot mint a
-replacement because the binary its kubeconfig names does not exist inside the
-pod.
+**The durable fix: use a service-account token.** SkyPilot's own setup already
+created `skypilot-service-account` in `default`, holding the pods, `pods/exec`,
+services, nodes and RBAC permissions the launcher needs. Mint a bearer token for
+it and put that in the kubeconfig -- no subprocess per call, no session to
+expire, and a lifetime you choose:
+
+```bash
+kubectl --context <ctx> create token skypilot-service-account \
+  -n default --duration=2160h        # 90 days; this cluster allows up to 8760h
+```
+
+Write it into the `user` entry for your context, **keeping the entry's name
+unchanged**, then `sky api stop && sky api start` so the server stops serving
+the credential it booted with. Verified on this cluster: `kubectl` and
+`sky jobs queue` both work and the ownership check passes, because ownership is
+derived from the kubeconfig user name and not from the token's subject.
+
+Rotate before expiry with the same command. Prefer 90 days over a year: a run
+takes hours, so a shorter lifetime costs nothing and a long-lived token sitting
+in a plaintext kubeconfig is a real credential.
 
 ## Curating by hand
 
