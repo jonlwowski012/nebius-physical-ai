@@ -3067,11 +3067,31 @@ def compare_learning(
     cameras = list(split["source"].get("cameras") or [])
     if not cameras:
         raise GrootVisualizationError("split manifest lacks derived camera metadata")
+    # The media has to come from the cohort the evaluations actually scored.
+    # Every cohort re-indexes episodes from 0, so "episode 0" is a different
+    # recording in each: in live run 20260908T222914Z the validation episode 0
+    # had 365 frames and the final episode 0 had 382. This stage used to read
+    # heldout media unconditionally, which was right while it compared heldout
+    # evaluations; pointing it at final-cohort evaluations then paired final
+    # actions with validation video (job 285/286 failed the alignment check).
+    # Equal-length episodes would have produced a silently wrong video instead.
+    evaluated_role = str(baseline.get("split_role") or "").strip() or "heldout"
+    posttrain_role = str(posttrain.get("split_role") or "").strip() or "heldout"
+    if evaluated_role != posttrain_role:
+        raise GrootVisualizationError(
+            "baseline and post-training evaluations scored different cohorts "
+            f"({evaluated_role!r} vs {posttrain_role!r}); a comparison across "
+            "cohorts is not a comparison"
+        )
+    if evaluated_role not in split:
+        raise GrootVisualizationError(
+            f"split manifest has no {evaluated_role!r} cohort to source media from"
+        )
     inventory = _heldout_video_inventory(
         client,
-        str(split["heldout"]["uri"]),
+        str(split[evaluated_role]["uri"]),
         cameras=cameras,
-        episode_count=int(split["heldout"]["episodes"]),
+        episode_count=int(split[evaluated_role]["episodes"]),
     )
     timebase = _episode_timebase(
         baseline["sample_alignment"],
