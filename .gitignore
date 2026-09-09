@@ -109,3 +109,14 @@ semgrep-*.json
 # Its cleanup trap removes these; a hard kill cannot, so keep them uncommittable.
 docs/.cli-stage-*/
 docs/.cli-prev-*/
+
+# Workflow-run artifacts the `publish` stage downloads beside the repo. These
+# are outputs of a run, not source: a bare `git add -A` swept an 18 MB
+# offline-comparison.mp4 and a 16k-line learning-report.json into a commit.
+# The durable copies live in S3 under the run prefix.
+/reports/
+/learning-report.json
+# Root-level only: `npa/tests/.../fixtures/sim2real_sample.mcap` is a tracked
+# fixture, so a bare `*.mcap` would shadow it.
+/*.rrd
+/*.mcap
