@@ -216,13 +216,16 @@ or documented, and all of them rendered, validated and planned cleanly first.
   credential it started with, and the controller cannot mint a replacement. See
   the guide's credential table.
 
-- **W&B project is now pinned in the rank wrapper.** The vendor trainer calls
-  `wandb.init(project=...)` with its own name, and an explicit argument beats
-  `WANDB_PROJECT`, so run 20260908T222914Z asked for `npa-groot` and logged to
-  `finetune-gr00t-n1d7`. `render_training_rank_wrapper` now wraps `wandb.init`
-  in the rank process to force `NPA_TRAINING_WANDB_PROJECT` (and the run name
-  when set), guarded by `NPA_TRAINING_WANDB_ENABLED` and fail-soft, because
-  tracking must never kill a multi-hour job.
+- **W&B is switched on at the launcher, never through the environment.**
+  `FinetuneConfig.use_wandb` defaults to `False` and `wandb_project` defaults to
+  `finetune-gr00t-n1d7`; `launch_finetune.py` copies both onto
+  `config.training`. Exporting `WANDB_MODE` / `WANDB_PROJECT` / `WANDB_API_KEY`
+  never reaches that switch, so every run through 20260908T222914Z logged
+  **nothing** -- its `training.log` has no `wandb.init`, no login line, no run
+  URL. The vendor nevertheless writes a `wandb_config.json` naming its own
+  default project, which looks like a real run and is not one; do not read it as
+  evidence. The finetune command now passes `--use-wandb` and
+  `--wandb-project`, and passes neither when tracking is disabled.
 - **A user-account token's expiry is pinned to the Nebius CLI session.**
   Minting at 01:12 and again at 12:56 both returned `13:12`, so re-minting
   cannot extend it and a multi-hour run can outlive the session. The symptoms

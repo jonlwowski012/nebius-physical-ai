@@ -1629,6 +1629,16 @@ echo NPA_GROOT_NCCL_TRANSPORT socket
         train_args += f" \\\n  --save-total-limit {save_total_limit}"
     if save_only_model:
         train_args += " \\\n  --save-only-model"
+    # The pinned launcher owns W&B: `FinetuneConfig.use_wandb` defaults to False
+    # and `wandb_project` defaults to "finetune-gr00t-n1d7", and
+    # launch_finetune.py copies both onto `config.training`. Exporting
+    # WANDB_* environment variables does not reach that switch, so runs logged
+    # nothing at all and the vendor still wrote a wandb_config.json naming its
+    # own default project -- which reads like a real run and is not one.
+    if training.wandb.enabled:
+        train_args += " \\\n  --use-wandb"
+        if training.wandb.project:
+            train_args += f" \\\n  --wandb-project {shlex.quote(training.wandb.project)}"
     override_args = _render_tyro_overrides(training.overrides)
     if override_args:
         train_args += f" \\\n  {override_args}"

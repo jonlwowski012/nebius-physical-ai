@@ -185,31 +185,6 @@ rank = int(os.environ.get("RANK", "0"))
 local_rank = int(os.environ.get("LOCAL_RANK", "0"))
 world_size = int(os.environ.get("WORLD_SIZE", "1"))
 
-# The vendor trainer calls wandb.init(project=...) with its own project name,
-# and an explicit argument beats WANDB_PROJECT, so a configured project was
-# silently ignored: live run 20260908T222914Z asked for "npa-groot" and landed
-# in "finetune-gr00t-n1d7". Force the configured project here, in the rank
-# process, before the vendor script runs. Fail soft: a tracking preference must
-# never be the reason a multi-hour training job dies.
-_wandb_project = os.environ.get("NPA_TRAINING_WANDB_PROJECT", "").strip()
-if _wandb_project and os.environ.get("NPA_TRAINING_WANDB_ENABLED", "") == "1":
-    try:
-        import wandb as _wandb
-
-        _npa_real_init = _wandb.init
-
-        def _npa_wandb_init(*args, **kwargs):
-            kwargs["project"] = _wandb_project
-            _run_name = os.environ.get("NPA_TRAINING_WANDB_RUN_NAME", "").strip()
-            if _run_name:
-                kwargs["name"] = _run_name
-            return _npa_real_init(*args, **kwargs)
-
-        _wandb.init = _npa_wandb_init
-        print("NPA_GROOT_WANDB_PROJECT_PINNED", _wandb_project)
-    except Exception as _exc:  # noqa: BLE001 - tracking is never fatal
-        print("NPA_GROOT_WANDB_PROJECT_PIN_FAILED", type(_exc).__name__, _exc)
-
 try:
     runpy.run_path("gr00t/experiment/launch_finetune.py", run_name="__main__")
 except SystemExit as exc:

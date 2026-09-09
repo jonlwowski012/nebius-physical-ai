@@ -263,12 +263,27 @@ trainer_state.log_history.explicit_global_step`, so the curve is the trainer's
 own steps rather than an interpolation. Training 1000 steps at global batch 16
 on one L40S took about 20 minutes.
 
-**W&B lands in the trainer's project, not the spec's.** `--wandb-project` sets
-`WANDB_PROJECT`, but the GR00T trainer calls `wandb.init(project=...)` with its
-own name and wins. The reference run logged to project
-`finetune-gr00t-n1d7`, and `checkpoints/candidate/wandb_config.json` records the
-project and run id it actually used. Read that file rather than assuming your
-configured project.
+**W&B is a launcher flag, not an environment variable.** The pinned GR00T
+launcher owns the switch:
+
+```
+finetune_config.py   use_wandb: bool = False
+                     wandb_project: str = "finetune-gr00t-n1d7"
+launch_finetune.py   config.training.use_wandb    = ft_config.use_wandb
+                     config.training.wandb_project = ft_config.wandb_project
+```
+
+Exporting `WANDB_MODE` / `WANDB_PROJECT` / `WANDB_API_KEY` never reaches it, so
+the reference run 20260908T222914Z logged nothing at all: its 80 KB
+`training.log` contains no `wandb.init`, no login line and no run URL. Confusingly
+the vendor still writes `checkpoints/candidate/wandb_project.json`-style config
+naming its own default project, which reads like a real run and is not one --
+do not go looking there for a run that does not exist.
+
+The spec passes `--wandb-mode online`, and the finetune command turns that into
+the launcher's `--use-wandb` plus `--wandb-project`. If a dashboard is empty,
+check `training.log` for a `wandb` login line before anything else: no line
+means tracking never started, which is a wiring problem rather than a sync one.
 
 Falling loss is not success. It is the precondition for asking the next
 question.

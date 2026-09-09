@@ -1,128 +1,80 @@
-"""The rank wrapper must force the configured W&B project.
+"""W&B has to be switched on at the vendor launcher, not through the environment.
 
-The vendor GR00T trainer calls `wandb.init(project=...)` with its own name, and
-an explicit argument beats `WANDB_PROJECT`. Live run 20260908T222914Z therefore
-asked for project "npa-groot" and logged to "finetune-gr00t-n1d7", so anyone
-looking in the configured project found nothing at all.
+The pinned GR00T launcher owns the decision:
+
+    finetune_config.py:  use_wandb: bool = False
+                         wandb_project: str = "finetune-gr00t-n1d7"
+    launch_finetune.py:  config.training.use_wandb = ft_config.use_wandb
+                         config.training.wandb_project = ft_config.wandb_project
+
+Exporting `WANDB_MODE` / `WANDB_PROJECT` / `WANDB_API_KEY` never reaches that
+switch, so every run through 20260908T222914Z logged nothing: its 80 KB
+`training.log` contains no `wandb.init`, no login line and no run URL. The
+vendor still wrote a `wandb_config.json` naming its own default project, which
+looks like evidence of a run and is not one.
 """
 
 from __future__ import annotations
 
-import subprocess
-import sys
-import textwrap
-from pathlib import Path
+from npa.cli.groot import _build_finetune_command
+from npa.workbench.training_config import build_training_config
 
-from npa.cli.groot.training_evidence import render_training_rank_wrapper
+_COMMON = dict(
+    input_path="s3://bucket/train/",
+    output_path="s3://bucket/out/",
+    base_model="nvidia/GR00T-N1.7-3B",
+    robot_embodiment="NEW_EMBODIMENT",
+    num_gpus=1,
+    config="cfg",
+    endpoint_url="https://endpoint",
+)
 
 
-def _run_wrapper(tmp_path: Path, env: dict[str, str]) -> tuple[str, dict]:
-    """Execute the rendered wrapper with a stub wandb and vendor trainer."""
-    import json
-    import os
+def _trainer_flags(command: str) -> list[str]:
+    """Return only the launcher argument lines, not the env exports."""
+    return [
+        line.strip()
+        for line in command.splitlines()
+        if line.strip().startswith("--")
+    ]
 
-    # A stub `wandb` that records the kwargs the vendor call ends up with.
-    (tmp_path / "wandb.py").write_text(
-        textwrap.dedent(
-            """
-            import json, os
-            def init(*args, **kwargs):
-                path = os.environ["NPA_TEST_CAPTURE"]
-                with open(path, "w", encoding="utf-8") as fh:
-                    json.dump(kwargs, fh)
-                return object()
-            """
-        ),
-        encoding="utf-8",
+
+def test_enabled_wandb_switches_on_the_launcher_flag() -> None:
+    config = build_training_config(
+        wandb_enabled=True, wandb_project="npa-groot", wandb_mode="online"
     )
-    # A stub vendor trainer that calls wandb.init the way upstream does.
-    vendor = tmp_path / "gr00t" / "experiment"
-    vendor.mkdir(parents=True)
-    (vendor / "launch_finetune.py").write_text(
-        'import wandb\nwandb.init(project="finetune-gr00t-n1d7", name="vendor")\n',
-        encoding="utf-8",
+    flags = _trainer_flags(_build_finetune_command(training_config=config, **_COMMON))
+
+    assert any(f.startswith("--use-wandb") for f in flags), (
+        "no --use-wandb passed; FinetuneConfig.use_wandb defaults to False, so "
+        "the trainer never calls wandb.init and the run logs nothing"
     )
-
-    capture = tmp_path / "captured.json"
-    script = tmp_path / "wrapper.py"
-    script.write_text(render_training_rank_wrapper(str(tmp_path)), encoding="utf-8")
-
-    full_env = {
-        **os.environ,
-        "NPA_TEST_CAPTURE": str(capture),
-        "PYTHONPATH": str(tmp_path),
-        **env,
-    }
-    proc = subprocess.run(
-        [sys.executable, str(script)],
-        cwd=tmp_path,
-        env=full_env,
-        capture_output=True,
-        text=True,
-    )
-    assert proc.returncode == 0, proc.stderr
-    recorded = json.loads(capture.read_text()) if capture.is_file() else {}
-    return proc.stdout, recorded
-
-
-def test_configured_project_overrides_the_vendor_default(tmp_path: Path) -> None:
-    out, kwargs = _run_wrapper(
-        tmp_path,
-        {
-            "NPA_TRAINING_WANDB_ENABLED": "1",
-            "NPA_TRAINING_WANDB_PROJECT": "npa-groot",
-        },
-    )
-    assert "NPA_GROOT_WANDB_PROJECT_PINNED npa-groot" in out
-    assert kwargs["project"] == "npa-groot", (
-        f"vendor default survived: {kwargs!r}; runs would land in the wrong project"
+    assert any("--wandb-project npa-groot" in f for f in flags), (
+        f"configured project not passed to the launcher: {flags!r}; the run "
+        "would land in the vendor default 'finetune-gr00t-n1d7'"
     )
 
 
-def test_configured_run_name_is_applied_when_set(tmp_path: Path) -> None:
-    _, kwargs = _run_wrapper(
-        tmp_path,
-        {
-            "NPA_TRAINING_WANDB_ENABLED": "1",
-            "NPA_TRAINING_WANDB_PROJECT": "npa-groot",
-            "NPA_TRAINING_WANDB_RUN_NAME": "run-42",
-        },
+def test_naming_a_mode_is_enough_to_switch_it_on() -> None:
+    """`--wandb-mode online` alone must enable it; there is no bare --wandb."""
+    config = build_training_config(wandb_enabled=False, wandb_mode="online")
+    # build_training_config records mode; the CLI derives `wandb_on` from it.
+    assert config.wandb.mode == "online"
+
+
+def test_disabled_wandb_passes_no_launcher_flags() -> None:
+    config = build_training_config(wandb_enabled=False, wandb_mode="disabled")
+    flags = _trainer_flags(_build_finetune_command(training_config=config, **_COMMON))
+
+    assert not any("wandb" in f for f in flags), (
+        f"a disabled run must not switch the launcher's W&B on: {flags!r}"
     )
-    assert kwargs["name"] == "run-42"
 
 
-def test_vendor_default_is_left_alone_when_tracking_is_off(tmp_path: Path) -> None:
-    """No pin without the enabled flag: this must not alter a disabled run."""
-    out, kwargs = _run_wrapper(
-        tmp_path, {"NPA_TRAINING_WANDB_PROJECT": "npa-groot"}
-    )
-    assert "PINNED" not in out
-    assert kwargs["project"] == "finetune-gr00t-n1d7"
+def test_enabled_without_a_project_still_switches_on() -> None:
+    """Omitting the project is allowed; the vendor default then applies."""
+    config = build_training_config(wandb_enabled=True, wandb_mode="online")
+    flags = _trainer_flags(_build_finetune_command(training_config=config, **_COMMON))
 
-
-def test_a_broken_wandb_never_fails_training(tmp_path: Path) -> None:
-    """Tracking is never worth killing a multi-hour job for."""
-    (tmp_path / "wandb.py").write_text("raise RuntimeError('boom')\n", encoding="utf-8")
-    vendor = tmp_path / "gr00t" / "experiment"
-    vendor.mkdir(parents=True)
-    (vendor / "launch_finetune.py").write_text("print('trained')\n", encoding="utf-8")
-
-    import os
-
-    script = tmp_path / "wrapper.py"
-    script.write_text(render_training_rank_wrapper(str(tmp_path)), encoding="utf-8")
-    proc = subprocess.run(
-        [sys.executable, str(script)],
-        cwd=tmp_path,
-        env={
-            **os.environ,
-            "PYTHONPATH": str(tmp_path),
-            "NPA_TRAINING_WANDB_ENABLED": "1",
-            "NPA_TRAINING_WANDB_PROJECT": "npa-groot",
-        },
-        capture_output=True,
-        text=True,
-    )
-    assert proc.returncode == 0, proc.stderr
-    assert "NPA_GROOT_WANDB_PROJECT_PIN_FAILED" in proc.stdout
-    assert "trained" in proc.stdout
+    assert any(f.startswith("--use-wandb") for f in flags)
+    assert not any("--wandb-project" in f for f in flags)
