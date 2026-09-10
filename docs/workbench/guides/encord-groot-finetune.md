@@ -150,10 +150,38 @@ move bulk data, not because they are stuck.
 
 ## What the run does
 
-```text
-prepare-dataset → push → curate → pull → verify → prepare-split → preflight
-→ baseline-validation → baseline-final → train → validate-checkpoints
-→ resolve-checkpoint → final-eval → compare → emit-rrd → emit-mcap → publish
+Three views of the same 17 states, each one a level deeper than the last. If
+you only read one, read the second: it is where the leakage-avoidance
+discipline that makes the headline number trustworthy actually becomes
+visible.
+
+### The shape, in one breath
+
+```mermaid
+flowchart LR
+  A[Your LeRobot dataset] --> B[Convert + audit]
+  B --> C[Curate in Encord]
+  C --> D[Fine-tune GR00T]
+  D --> E[Select the best checkpoint]
+  E --> F[Evidence: report, video, viewers]
+```
+
+Five boxes, and the whole guide is an explanation of what happens inside each
+one.
+
+### Phase by phase
+
+```mermaid
+flowchart TB
+  P["Prepare<br/>convert + audit"] --> Q["Curate in Encord<br/>push → curate → pull → verify"]
+  Q --> R["Split into 3 cohorts<br/>+ preflight gate"]
+  R -- validation --> BV["Baseline eval<br/>(ceiling for selection)"]
+  R -- final --> BF["Baseline eval<br/>(headline, read once)"]
+  BV --> TR[Train GR00T]
+  BF --> TR
+  TR --> SEL["Select checkpoint<br/>score every save on validation"]
+  SEL -- "final, once" --> CMP[Compare selected vs. baseline]
+  CMP --> PUB["Publish<br/>report + Rerun + MCAP"]
 ```
 
 **Conversion runs first, before Encord.** Encord curates media *items*, and
@@ -176,7 +204,88 @@ cannot also be the evidence the choice was good, so the headline comparison
 happens on the final cohort instead. That is why the run evaluates the base
 model twice: once on validation, to give selection a ceiling to beat, and once
 on final, as one half of the comparison. Both reuse the same initialized
-weights, so the second costs an evaluation rather than a model build.
+weights, so the second costs an evaluation rather than a model build. The
+diagram's two separate "Baseline eval" boxes are that decision made visible:
+they are the same tool run twice, deliberately kept apart.
+
+### Every stage, for engineers
+
+The node numbers match the job name suffix you see in `sky jobs logs
+<run-id>-NN-<state>` and in every `reports/*.json`. Stadium-shaped stages
+(`baseline-validation`, `baseline-final`, `train`, `validate-checkpoints`,
+`final-eval`) request a GPU and run real `Gr00tPolicy` inference or training;
+`prepare-dataset` runs in the same GR00T image, for `ffmpeg` and modality
+generation, but requests CPU only. The cylinders are S3 prefixes under the run
+root, so a stage's dotted edge is the artifact contract you can verify with
+`aws s3 ls`.
+
+```mermaid
+flowchart TB
+  subgraph P["1 Prepare"]
+    n1(["01 · prepare-dataset<br/>GR00T image, CPU"])
+  end
+
+  subgraph C["2 Curate in Encord"]
+    n2["02 · push"]
+    n3["03 · curate"]
+    n4["04 · pull"]
+    n5["05 · verify"]
+    n2 --> n3 --> n4 --> n5
+  end
+
+  subgraph S["3 Split & gate"]
+    n6["06 · prepare-split"]
+    n7["07 · preflight"]
+    n6 --> n7
+  end
+
+  cohorts[("S3: data/train<br/>data/validation<br/>data/final")]
+  n6 -.-> cohorts
+
+  subgraph B["4 Baselines (GPU)"]
+    n8(["08 · baseline-validation"])
+    n9(["09 · baseline-final"])
+  end
+
+  cohorts -. validation .-> n8
+  cohorts -. final .-> n9
+
+  subgraph T["5 Train (GPU)"]
+    n10(["10 · train"])
+  end
+  n8 --> n10
+  n9 --> n10
+
+  ckpts[("S3: checkpoints/candidate/*")]
+  n10 -.-> ckpts
+
+  subgraph V["6 Select checkpoint"]
+    n11(["11 · validate-checkpoints (GPU)"])
+    n12["12 · resolve-checkpoint"]
+    n11 --> n12
+  end
+  cohorts -. "validation, x5" .-> n11
+  ckpts -.-> n11
+  ckpts -.-> n12
+
+  subgraph F["7 Final comparison"]
+    n13(["13 · final-eval (GPU)"])
+    n14["14 · compare"]
+    n13 --> n14
+  end
+  cohorts -. "final, once" .-> n13
+  n12 --> n13
+
+  subgraph Pub["8 Publish"]
+    n15["15 · emit-rrd"]
+    n16["16 · emit-mcap"]
+    n17["17 · publish"]
+    n14 --> n15 --> n16 --> n17
+  end
+
+  n7 --> n8
+  n7 --> n9
+```
 
 ## Is my data usable?
 
