@@ -709,83 +709,16 @@ with different curation is correctly a different experiment.
 
 ## Augmenting your data with Cosmos
 
-This guide's own pipeline does not do this -- augmentation was deliberately
-left out to keep the core loop small. It exists as a separate, tested
-extension on branch `claude/nebius-encord-cosmos-pipeline-42e1de`, spec
-`npa/workflows/workbench/npa-workflows/encord-cosmos3-groot-finetune.yaml`, for
-when you want more visual variety than more robot time can buy you.
-
-**What it buys you.** Cosmos3 video2video generates physically-plausible
-visual variants of your curated episodes -- different lighting, background,
-texture -- while preserving the robot motion and camera geometry the actions
-were recorded against. The synthetic episodes are trimmed and folded into the
-training set alongside your real ones, so the fine-tune sees more visual
-diversity per unit of teleop time.
-
-**The stages**, in the same numbered style as [every stage, for
-engineers](#every-stage-for-engineers) above:
-
-```text
-01 seed-source*  → 02 push-original → 03 curate → 04 pull-curated
-→ 05 stage-input → 06/07 augment (Cosmos3, fan-out) → 08 push-augmented
-→ 09 materialize-training-data → 10 access-capacity-preflight
-→ 11 prepare-split → 12 baseline-eval → 13 finetune
-→ 14 resolve-trained-checkpoint → 15 posttrain-eval → 16 compare-learning
-→ 17 judge-comparison-video
-```
-
-\* `seed-source` populates `lerobot_dataset_uri` from a public dataset when you
-do not already have one there -- that is how this was validated, against
-`lerobot/pusht`. Point `lerobot_dataset_uri` at your own prepared data instead
-and the rest of the pipeline is unchanged.
-
-**The knobs that matter:**
-
-| Config | What it controls |
-| --- | --- |
-| `cosmos3_num_frames` | Clip length. Defaults to 61, not the upstream 189: at 189 frames, video2video OOMs in VAE decode on an L40S. |
-| `cosmos3_steps`, `cosmos3_guidance` | Denoising steps and CFG scale. 24 / 5.0 is the validated starting point. |
-| `augmentation_count` | Synthetic variants generated per source episode. |
-| `prompt` | What "physically plausible variant" means for your scene -- keep it about lighting/texture/background, not motion. |
-
-**Two things this session's live testing found and fixed, worth knowing before
-you rely on it:**
-
-- **A LeRobot dataset declares one geometry per camera, and `materialize` used
-  to copy Cosmos output in byte-for-byte.** A live run generated video at its
-  native 1280x720/24fps into a dataset that declared 96x96/10fps -- a 13x
-  resolution mismatch and, worse, an action timebase wrong by 2.4x for the
-  synthetic episodes, while every metadata-only check passed. `materialize` now
-  probes each variant and conforms it to the declared geometry before writing
-  it (`ca90fa15` on the Cosmos branch). The main pipeline's own
-  [dataset audit](#is-my-data-usable) gained the matching check
-  (`0c3c18d7`), so a similar defect from any source would now fail closed
-  there too.
-- **The shipped `gpu` resource profile does not fit this cluster.** It asks for
-  16 CPU / 80Gi; the L40S and H100 nodes here allocate about 15900m / 87Gi
-  each. Apply the same
-  [node-fit guardrail](../../../npa/tests/guardrails/test_encord_groot_finetune_fits_a_node.py)
-  logic this guide's own spec uses before submitting, or the GPU stages sit
-  `ResourcesUnavailableError` forever.
-
-**Two more things to expect:**
-
-- `workbench.cosmos3.generate` and `workbench.vlm_eval.loop` resolve to image
-  tags that are not in this cluster's private registry but are published on
-  GHCR. Add `--image-override workbench.cosmos3=ghcr.io/nebius/nebius-physical-ai/npa-cosmos3:<tag>`
-  and `--image-override workbench.vlm_eval=ghcr.io/nebius/nebius-physical-ai/npa-cosmos:<tag>`
-  alongside the usual `workbench.groot=...` override.
-- `judge-comparison-video` scores the comparison video with a Token
-  Factory-hosted reasoner. That model has been retired from the public
-  serverless catalog before; run `npa workbench token-factory models` before
-  depending on this stage.
-
-**Status.** `seed-source` through `baseline-eval` -- the Encord roundtrip,
-both Cosmos augmentations, and the merge into a training set -- have all
-completed live on real infrastructure. `finetune` through
-`judge-comparison-video` are still being validated end to end; treat this
-extension as beta, and do not read anything here as a measured result the way
-the numbers earlier in this guide are.
+This pipeline does not do this -- augmentation was deliberately left out to
+keep the core loop small and fully audited. For a complete, standalone guide
+to generating Cosmos3 video2video variants of your episodes and folding them
+into the training set before fine-tuning, see
+[Fine-tune GR00T on Cosmos-augmented robot demonstrations](encord-cosmos3-groot-finetune.md).
+It reuses this guide's `finetune` / `posttrain-eval` / `compare-learning`
+stages and their report schema, at a smaller, faster, and currently
+less-audited scale than the pipeline documented here -- see that guide's own
+"Is my data usable?" section for exactly which safety nets it does and does
+not have yet.
 
 ## Adapting to your robot
 
@@ -824,6 +757,10 @@ s3://<bucket>/encord-groot-finetune/<run-id>/
 
 - [GR00T N1.7 operational training pipeline](../cookbooks/groot-1-7-training.md)
   — the shorter plumbing validation this guide's stages grew out of.
+- [Fine-tune GR00T on Cosmos-augmented robot demonstrations](encord-cosmos3-groot-finetune.md)
+  — adds Cosmos3 video2video augmentation ahead of this guide's fine-tune
+  stages, at a smaller scale and without this guide's dataset audit or
+  roundtrip verify (yet).
 - [Encord curation](../encord.md) — credentials, integrations, and the curation
   verbs on their own.
 - [Physical AI Data Factory](physical-ai-data-factory.md) — augmentation and
