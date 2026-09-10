@@ -1843,12 +1843,13 @@ def build_skypilot_task_doc(
     """Build one SkyPilot task document from a planned step."""
 
     scheduler_task = build_scheduler_task(spec, step, run_id=run_id)
+    tool_ref = str(scheduler_task.get("tool_ref") or "")
     resources = normalize_resources(
         scheduler_task.get("resources") or {},
         accelerator_overrides=options.gpu_accelerator_overrides,
     )
     image = resolve_task_image(
-        str(scheduler_task.get("tool_ref") or ""),
+        tool_ref,
         scheduler_task.get("resources") or {},
         options=options,
     )
@@ -1928,7 +1929,7 @@ def build_skypilot_task_doc(
         # the toolRefs whose argv shells out to `npa` are affected; the ones
         # that invoke `python3 -m npa.workflows...` bypass the CLI entirely,
         # which is why the eval stages passed while training failed.
-        light_tool = tool_image_key(str(scheduler_task.get("tool_ref") or ""))
+        light_tool = tool_image_key(tool_ref)
         if light_tool:
             envs["NPA_LIGHT_WORKBENCH_TOOL"] = light_tool
     if expected_source_sha:
@@ -1941,7 +1942,7 @@ def build_skypilot_task_doc(
         envs["NPA_SIM2REAL_SOURCE_SHA"] = expected_source_sha
     envs.update(
         isaac_eula_envs(
-            str(scheduler_task.get("tool_ref") or ""),
+            tool_ref,
             resources=scheduler_task.get("resources") or {},
             config=spec.config,
             resolved_image=image,

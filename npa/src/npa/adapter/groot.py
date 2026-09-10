@@ -705,9 +705,9 @@ def _audit_declared_geometry(info: dict[str, Any], camera_key: str) -> tuple[int
 
 
 def _audit_resolution(info: dict[str, Any], camera_key: str) -> str:
-    shape = ((info.get("features") or {}).get(camera_key) or {}).get("shape") or []
-    if len(shape) >= 2:
-        return f"{int(shape[1])}x{int(shape[0])}"
+    width, height = _audit_declared_geometry(info, camera_key)
+    if width and height:
+        return f"{width}x{height}"
     return "unknown"
 
 

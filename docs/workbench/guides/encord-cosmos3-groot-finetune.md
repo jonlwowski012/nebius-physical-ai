@@ -128,18 +128,9 @@ publicly on GHCR, which is where the two `--image-override` lines above point.
 name), and a bare `--image` would put every stage, Encord and Cosmos alike, on
 whichever single image you name.
 
-Verify the routing before you submit:
-
-```bash
-npa workbench workflow submit <spec> --run-id probe --plan-only --runtime \
-  --output-format json <your flags> | python3 -c '
-import sys, json, yaml
-d = json.load(sys.stdin)
-for doc in yaml.safe_load_all(d["skypilot_yaml"]):
-    for t in (doc.get("tasks") or [doc]) if isinstance(doc, dict) else []:
-        img = (t.get("resources") or {}).get("image_id", "")
-        print(f"{t.get(\"name\",\"?\"):28} {img.split(\"/\")[-1] or \"default\"}")'
-```
+Verify the routing before you submit, the same way as the plain guide's
+[routing check](encord-groot-finetune.md#submit) -- the `plan-only` probe
+script there works unchanged against this spec, just swap in the flags above.
 
 Watch it:
 
