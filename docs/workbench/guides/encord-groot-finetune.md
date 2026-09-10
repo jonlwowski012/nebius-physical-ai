@@ -7,11 +7,13 @@ tells you whether it helped. One YAML, one submit.
 It is written for a robotics engineer who knows their robot and their data but
 has not trained a vision-language-action policy before.
 
-> **Validation status: not yet run live.** The spec validates and plans, and its
-> stages have unit and guardrail coverage, but no end-to-end run has been
-> performed against it. This guide therefore contains **no measured numbers**.
-> Where you would expect a timing or a result, you will find what to look at
-> instead. Treat the defaults as a starting recipe, not a tuned one.
+> **Validation status: run end to end.** All 17 stages succeeded on run
+> `encord-groot-finetune-20260908T222914Z` (L40S, 1 GPU, `max_steps=1000`,
+> `save_steps=200`) against `lerobot/svla_so100_pickplace`. Every number below
+> is measured from that run's artifacts. The defaults are a working recipe, but
+> read [Scale up](#scale-up) before treating them as tuned: 1000 steps is 1.117
+> epochs over 36 episodes, and the run's own preflight records
+> `statistical_learning_claim: false`.
 
 ## What you get, and what you do not
 
@@ -75,7 +77,9 @@ npa workbench workflow submit \
   --var bucket=<bucket> \
   --var source_data_uri=s3://<bucket>/datasets/so100-pickplace/ \
   --var encord_integration=<your-encord-integration-title> \
-  --registry <registry>/npa-groot:<validated-tag> \
+  --image-override workbench.groot=<registry>/npa-groot:<tag> \
+  --image-override workflow.groot.prepare_dataset=<registry>/npa-groot:<tag> \
+  --image-override workflow.groot.validate_checkpoints=<registry>/npa-groot:<tag> \
   --secret-env HF_TOKEN --secret-env ENCORD_SSH_KEY_B64 \
   --secret-env WANDB_API_KEY
 ```
@@ -84,6 +88,30 @@ npa workbench workflow submit \
 deadline does not survive a cold image pull plus a model download plus training,
 and a run cancelled at the deadline looks like a failure that is really a
 timeout.
+
+**Why three `--image-override` flags and not `--registry`.** `--registry` takes
+a registry *prefix* and appends `npa-groot:<pinned-version>` itself, so passing
+a full image reference renders the malformed
+`<registry>/npa-groot:<tag>/npa-groot:0.1.0`. `--image` accepts a full
+reference but applies it to **every** stage, which puts the Encord stages inside
+the GR00T image -- where they fail with `No such command 'encord'`, because that
+image ships a light `npa workbench` exposing one tool group. `--image-override
+TOOL_REF=IMAGE` is prefix-matched and repeatable, so these three flags put the
+GR00T image on exactly the six stages that need it and leave the eleven CPU
+stages on the default image with the full CLI.
+
+Verify the routing before you submit, rather than discovering it in a pod:
+
+```bash
+npa workbench workflow submit <spec> --run-id probe --plan-only --runtime \
+  --output-format json <your flags> | python3 -c '
+import sys, json, yaml
+d = json.load(sys.stdin)
+for doc in yaml.safe_load_all(d["skypilot_yaml"]):
+    for t in (doc.get("tasks") or [doc]) if isinstance(doc, dict) else []:
+        img = (t.get("resources") or {}).get("image_id", "")
+        print(f"{t.get(\"name\",\"?\"):24} {img.split(\"/\")[-1] or \"default\"}")'
+```
 
 Add `--stage-src` only if your CPU image predates the Encord tools.
 
@@ -97,12 +125,63 @@ npa workbench workflow logs <run-id> --stage train
 The W&B run link is printed by the training stage. `--var wandb_mode=""` turns
 tracking off without changing anything else about the run.
 
+## How long it takes
+
+Measured on the reference run (L40S, warm image cache, 50 episodes):
+
+| Stage | Wall time |
+| --- | --- |
+| prepare-dataset | ~6 min (27 GB image pull on a cold node adds ~5) |
+| push, curate, pull, verify | ~2 min each |
+| prepare-split | ~10 min (copies ~600 MB into three cohorts) |
+| preflight | seconds |
+| baseline-validation | ~6 min (12.6 GB model download plus 173 forwards) |
+| baseline-final | ~4 min (reuses the baseline checkpoint) |
+| train, 1000 steps | ~20 min |
+| validate-checkpoints, 5 candidates | ~10 min (~90 s each) |
+| resolve-checkpoint | ~8 min (downloads the selected 12.6 GB checkpoint) |
+| final-eval, compare | ~4 min each |
+| emit-rrd, emit-mcap, publish | ~5 min total |
+
+About 90 minutes end to end, and roughly 91 GB of artifacts: 75.5 GB of
+checkpoints, a 1.3 GB `.rrd`, a 659 MB `.mcap`, and the rest dataset copies.
+`prepare-split` and `resolve-checkpoint` are slower than they look because both
+move bulk data, not because they are stuck.
+
 ## What the run does
 
-```text
-prepare-dataset → push → curate → pull → verify → prepare-split → preflight
-→ baseline-validation → baseline-final → train → validate-checkpoints
-→ resolve-checkpoint → final-eval → compare → emit-rrd → emit-mcap → publish
+Three views of the same 17 states, each one a level deeper than the last. If
+you only read one, read the second: it is where the leakage-avoidance
+discipline that makes the headline number trustworthy actually becomes
+visible.
+
+### The shape, in one breath
+
+```mermaid
+flowchart LR
+  A[Your LeRobot dataset] --> B[Convert + audit]
+  B --> C[Curate in Encord]
+  C --> D[Fine-tune GR00T]
+  D --> E[Select the best checkpoint]
+  E --> F[Evidence: report, video, viewers]
+```
+
+Five boxes, and the whole guide is an explanation of what happens inside each
+one.
+
+### Phase by phase
+
+```mermaid
+flowchart TB
+  P["Prepare<br/>convert + audit"] --> Q["Curate in Encord<br/>push → curate → pull → verify"]
+  Q --> R["Split into 3 cohorts<br/>+ preflight gate"]
+  R -- validation --> BV["Baseline eval<br/>(ceiling for selection)"]
+  R -- final --> BF["Baseline eval<br/>(headline, read once)"]
+  BV --> TR[Train GR00T]
+  BF --> TR
+  TR --> SEL["Select checkpoint<br/>score every save on validation"]
+  SEL -- "final, once" --> CMP[Compare selected vs. baseline]
+  CMP --> PUB["Publish<br/>report + Rerun + MCAP"]
 ```
 
 **Conversion runs first, before Encord.** Encord curates media *items*, and
@@ -125,7 +204,88 @@ cannot also be the evidence the choice was good, so the headline comparison
 happens on the final cohort instead. That is why the run evaluates the base
 model twice: once on validation, to give selection a ceiling to beat, and once
 on final, as one half of the comparison. Both reuse the same initialized
-weights, so the second costs an evaluation rather than a model build.
+weights, so the second costs an evaluation rather than a model build. The
+diagram's two separate "Baseline eval" boxes are that decision made visible:
+they are the same tool run twice, deliberately kept apart.
+
+### Every stage, for engineers
+
+The node numbers match the job name suffix you see in `sky jobs logs
+<run-id>-NN-<state>` and in every `reports/*.json`. Stadium-shaped stages
+(`baseline-validation`, `baseline-final`, `train`, `validate-checkpoints`,
+`final-eval`) request a GPU and run real `Gr00tPolicy` inference or training;
+`prepare-dataset` runs in the same GR00T image, for `ffmpeg` and modality
+generation, but requests CPU only. The cylinders are S3 prefixes under the run
+root, so a stage's dotted edge is the artifact contract you can verify with
+`aws s3 ls`.
+
+```mermaid
+flowchart TB
+  subgraph P["1 Prepare"]
+    n1(["01 · prepare-dataset<br/>GR00T image, CPU"])
+  end
+
+  subgraph C["2 Curate in Encord"]
+    n2["02 · push"]
+    n3["03 · curate"]
+    n4["04 · pull"]
+    n5["05 · verify"]
+    n2 --> n3 --> n4 --> n5
+  end
+
+  subgraph S["3 Split & gate"]
+    n6["06 · prepare-split"]
+    n7["07 · preflight"]
+    n6 --> n7
+  end
+
+  cohorts[("S3: data/train<br/>data/validation<br/>data/final")]
+  n6 -.-> cohorts
+
+  subgraph B["4 Baselines (GPU)"]
+    n8(["08 · baseline-validation"])
+    n9(["09 · baseline-final"])
+  end
+
+  cohorts -. validation .-> n8
+  cohorts -. final .-> n9
+
+  subgraph T["5 Train (GPU)"]
+    n10(["10 · train"])
+  end
+  n8 --> n10
+  n9 --> n10
+
+  ckpts[("S3: checkpoints/candidate/*")]
+  n10 -.-> ckpts
+
+  subgraph V["6 Select checkpoint"]
+    n11(["11 · validate-checkpoints (GPU)"])
+    n12["12 · resolve-checkpoint"]
+    n11 --> n12
+  end
+  cohorts -. "validation, x5" .-> n11
+  ckpts -.-> n11
+  ckpts -.-> n12
+
+  subgraph F["7 Final comparison"]
+    n13(["13 · final-eval (GPU)"])
+    n14["14 · compare"]
+    n13 --> n14
+  end
+  cohorts -. "final, once" .-> n13
+  n12 --> n13
+
+  subgraph Pub["8 Publish"]
+    n15["15 · emit-rrd"]
+    n16["16 · emit-mcap"]
+    n17["17 · publish"]
+    n14 --> n15 --> n16 --> n17
+  end
+
+  n7 --> n8
+  n7 --> n9
+```
 
 ## Is my data usable?
 
@@ -155,6 +315,27 @@ The reading rule: **look at the per-dimension ranges before training.** A
 saturated joint or a constant gripper is a data problem, and no amount of
 training fixes it.
 
+**What a passing audit looks like.** The reference run's
+`reports/dataset-audit.json`:
+
+```json
+{ "tasks": ["Pick up the cube and place it in the box."],
+  "dataset": { "episodes": 50, "frames": 19631, "fps": 30.0,
+               "duration_seconds": 654.366667,
+               "episode_frames_min": 326, "episode_frames_max": 575,
+               "episode_frames_median": 382 },
+  "advisories": [] }
+```
+
+Both cameras reported 640x480 with all 50 episodes, and state and action were
+6-dimensional with no constant dimension. Seven checks passed, including
+`declared language annotation has task text` -- that one matters more than it
+looks. `modality.json` maps `human.task_description` onto `task_index`, so GR00T
+resolves every frame's instruction through `meta/tasks.jsonl`. Empty task text
+there trains a language-conditioned policy that never sees its task, and the
+loss still falls, so nothing downstream catches it. The audit now fails closed
+on that combination. If your `tasks` array is empty, stop and fix conversion.
+
 The audit does not establish task coverage, operator quality, or label
 correctness. For your own recordings, measure coverage across object poses,
 lighting, camera placement, operator and session, and include recoveries. Do not
@@ -174,6 +355,44 @@ What to actually conclude:
 - **Low samples per second means the GPU is data-starved**, not that the model
   is slow. Raise `dataloader_num_workers` before you raise anything else.
 - **A NaN anywhere means stop.** Start a new run; do not resume through it.
+
+**Measured on the reference run** (`npa_groot_finetune_manifest.json`):
+
+| Field | Value |
+| --- | --- |
+| `initial_loss` | 1.3847 |
+| `final_loss` | 0.0634 |
+| `robust_early_loss` -> `robust_late_loss` | 1.2348 -> 0.0697 |
+| `aggregate_train_loss` | 0.4408 |
+| `loss_decreased` / `loss_finite` | `true` / `true` |
+| `loss_steps_real` | `true` |
+
+The manifest records `loss_step_source:
+trainer_state.log_history.explicit_global_step`, so the curve is the trainer's
+own steps rather than an interpolation. Training 1000 steps at global batch 16
+on one L40S took about 20 minutes.
+
+**W&B is a launcher flag, not an environment variable.** The pinned GR00T
+launcher owns the switch:
+
+```
+finetune_config.py   use_wandb: bool = False
+                     wandb_project: str = "finetune-gr00t-n1d7"
+launch_finetune.py   config.training.use_wandb    = ft_config.use_wandb
+                     config.training.wandb_project = ft_config.wandb_project
+```
+
+Exporting `WANDB_MODE` / `WANDB_PROJECT` / `WANDB_API_KEY` never reaches it, so
+the reference run 20260908T222914Z logged nothing at all: its 80 KB
+`training.log` contains no `wandb.init`, no login line and no run URL. Confusingly
+the vendor still writes `checkpoints/candidate/wandb_project.json`-style config
+naming its own default project, which reads like a real run and is not one --
+do not go looking there for a run that does not exist.
+
+The spec passes `--wandb-mode online`, and the finetune command turns that into
+the launcher's `--use-wandb` plus `--wandb-project`. If a dashboard is empty,
+check `training.log` for a `wandb` login line before anything else: no line
+means tracking never started, which is a wiring problem rather than a sync one.
 
 Falling loss is not success. It is the precondition for asking the next
 question.
@@ -210,6 +429,75 @@ Two traps worth naming. An improvement smaller than the repeat-noise band is
 not an improvement. And beating the base model is a much lower bar than beating
 a trivial predictor, which is why the skill score is there.
 
+### The reference run's numbers
+
+The validation curve that chose the checkpoint, with the skill score computed
+against that cohort's train-mean predictor (MSE 493.83):
+
+| Candidate | validation MSE | MAE | skill |
+| --- | --- | --- | --- |
+| base model | 1716.55 | 31.401 | -2.476 |
+| checkpoint-200 | 655.86 | 18.237 | -0.328 |
+| checkpoint-400 | 370.75 | 12.690 | +0.249 |
+| checkpoint-600 | 229.41 | 8.947 | +0.535 |
+| checkpoint-800 | 43.54 | 4.503 | +0.912 |
+| **checkpoint-1000** | **38.64** | **4.443** | **+0.922** |
+
+Note the shape: a large drop through step 800, then a small one to 1000
+(43.54 -> 38.64). That is a curve beginning to flatten, which says more steps
+will help less than more episodes would. At step 600 it was still falling
+steeply; the same run supports opposite conclusions depending on where you stop,
+which is why you read the curve and not the last number.
+
+Selection recorded:
+
+```json
+{ "outcome": "selected", "selected_step": 1000, "selected_mse": 38.6393,
+  "baseline_mse": 1716.5498, "eligibility_ceiling_mse": 1544.8948,
+  "relative_improvement": 0.9775, "candidates_considered": 5 }
+```
+
+The headline, on the final cohort of 7 episodes and 2588 samples read exactly
+once:
+
+| | base model | fine-tuned | |
+| --- | --- | --- | --- |
+| action MSE | 1734.28 | **39.88** | -97.7% |
+| MAE | 31.531 | **4.471** | 7x lower |
+| skill score | -2.902 | **+0.910** | |
+
+And the gate that makes it credible rather than merely large:
+
+```json
+{ "gate_passed": true, "gate_failures": [], "regressions": [],
+  "repeat_noise_spread": 44.4520,
+  "required_absolute_improvement_over_noise": 133.3561,
+  "absolute_improvement": 1694.4013 }
+```
+
+The improvement is 12.7x the required margin over noise, every one of the 6
+action dimensions improved, and each side ran 5 repeats across 4 independent
+seeds (830 model forwards each) with `real_model_forward: true`.
+
+**What this does not say.** The report ships its own limitations, and they are
+the honest frame for the number above:
+
+```json
+"limitations": [
+  "This report is offline action-matching evidence, not a robot rollout.",
+  "The short optimizer smoke is an operational pipeline validation and does
+   not establish statistical learning."
+],
+"candidate_promoted": false,
+"closed_loop": false
+```
+
+The policy predicts held-out expert actions far better than the base model and
+far better than any trivial predictor, on episodes it never saw. That is real
+evidence of learning. It is not a task success rate, it says nothing about
+recovery, timing or contact, and the run deliberately does not promote the
+checkpoint.
+
 ## When it says `not_improved`
 
 Work in this order:
@@ -218,8 +506,11 @@ Work in this order:
    more failures than hyperparameters do.
 2. **Check the training signals** above. A flat loss with only one episode being
    sampled is a data-consumption bug, not a model problem.
-3. **Train longer.** The default 500 steps is deliberately short. 2,000 to
-   10,000 is a normal range once the pipeline is proven.
+3. **Train longer.** The default 1000 steps is 1.117 epochs over 36 episodes --
+   barely one pass. 2,000 to 10,000 is a normal range once the pipeline is
+   proven. Remember `save_steps` must divide `max_steps` and
+   `save_total_limit` must cover every checkpoint saved, or preflight rejects
+   the run.
 4. **Add data**, especially coverage of the situations it fails in.
 5. **Then** touch the learning rate.
 
@@ -244,6 +535,30 @@ model against the GPU first, since changing the accelerator does not prove its
 kernels are compatible. Plan S3 capacity from your first measured checkpoint
 size, and note that optimizer state can exceed the weights.
 
+**Check the node's disk before you choose the GPU.** This is the sizing trap
+that bites, because it has nothing to do with GPU memory. The GR00T image is
+about 27 GB compressed and unpacks to roughly 55 to 80 GB. Add the base model
+and its runtime dependency, then the checkpoints the schedule retains: at five
+retained weights-only checkpoints for a 3B model, budget on the order of
+
+```text
+55-80 GB (image) + ~10 GB (models) + 5 x ~13 GB (checkpoints) = 130-155 GB
+```
+
+A node advertising around 118 GB of ephemeral storage cannot hold that, and a
+node advertising around 238 GB can. Check yours before submitting:
+
+```bash
+kubectl get nodes -o custom-columns=\
+'NAME:.metadata.name,GPU:.metadata.labels.nebius\.com/gpu-name,DISK:.status.allocatable.ephemeral-storage'
+```
+
+If the GPU you want is short on disk, the levers are a lower
+`save_total_limit` (at the cost of selection candidates), the
+[durable model cache](../model-weight-cache.md) on a mounted volume, or simply
+picking the node with more room. Training that dies on `no space left on
+device` after an hour looks like a training failure and is not one.
+
 Two costs to know about. Conversion **re-encodes** video when the source packs
 episodes together, which costs CPU time and one lossy generation; a dataset
 already recorded per-episode is copied byte-for-byte instead. And conversion is
@@ -264,9 +579,117 @@ idempotent, so you can convert once with `npa workbench groot convert` and point
 | GPU mostly idle | Samples per second | Raise `dataloader_num_workers`; profile before adding GPUs |
 | Training loss goes NaN | Input finiteness, learning rate | Stop; start a new run rather than resuming |
 
-To resume, repeat the submit with `--resume-run <original-run-id>` in place of
-`--run-id`. Completed stages, including verified curation and saved checkpoints,
-are reused.
+### Resuming, exactly
+
+Repeat the submit with `--resume-run <original-run-id>` in place of `--run-id`
+(the two are mutually exclusive). Completed waves replay from the ledger in
+seconds -- you will see `replayed from ledger (job N)` per stage -- so verified
+curation, saved checkpoints and finished evaluations are reused rather than
+recomputed.
+
+**Pass the original run id, not the id the error message suggests.** A failed
+wave's `operator_remedy` names a wave-scoped id like
+`<run-id>-07-preflight`. `--resume-run` validates its argument *as a run id*, so
+that value becomes a brand-new run with no ledger history and the pipeline
+restarts from stage 1. This cost a full 35-minute replay before we noticed.
+
+Two failure modes need an explicit authorization flag, because the runtime will
+not invent an attempt it cannot tie to a known job:
+
+| Recorded state | Meaning | Flag |
+| --- | --- | --- |
+| `resume_block_terminal_or_legacy_absence` with `job_id: ""` | The launch died before SkyPilot assigned an id, so there is no identity to reconcile | Unrecoverable; start a fresh run |
+| Wave failed but the job actually succeeded | An unconfirmable launch that did complete | `--adopt-absent-in-flight-outputs` |
+| Wave terminal-failed and the job is genuinely gone | Safe to re-attempt | `--retries N`, or `--retry-absent-in-flight` |
+
+The first row is worth internalizing: if a wave never got a job id, that run is
+finished no matter what you fix afterwards. We lost a run to it.
+
+### Kubernetes credential traps
+
+Two thirds of the interruptions in the reference session were credentials, not
+the pipeline. All three symptoms look like network faults and are not.
+
+| Symptom | Real cause | Fix |
+| --- | --- | --- |
+| `managed-job launch indeterminate ... transport: authentication handshake failed: context deadline exceeded`, naming `.nebius/bin/nebius ... exit code 60` | The kubeconfig authenticates through an exec plugin that shells out per call, and it intermittently times out | Replace the `exec` user in `~/.kube/config` with an inline bearer token |
+| Launches fail while `kubectl` works fine | The SkyPilot API server caches the credential it started with; a long-lived server holds an expired token | `sky api stop && sky api start` |
+| `You must be logged in to the server (Unauthorized)` mid-run | The inline token expired | Mint a new one and restart the API server, or it keeps serving the old one |
+
+`KUBECONFIG` does not help here. SkyPilot 0.12.2 calls
+`list_kube_config_contexts()` with no `config_file`, so the Kubernetes client
+reads `~/.kube/config` and ignores the environment variable -- npa's
+`sky_environment()` documents this. The file itself has to carry the credential.
+
+Mint a token with:
+
+```bash
+nebius mk8s v1 cluster get-token --profile <profile> --format json
+```
+
+Keep the kubeconfig **user name unchanged** when you edit it. SkyPilot derives
+cluster ownership from that name, so renaming it orphans the existing jobs
+controller with
+`ClusterOwnerIdentityMismatchError`.
+
+**The durable direction is a service-account token**, but the service account
+SkyPilot ships is **not sufficient as-is**, and this is worth getting right
+before you try it.
+
+```bash
+kubectl --context <ctx> create token skypilot-service-account \
+  -n default --duration=2160h        # 90 days; this cluster allows up to 8760h
+```
+
+That token authenticates, passes SkyPilot's ownership check (ownership derives
+from the kubeconfig *user entry name*, not the token subject, so keep the entry
+name unchanged), and serves `sky jobs queue` correctly. It then fails
+provisioning:
+
+```
+pods is forbidden: User "system:serviceaccount:default:skypilot-service-account"
+cannot list resource "pods" in API group "" at the cluster scope
+```
+
+`skypilot-service-account` is bound namespace-scoped in `default`, so
+`list pods -n default` is allowed and `list pods --all-namespaces` is not --
+and SkyPilot's GPU discovery lists cluster-wide. The failure surfaces as
+`accelerator readiness failed: Timed out after 600s waiting for SkyPilot to
+discover a compatible GPU`, which reads like a capacity problem and is a
+permissions problem.
+
+Before adopting a service account, grant it cluster-scoped read on the
+resources SkyPilot discovers against (`pods`, `nodes`) and **verify with
+`sky gpus list --infra k8s`, not just `kubectl` and `sky jobs queue`.** A
+credential can pass every check you thought to run and still fail the one the
+launcher makes.
+
+**The expiry is pinned to your Nebius session, not to when you mint.** This is
+the part that makes a user-account token unsuitable for a long run. Minting at
+01:12 returned a token expiring 13:12; minting again at 12:56 returned the same
+13:12. So the ceiling is the CLI session, and no amount of re-minting moves it:
+
+```bash
+# both of these return the identical expirationTimestamp
+nebius mk8s v1 cluster get-token --profile <profile> --format json
+```
+
+When the session lapses mid-run the symptoms are split and confusing:
+`sky jobs queue` keeps working, because the API server holds a credential in
+memory, while `kubectl` returns `Unauthorized` -- and the submit path needs
+`kubectl` for its GPU-readiness and API-stability checks, so the next wave
+launch fails with `managed-job launch indeterminate`. A run can therefore look
+healthy in the job queue and be unable to start another stage.
+
+A service-account token has no such ceiling, which is the real argument for it
+over convenience. Until the cluster-scoped binding exists, either re-login to
+Nebius before a long submit and accept the session window, or restore the
+exec-plugin kubeconfig, which at least re-mints per call for the life of the
+session instead of freezing one token:
+
+Either way, restart the API server afterwards (`sky api stop && sky api
+start`) -- it serves the credential it booted with. Prefer 90 days over a year
+for any long-lived token in a plaintext kubeconfig.
 
 ## Curating by hand
 
@@ -283,6 +706,19 @@ quality classifier**. Two ways to make curation mean something:
 Either way `selection.json` records which episodes trained and which Encord
 items they came from, and the selection enters the split hash, so the same seed
 with different curation is correctly a different experiment.
+
+## Augmenting your data with Cosmos
+
+This pipeline does not do this -- augmentation was deliberately left out to
+keep the core loop small and fully audited. For a complete, standalone guide
+to generating Cosmos3 video2video variants of your episodes and folding them
+into the training set before fine-tuning, see
+[Fine-tune GR00T on Cosmos-augmented robot demonstrations](encord-cosmos3-groot-finetune.md).
+It reuses this guide's `finetune` / `posttrain-eval` / `compare-learning`
+stages and their report schema, at a smaller, faster, and currently
+less-audited scale than the pipeline documented here -- see that guide's own
+"Is my data usable?" section for exactly which safety nets it does and does
+not have yet.
 
 ## Adapting to your robot
 
@@ -321,6 +757,10 @@ s3://<bucket>/encord-groot-finetune/<run-id>/
 
 - [GR00T N1.7 operational training pipeline](../cookbooks/groot-1-7-training.md)
   — the shorter plumbing validation this guide's stages grew out of.
+- [Fine-tune GR00T on Cosmos-augmented robot demonstrations](encord-cosmos3-groot-finetune.md)
+  — adds Cosmos3 video2video augmentation ahead of this guide's fine-tune
+  stages, at a smaller scale and without this guide's dataset audit or
+  roundtrip verify (yet).
 - [Encord curation](../encord.md) — credentials, integrations, and the curation
   verbs on their own.
 - [Physical AI Data Factory](physical-ai-data-factory.md) — augmentation and

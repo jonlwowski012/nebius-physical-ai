@@ -558,3 +558,37 @@ def test_baseline_reuses_published_weights_instead_of_rebuilding(
 
     assert built == [], "a published baseline must not be rebuilt"
     assert uploaded == [], "a reused baseline must not be re-uploaded"
+
+
+def test_compare_sources_media_from_the_cohort_it_evaluated() -> None:
+    """The comparison video must come from the cohort the evaluations scored.
+
+    Every cohort re-indexes episodes from 0, so "episode 0" names a different
+    recording in each. In live run 20260908T222914Z the validation episode 0 had
+    365 frames and the final episode 0 had 382. `compare_learning` sourced
+    heldout media unconditionally -- correct while it compared heldout
+    evaluations, wrong once the spec pointed it at final-cohort evaluations,
+    which is what jobs 285 and 286 hit:
+
+        camera 'front' episode 0 has 365 frames but action/state alignment
+        requires frame 365
+
+    Cohorts of equal length would have produced a silently mismatched video
+    rather than an error, so this asserts the source follows `split_role`.
+    """
+    import inspect
+
+    from npa.workflows import groot_learning
+
+    source = inspect.getsource(groot_learning.compare_learning)
+    assert 'split[evaluated_role]["uri"]' in source, (
+        "compare_learning no longer selects media by the evaluated cohort; a "
+        "hardcoded cohort silently pairs one cohort's actions with another's video"
+    )
+    assert 'split["heldout"]["uri"]' not in source, (
+        "compare_learning still hardcodes heldout media"
+    )
+    assert "scored different cohorts" in source, (
+        "compare_learning must fail closed when the two evaluations disagree "
+        "about which cohort they scored"
+    )

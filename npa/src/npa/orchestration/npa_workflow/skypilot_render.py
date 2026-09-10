@@ -64,6 +64,14 @@ TOOL_REF_IMAGE_TOOL: dict[str, str] = {
     # must not inherit Isaac image routing or consent requirements.
     "workbench.genesis": "genesis",
     "workbench.groot": "groot",
+    # Two workflow.groot stages need the GR00T image rather than the default
+    # one the rest of that family runs on: prepare_dataset shells out to
+    # ffmpeg to split packed LeRobot v3 video, and validate_checkpoints runs
+    # real Gr00tPolicy forwards on a GPU. Exact entries, so the CPU-only
+    # members (compare_learning, the RRD/MCAP emitters) keep using the
+    # default image plus staged source.
+    "workflow.groot.prepare_dataset": "groot",
+    "workflow.groot.validate_checkpoints": "groot",
 }
 
 OPENPI_TERMS_ENV = "NPA_OPENPI_ACCEPT_GEMMA_TERMS"
@@ -130,6 +138,20 @@ DECLARATIVE_PIP_EXTRAS = frozenset({"viz"})
 #: look for. `lerobot policy_train` needs the latter: it materialises its dataset with
 #: `huggingface_hub`, and the interpreter running npa in a vendor image is not the vendor's own
 #: venv, so the library is not necessarily importable there (live job 244).
+#: Requirements every stage that loads the real GR00T model needs. The
+#: redistributable image's uv-created Python 3.10 environment has no pip, and a
+#: source overlay can expose the current CLI while its conditional Python <3.11
+#: dependency is still absent (live job 446 failed on ``import tomli`` before
+#: the trainer started). The common installer's uv fallback targets the exact
+#: recorded interpreter.
+_GROOT_REAL_MODEL_REQUIREMENTS: tuple[tuple[str, str], ...] = (
+    ("python:tomli", "tomli>=2.0.0"),
+    (
+        'python:transformers;assert(__import__("importlib.metadata").metadata.version("transformers")=="4.57.3")',
+        "transformers==4.57.3",
+    ),
+)
+
 TOOL_REF_PIP_REQUIREMENTS: dict[str, tuple[tuple[str, str], ...]] = {
     # The OpenPI BYOF environment intentionally contains only upstream's
     # pinned runtime. Four-mode stages publish/read private object-storage
@@ -142,18 +164,14 @@ TOOL_REF_PIP_REQUIREMENTS: dict[str, tuple[tuple[str, str], ...]] = {
     # fails during import. Restore the upstream runtime exactly for real model
     # stages. A normal targeted install also restores its Hub/tokenizers closure
     # while leaving torch and the vendor GR00T package untouched.
-    "workbench.groot": (
-        # The redistributable image's uv-created Python 3.10 environment has no
-        # pip. A source overlay can expose the current CLI while its conditional
-        # Python <3.11 dependency is still absent; live job 446 then failed on
-        # ``import tomli`` before the trainer started. The common installer's uv
-        # fallback targets the exact recorded interpreter.
-        ("python:tomli", "tomli>=2.0.0"),
-        (
-            'python:transformers;assert(__import__("importlib.metadata").metadata.version("transformers")=="4.57.3")',
-            "transformers==4.57.3",
-        ),
-    ),
+    "workbench.groot": _GROOT_REAL_MODEL_REQUIREMENTS,
+    # Runs the same `_evaluate_checkpoint` -> Gr00tPolicy path as the evals, but
+    # sits under `workflow.groot`, so the `workbench.groot` prefix above does not
+    # reach it. Live job 281 imported gr00t.data.interfaces against the image's
+    # upgraded Transformers and died on
+    # `cannot import name 'is_offline_mode' from 'huggingface_hub'` -- after
+    # training had already produced all five checkpoints.
+    "workflow.groot.validate_checkpoints": _GROOT_REAL_MODEL_REQUIREMENTS,
     "workflow.groot.prepare_split": (("python:pyarrow", "pyarrow>=15,<22"),),
     "workflow.groot.compare_learning": (
         ("python:av", "av>=12,<17"),
@@ -1825,12 +1843,13 @@ def build_skypilot_task_doc(
     """Build one SkyPilot task document from a planned step."""
 
     scheduler_task = build_scheduler_task(spec, step, run_id=run_id)
+    tool_ref = str(scheduler_task.get("tool_ref") or "")
     resources = normalize_resources(
         scheduler_task.get("resources") or {},
         accelerator_overrides=options.gpu_accelerator_overrides,
     )
     image = resolve_task_image(
-        str(scheduler_task.get("tool_ref") or ""),
+        tool_ref,
         scheduler_task.get("resources") or {},
         options=options,
     )
@@ -1902,6 +1921,17 @@ def build_skypilot_task_doc(
         envs["AWS_ENDPOINT_URL"] = options.aws_endpoint_url
     if image:
         envs["NPA_TASK_IMAGE"] = image.removeprefix("docker:")
+        # A capability image ships a dependency-minimal `npa workbench` that
+        # exposes exactly ONE tool group, selected by this env. With
+        # NPA_SKIP_EAGER_IMPORTS baked in and this unset, that light CLI falls
+        # back to the cosmos2 surface, so `npa workbench groot finetune` dies
+        # with "No such command 'groot'" *inside the GR00T image itself*. Only
+        # the toolRefs whose argv shells out to `npa` are affected; the ones
+        # that invoke `python3 -m npa.workflows...` bypass the CLI entirely,
+        # which is why the eval stages passed while training failed.
+        light_tool = tool_image_key(tool_ref)
+        if light_tool:
+            envs["NPA_LIGHT_WORKBENCH_TOOL"] = light_tool
     if expected_source_sha:
         if len(expected_source_sha) != 40 or any(
             char not in "0123456789abcdef" for char in expected_source_sha
@@ -1912,7 +1942,7 @@ def build_skypilot_task_doc(
         envs["NPA_SIM2REAL_SOURCE_SHA"] = expected_source_sha
     envs.update(
         isaac_eula_envs(
-            str(scheduler_task.get("tool_ref") or ""),
+            tool_ref,
             resources=scheduler_task.get("resources") or {},
             config=spec.config,
             resolved_image=image,

@@ -86,6 +86,12 @@ Do not soften any of these when adapting the pipeline:
 - **The checkpoint schedule** requires `save_steps` to divide `max_steps` and
   retention to cover every checkpoint saved, because a deleted checkpoint
   cannot be selected.
+- **A declared language annotation must have task text.** When
+  `meta/modality.json` maps an annotation onto `task_index`, GR00T resolves
+  every frame's instruction through `meta/tasks.jsonl`, so empty task text
+  trains a language-conditioned policy that never sees its task. Loss still
+  falls and the run still reports an improvement, which is why this raises
+  instead of warning.
 
 ## Reading The Result
 
@@ -128,6 +134,16 @@ not measure recovery, timing, or contact, and it says nothing about hardware.
   and copies per-episode video byte-for-byte. It is idempotent, so converting
   once with `npa workbench groot convert` and pointing `source_data_uri` at the
   result makes later runs skip the work.
+- **Only `prepare-dataset` may read `source_data_uri`.** `modality.json` is a
+  GR00T artifact that conversion *creates*, so every later stage must consume
+  `prepared_data_uri`. The shared `workflow.groot.prepare_split` catalog entry
+  defaults `--source-uri` to the raw input, which is right for
+  `groot-1-7-finetune.yaml` and wrong here, so this spec overrides it with a
+  per-state `params` overlay. The spec validates and plans either way; the
+  mistake only surfaces as `NoSuchKey` minutes into a live submit.
+- **LeRobot v3 stores task text as the pandas index** of `meta/tasks.parquet`,
+  arriving as `__index_level_0__` rather than a `task` column. Reading only
+  `task` silently yields `""` for every v3 dataset.
 - **`encord_media_uri` hardcodes `chunk-000`**, correct below 1000 episodes
   since the chunk index is `episode_index // chunks_size`. A larger dataset
   needs a fan-out here.
@@ -151,7 +167,80 @@ the template: which stages carry `--split-role final`, and that
 
 ## Status
 
-The spec validates and plans and its stages have unit and guardrail coverage.
-**No end-to-end live run has been performed**, so the guide quotes no measured
-numbers and the defaults are a starting recipe rather than a tuned one. Do not
-add measured claims to the guide without citing a run id.
+**Validated end to end.** All 17 stages succeeded on run
+`encord-groot-finetune-20260908T222914Z` (L40S, `max_steps=1000`,
+`save_steps=200`, `lerobot/svla_so100_pickplace`). Final cohort: action MSE
+1734.28 -> 39.88, MAE 31.531 -> 4.471, skill score -2.902 -> +0.910,
+`gate_passed: true` with the improvement 12.7x the repeat-noise band and no
+per-dimension regressions. About 90 minutes and ~91 GB of artifacts.
+
+Do not add further measured claims without citing a run id.
+
+## Live-run Traps
+
+Five defects and three operational traps were found by that run; all are fixed
+or documented, and all of them rendered, validated and planned cleanly first.
+
+- **Only `prepare-dataset` may read `config.source_data_uri`.** `modality.json`
+  is a GR00T artifact conversion creates, so later stages consume
+  `prepared_data_uri`. The shared `prepare_split` catalog entry defaults to the
+  raw input; this spec overrides it per state.
+- **LeRobot v3 stores task text as the pandas index** of `meta/tasks.parquet`
+  (`__index_level_0__`). Reading only `task` yielded `""`, which would have
+  trained a language-conditioned policy on an empty instruction while loss fell
+  normally. The audit now fails closed on a declared language annotation with no
+  task text.
+- **Capability images ship a one-group `npa workbench`.** The renderer pins
+  `NPA_LIGHT_WORKBENCH_TOOL` from `tool_image_key`; without it the CLI falls back
+  to the cosmos2 surface and `npa workbench groot|encord` does not exist. Only
+  `workbench.groot.finetune` shells out to `npa`; every other GR00T toolRef uses
+  `python3 -m npa.workflows...` and is unaffected, which is what hid it.
+- **Every real-model stage needs `transformers==4.57.3`.** The requirement is
+  keyed on `workbench.groot`, which does not reach
+  `workflow.groot.validate_checkpoints`; it failed *after* training, on
+  `is_offline_mode` from `huggingface_hub`.
+- **`compare_learning` sources media by the evaluations' `split_role`.**
+  Cohorts re-index episodes from 0, so validation episode 0 (365 frames) is not
+  final episode 0 (382). Hardcoding heldout media paired final actions with
+  validation video; equal-length cohorts would have rendered a silently wrong
+  video instead of failing.
+- **`--resume-run` takes the ORIGINAL run id.** The wave-scoped id in
+  `operator_remedy` becomes a new run and restarts from stage 1. A wave that
+  failed before SkyPilot assigned a `job_id` records
+  `resume_block_terminal_or_legacy_absence` and is unrecoverable -- start fresh.
+- **`--image-override TOOL_REF=IMAGE`, not `--registry` or `--image`.**
+  `--registry` appends its own tag; `--image` pins every stage and breaks the
+  Encord stages.
+- **Kubeconfig exec plugins and cached tokens.** `KUBECONFIG` is ignored
+  (SkyPilot reads `~/.kube/config` directly), the API server caches the
+  credential it started with, and the controller cannot mint a replacement. See
+  the guide's credential table.
+
+- **W&B is switched on at the launcher, never through the environment.**
+  `FinetuneConfig.use_wandb` defaults to `False` and `wandb_project` defaults to
+  `finetune-gr00t-n1d7`; `launch_finetune.py` copies both onto
+  `config.training`. Exporting `WANDB_MODE` / `WANDB_PROJECT` / `WANDB_API_KEY`
+  never reaches that switch, so every run through 20260908T222914Z logged
+  **nothing** -- its `training.log` has no `wandb.init`, no login line, no run
+  URL. The vendor nevertheless writes a `wandb_config.json` naming its own
+  default project, which looks like a real run and is not one; do not read it as
+  evidence. The finetune command now passes `--use-wandb` and
+  `--wandb-project`, and passes neither when tracking is disabled.
+- **A user-account token's expiry is pinned to the Nebius CLI session.**
+  Minting at 01:12 and again at 12:56 both returned `13:12`, so re-minting
+  cannot extend it and a multi-hour run can outlive the session. The symptoms
+  split: `sky jobs queue` still works (the API server holds a credential in
+  memory) while `kubectl` returns `Unauthorized`, and because the submit path
+  uses `kubectl` for GPU-readiness checks the next wave fails with
+  `managed-job launch indeterminate`. The queue looks healthy while nothing can
+  launch.
+- **A service-account token is the right direction but needs cluster-scoped
+  read first.** `skypilot-service-account` is bound namespace-scoped in
+  `default`, so it authenticates, passes the ownership check and serves
+  `sky jobs queue`, then fails provisioning with `pods is forbidden ... at the
+  cluster scope` -- which surfaces as `accelerator readiness failed: Timed out
+  after 600s waiting for SkyPilot to discover a compatible GPU` and reads like a
+  capacity problem. Grant cluster-scoped read on `pods` and `nodes`, and verify
+  with `sky gpus list --infra k8s`, not only `kubectl` and `sky jobs queue`.
+  Keep the kubeconfig user entry name unchanged (ownership derives from it) and
+  restart the API server, which serves the credential it booted with.

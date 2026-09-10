@@ -60,6 +60,12 @@ dependencies = [
     "rerun-sdk==0.31.4",
     # Formerly the `server` extra: FastAPI policy/eval + agent backend server.
     "fastapi~=0.136.1",
+    # Pinned model/dataset downloads. Imported by npa.workflows.lerobot_dataset
+    # (`npa workbench lerobot fetch-dataset`), the GR00T baseline initializer in
+    # npa.workflows.groot_learning, and npa.fiftyone_lerobot. It was previously
+    # undeclared, so those paths failed at runtime on a clean install with
+    # "huggingface_hub is required".
+    "huggingface_hub>=0.34",
 ]
 
 [project.optional-dependencies]

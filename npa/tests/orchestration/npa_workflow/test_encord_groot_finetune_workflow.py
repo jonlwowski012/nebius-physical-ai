@@ -237,3 +237,169 @@ def test_spec_is_registered_for_live_submission() -> None:
     source = Path(submit_matrix.__file__).read_text(encoding="utf-8")
     assert "encord-groot-finetune.yaml" in source
     assert "ENCORD_SSH_KEY_B64" in source
+
+
+def test_gpu_stages_get_the_groot_image_not_the_default_one() -> None:
+    """A stage that imports gr00t or shells to ffmpeg cannot run image-less.
+
+    Caught on the way to a live submit: `workflow.groot.validate_checkpoints`
+    runs real `Gr00tPolicy` forwards and `workflow.groot.prepare_dataset` shells
+    out to ffmpeg to split packed LeRobot v3 video, yet both resolved to no
+    image and would have landed on SkyPilot's default one.
+    """
+    from npa.orchestration.npa_workflow.skypilot_render import tool_image_key
+
+    spec = load_spec(SPEC_PATH)
+    needs_groot = {
+        "prepare-dataset",
+        "baseline-validation",
+        "baseline-final",
+        "train",
+        "validate-checkpoints",
+        "final-eval",
+    }
+
+    for name in needs_groot:
+        tool = spec.states[name].tool_ref
+        assert tool_image_key(tool) == "groot", (
+            f"{name} ({tool}) must run in the GR00T image; it resolved to "
+            f"{tool_image_key(tool)!r}"
+        )
+
+    # The reporting stages deliberately stay on the default image plus staged
+    # source, which is where their [viz] extra comes from.
+    for name in ("compare", "emit-rrd", "emit-mcap", "publish", "prepare-split"):
+        tool = spec.states[name].tool_ref
+        assert tool_image_key(tool) is None, f"{name} ({tool}) should stay image-less"
+
+
+def test_every_dataset_reader_after_conversion_reads_the_converted_dataset() -> None:
+    """Only `prepare-dataset` may read the raw input.
+
+    Found by live run `encord-groot-finetune-20260908T181240Z`, which failed at
+    `prepare-split` with `NoSuchKey` on
+    `datasets/so100-pickplace/meta/modality.json`. `modality.json` is a GR00T
+    artifact that *conversion creates*, so a raw LeRobot v3 dataset has none.
+    The shared `workflow.groot.prepare_split` catalog entry defaults
+    `--source-uri` to `config.source_data_uri`, which is correct for
+    `groot-1-7-finetune.yaml` (already GR00T, no conversion stage) and wrong
+    here, so this spec overrides it per state.
+
+    The dangerous part is that the spec validates, plans, and renders cleanly
+    either way; the failure only appears minutes into a live submit.
+    """
+    spec = load_spec(SPEC_PATH)
+    steps = {step.state: list(step.argv) for step in build_plan(spec, run_id="conv").steps}
+
+    raw = "datasets/lerobot-source/"
+    prepared = "data/prepared/"
+
+    source = steps["prepare-dataset"]
+    assert raw in source[source.index("--source-uri") + 1], (
+        "prepare-dataset must read the raw input dataset"
+    )
+
+    split = steps["prepare-split"]
+    read = split[split.index("--source-uri") + 1]
+    assert prepared in read and raw not in read, (
+        f"prepare-split reads {read!r}; it must read the converted dataset, "
+        "because meta/modality.json only exists after conversion"
+    )
+
+    for state, argv in steps.items():
+        if state == "prepare-dataset":
+            continue
+        offenders = [value for value in argv if raw in str(value)]
+        assert not offenders, (
+            f"state {state!r} reads the raw dataset {offenders!r}; every stage "
+            "after conversion must consume the converted dataset"
+        )
+
+
+def test_capability_image_stages_pin_the_light_workbench_tool(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A stage running in a capability image must be told which CLI to expose.
+
+    The GR00T image bakes `NPA_SKIP_EAGER_IMPORTS`, so `npa workbench` builds
+    a dependency-minimal tree that exposes exactly one tool group, chosen by
+    `NPA_LIGHT_WORKBENCH_TOOL`. Unset, it falls back to the cosmos2 surface, so
+    `npa workbench groot finetune` failed with "No such command 'groot'" while
+    running *inside the GR00T image* (live job 264).
+
+    Only `workbench.groot.finetune` shells out to `npa`; every other GR00T
+    toolRef invokes `python3 -m npa.workflows...` and bypasses the CLI, which
+    is why both baseline evaluations passed and training did not. That
+    asymmetry is what made this survive every offline check.
+    """
+    rendered = _rendered("light-cli", monkeypatch)
+
+    for name, task in rendered.items():
+        image = str((task.get("resources") or {}).get("image_id") or "")
+        pinned = (task.get("envs") or {}).get("NPA_LIGHT_WORKBENCH_TOOL", "")
+        if "npa-groot" in image:
+            assert pinned == "groot", (
+                f"stage {name!r} runs in the GR00T image but does not pin "
+                "NPA_LIGHT_WORKBENCH_TOOL, so any `npa workbench groot` call "
+                "would resolve against the cosmos2 surface"
+            )
+        else:
+            assert not pinned, (
+                f"stage {name!r} is not on a capability image yet pins "
+                f"NPA_LIGHT_WORKBENCH_TOOL={pinned!r}"
+            )
+
+
+def test_the_training_stage_is_the_one_that_needs_the_cli(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Pin the asymmetry that hid the bug, so a refactor cannot silently undo it."""
+    spec = load_spec(SPEC_PATH)
+    steps = {s.state: list(s.argv) for s in build_plan(spec, run_id="cli-shape").steps}
+
+    assert steps["train"][0] == "npa", (
+        "train no longer shells out to the npa CLI; if that changed, the "
+        "light-CLI pin may no longer be what keeps this stage working"
+    )
+    for name in ("baseline-validation", "baseline-final", "final-eval"):
+        assert steps[name][0] == "python3", (
+            f"{name} now shells out to the CLI and so depends on the "
+            "light-workbench pin too"
+        )
+
+
+def test_every_real_model_stage_pins_the_transformers_version() -> None:
+    """A stage that loads Gr00tPolicy must restore the upstream Transformers pin.
+
+    The redistributable GR00T image upgrades Transformers with `--no-deps`, so
+    the version present at runtime is newer than the 4.57.3 that GR00T commit
+    3df8b382 pins. Live job 281 ran `validate-checkpoints` without the pin and
+    died importing `gr00t.data.interfaces`:
+
+        ImportError: cannot import name 'is_offline_mode' from 'huggingface_hub'
+
+    It failed *after* training had produced all five checkpoints, which is the
+    expensive place to discover a missing dependency declaration. The pin was
+    keyed on the `workbench.groot` prefix, and `workflow.groot.*` stages that
+    run the same `_evaluate_checkpoint` path fall outside it.
+    """
+    from npa.orchestration.npa_workflow.skypilot_render import tool_pip_requirements
+
+    spec = load_spec(SPEC_PATH)
+    # Stages that build a real policy and run forward passes on a GPU.
+    real_model_states = {
+        "baseline-validation",
+        "baseline-final",
+        "train",
+        "validate-checkpoints",
+        "final-eval",
+    }
+
+    for name in sorted(real_model_states):
+        tool = spec.states[name].tool_ref
+        pinned = {spec for _probe, spec in tool_pip_requirements(tool)}
+        assert "transformers==4.57.3" in pinned, (
+            f"state {name!r} (toolRef {tool!r}) loads the real GR00T model but "
+            "does not pin transformers==4.57.3; it will import against the "
+            "image's upgraded Transformers and fail on huggingface_hub"
+        )

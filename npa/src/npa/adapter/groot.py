@@ -24,6 +24,7 @@ import json
 import re
 import shutil
 import subprocess
+from collections.abc import Mapping
 from pathlib import Path
 from typing import Any
 
@@ -53,6 +54,10 @@ AUDIT_TIMEBASE_TOLERANCE = 0.25
 AUDIT_LENGTH_SPREAD = 2
 #: The conditions :func:`audit_dataset` raises on. Reaching its report means
 #: every one of them held, so they are listed rather than evaluated.
+#: Frame-count slack between a video and its declared episode length. Re-encoding
+#: can legitimately round by a frame; it cannot lose a third of the episode.
+AUDIT_FRAME_COUNT_SLACK = 1
+
 AUDIT_FATAL_CHECKS = (
     "every episode has a data file",
     "declared episode length matches its data file",
@@ -272,6 +277,9 @@ def audit_dataset(dataset_dir: Path) -> dict[str, Any]:
     # Only the byte total varies per camera: a camera missing video for any
     # episode raises below, so every camera covers every episode.
     camera_bytes = dict.fromkeys(camera_keys, 0)
+    #: Cameras whose video was actually opened, so the report can say whether
+    #: the geometry check ran or ffprobe was simply unavailable.
+    probed_cameras: set[str] = set()
     # The audit reads two flat vectors and the timebase; the remaining columns
     # (indices, task ids, and any synthetic modality columns) are dead weight.
     wanted = (*AUDIT_VECTOR_KEYS, "timestamp")
@@ -334,6 +342,38 @@ def audit_dataset(dataset_dir: Path) -> dict[str, Any]:
                     f"video bytes at {video}"
                 )
             camera_bytes[camera_key] += size
+            # Open the file. `info.json` declaring 96x96 at 10fps while the
+            # stored video is 1280x720 at 24fps passes every metadata-only
+            # check and silently puts the action timebase off by 2.4x.
+            geometry = _probe_video_geometry(video)
+            if geometry is not None:
+                probed_cameras.add(camera_key)
+                declared_w, declared_h = _audit_declared_geometry(info, camera_key)
+                actual_w, actual_h = geometry["width"], geometry["height"]
+                if declared_w and declared_h and (declared_w, declared_h) != (
+                    actual_w,
+                    actual_h,
+                ):
+                    raise GR00TAdapterError(
+                        f"Episode {episode_index} camera {camera_key!r} video is "
+                        f"{actual_w}x{actual_h} but metadata declares "
+                        f"{declared_w}x{declared_h}: {video}"
+                    )
+                actual_frames = int(geometry["frames"] or 0)
+                if actual_frames and abs(actual_frames - rows) > AUDIT_FRAME_COUNT_SLACK:
+                    raise GR00TAdapterError(
+                        f"Episode {episode_index} camera {camera_key!r} video has "
+                        f"{actual_frames} frames but the episode declares {rows}; "
+                        "actions cannot be aligned to frames that do not exist"
+                    )
+                actual_fps = float(geometry["fps"] or 0.0)
+                if actual_fps and abs(actual_fps - fps) > AUDIT_TIMEBASE_TOLERANCE:
+                    raise GR00TAdapterError(
+                        f"Episode {episode_index} camera {camera_key!r} video runs at "
+                        f"{actual_fps:g}fps but the dataset declares {fps:g}fps; the "
+                        "action timebase for this episode would be wrong by "
+                        f"{actual_fps / fps:.2f}x"
+                    )
 
         episodes.append(
             {
@@ -395,6 +435,15 @@ def audit_dataset(dataset_dir: Path) -> dict[str, Any]:
         for task in _read_groot_task_rows(dataset_dir)
         if str(task.get("task", ""))
     ]
+    language_annotation = _declared_language_annotation(dataset_dir)
+    if language_annotation and not tasks:
+        raise GR00TAdapterError(
+            f"Dataset declares the language annotation {language_annotation!r} in "
+            "meta/modality.json but meta/tasks.jsonl carries no task text. GR00T "
+            "would resolve every frame's instruction to an empty string and train "
+            "a language-conditioned policy that never sees its task, which still "
+            "reports a falling loss and a meaningless improvement number."
+        )
     report = {
         "schema": DATASET_AUDIT_SCHEMA,
         "status": "audited",
@@ -431,10 +480,37 @@ def audit_dataset(dataset_dir: Path) -> dict[str, Any]:
             {
                 "name": "every declared camera has episode video bytes",
                 "status": "passed" if camera_keys else "skipped",
-            }
+            },
+            {
+                "name": "declared language annotation has task text",
+                "status": "passed" if language_annotation else "skipped",
+            },
+            {
+                "name": "camera video geometry matches metadata",
+                "status": "passed" if probed_cameras else "skipped",
+            },
         ],
     }
     return report
+
+
+def _declared_language_annotation(dataset_dir: Path) -> str:
+    """Return the annotation key GR00T resolves to a language instruction.
+
+    `meta/modality.json` may map an annotation such as
+    ``human.task_description`` onto ``task_index``, which GR00T then resolves
+    through ``meta/tasks.jsonl``. When that mapping exists the task text is a
+    training input, not documentation, so the audit has to check it is there.
+    Returns "" when the dataset declares no language annotation.
+    """
+
+    modality_path = dataset_dir / "meta" / "modality.json"
+    if not modality_path.is_file():
+        return ""
+    annotation = _load_json(modality_path).get("annotation") or {}
+    if not isinstance(annotation, Mapping):
+        return ""
+    return next((str(key) for key in annotation if str(key)), "")
 
 
 def _flat_float64(column: Any) -> Any:
@@ -548,10 +624,90 @@ def _audit_timebase(
     }
 
 
-def _audit_resolution(info: dict[str, Any], camera_key: str) -> str:
+def _probe_video_geometry(path: Path) -> dict[str, Any] | None:
+    """Return the video's real width, height, fps and frame count.
+
+    `info.json` is metadata, not evidence: a dataset can declare 96x96 at 10fps
+    and store 1280x720 at 24fps. Cosmos-augmented episodes did exactly that
+    (run cosmos-check-20260909T173508Z), which puts the action timebase off by
+    2.4x for those episodes while every metadata-only check still passes.
+
+    Counts packets rather than decoding frames, so probing a 50-episode
+    two-camera dataset stays cheap. Returns None when ffprobe is unavailable,
+    so the audit degrades to "skipped" rather than failing a usable dataset.
+    """
+
+    ffprobe = shutil.which("ffprobe")
+    if ffprobe is None:
+        return None
+    command = [
+        ffprobe,
+        "-v",
+        "error",
+        "-select_streams",
+        "v:0",
+        "-count_packets",
+        "-show_entries",
+        "stream=width,height,r_frame_rate,nb_frames,nb_read_packets",
+        "-of",
+        "json",
+        str(path),
+    ]
+    try:
+        completed = subprocess.run(command, check=True, capture_output=True, text=True)
+        # A stubbed or unusual runner can return something without stdout; an
+        # unprobeable video degrades the check to "skipped", it never crashes
+        # an otherwise valid audit.
+        stdout = getattr(completed, "stdout", None)
+        if not stdout:
+            return None
+        streams = (json.loads(stdout) or {}).get("streams") or []
+    except (
+        subprocess.CalledProcessError,
+        json.JSONDecodeError,
+        OSError,
+        TypeError,
+        ValueError,
+    ):
+        return None
+    if not streams:
+        return None
+    stream = streams[0]
+    frames = 0
+    for key in ("nb_frames", "nb_read_packets"):
+        try:
+            frames = int(stream.get(key) or 0)
+        except (TypeError, ValueError):
+            frames = 0
+        if frames:
+            break
+    rate = str(stream.get("r_frame_rate") or "0/1")
+    try:
+        numerator, _, denominator = rate.partition("/")
+        fps = float(numerator) / float(denominator or 1)
+    except (TypeError, ValueError, ZeroDivisionError):
+        fps = 0.0
+    return {
+        "width": int(stream.get("width") or 0),
+        "height": int(stream.get("height") or 0),
+        "fps": fps,
+        "frames": frames,
+    }
+
+
+def _audit_declared_geometry(info: dict[str, Any], camera_key: str) -> tuple[int, int]:
+    """Return the (width, height) `info.json` declares for a camera."""
+
     shape = ((info.get("features") or {}).get(camera_key) or {}).get("shape") or []
     if len(shape) >= 2:
-        return f"{int(shape[1])}x{int(shape[0])}"
+        return int(shape[1]), int(shape[0])
+    return 0, 0
+
+
+def _audit_resolution(info: dict[str, Any], camera_key: str) -> str:
+    width, height = _audit_declared_geometry(info, camera_key)
+    if width and height:
+        return f"{width}x{height}"
     return "unknown"
 
 
@@ -643,13 +799,32 @@ def _read_lerobot_episode_rows(input_dir: Path) -> list[dict[str, Any]]:
     return rows
 
 
+def _task_text(row: dict[str, Any]) -> str:
+    """Return the task string from a `tasks.parquet` row.
+
+    LeRobot v3 writes the task text as the *pandas index* of
+    `meta/tasks.parquet`, so it arrives as `__index_level_0__` rather than a
+    `task` column. Reading only `task` silently yielded "" for every v3
+    dataset, which then propagated into the converted `meta/tasks.jsonl` and
+    left the dataset audit reporting no tasks at all. Fall back to the lone
+    remaining string column so the text survives conversion.
+    """
+    direct = row.get("task")
+    if direct not in (None, ""):
+        return str(direct)
+    for key, value in row.items():
+        if key != "task_index" and isinstance(value, str) and value:
+            return value
+    return ""
+
+
 def _read_lerobot_task_rows(input_dir: Path) -> list[dict[str, Any]]:
     jsonl_rows = _read_jsonl(input_dir / "meta" / "tasks.jsonl")
     if jsonl_rows:
         return jsonl_rows
     rows = _table_rows(input_dir / "meta" / "tasks.parquet")
     return [
-        {"task_index": int(row.get("task_index", idx)), "task": str(row.get("task", ""))}
+        {"task_index": int(row.get("task_index", idx)), "task": _task_text(row)}
         for idx, row in enumerate(rows)
     ]
 
