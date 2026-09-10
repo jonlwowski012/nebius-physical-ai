@@ -2544,6 +2544,82 @@ TOOL_CATALOG: dict[str, ToolEntry] = {
             "--curation-report-uri",
         ),
     ),
+    "workbench.groot_augment.generate": ToolEntry(
+        name="workbench.groot_augment.generate",
+        access_capabilities=("cosmos3",),
+        description=(
+            "Generate full-length Cosmos-augmented episode variants for every "
+            "train episode and camera, sliding a window of fixed-length Cosmos "
+            "generations across each episode and stitching them back together "
+            "(Cosmos emits a clip shorter than most episodes, not a full one). "
+            "Named outside the workbench.groot family and invoked as a module "
+            "(not `npa workbench groot ...`) because it needs the Cosmos3 "
+            "runtime image, not the GR00T one -- a shared "
+            "`--image-override workbench.groot=...` must not sweep it in."
+        ),
+        argv_template=[
+            "python3",
+            "-m",
+            "npa.workflows.groot_augment",
+            "generate",
+            "--dataset-uri",
+            "{{config.train_data_uri}}",
+            "--output-uri",
+            "{{config.augment_variants_uri}}",
+            "--manifest-uri",
+            "{{config.augment_generation_manifest_uri}}",
+            "--cameras",
+            "{{config.augment_cameras}}",
+            "--episode-indices",
+            "{{config.augment_episode_indices}}",
+            "--augmentation-count",
+            "{{config.augmentation_count}}",
+            "--window-frames",
+            "{{config.cosmos3_num_frames}}",
+            "--overlap-frames",
+            "{{config.augment_overlap_frames}}",
+            "--prompt",
+            "{{config.prompt}}",
+            "--checkpoint",
+            "{{config.cosmos3_checkpoint}}",
+            "--guidance",
+            "{{config.cosmos3_guidance}}",
+            "--num-steps",
+            "{{config.cosmos3_steps}}",
+            "--mode",
+            "{{config.cosmos3_mode}}",
+            "--run-id",
+            "{{run.id}}",
+        ],
+    ),
+    "workflow.groot_augment.materialize": ToolEntry(
+        name="workflow.groot_augment.materialize",
+        description=(
+            "Merge only the Cosmos variants that passed the evaluator gate into "
+            "the train split, as synthetic episodes that copy their source "
+            "episode's action rows verbatim. Needs only pyarrow and (when a "
+            "variant's geometry must be conformed) ffmpeg, not the GR00T model "
+            "stack, so it runs on the default CPU image."
+        ),
+        argv_template=[
+            "python3",
+            "-m",
+            "npa.workflows.groot_augment",
+            "materialize",
+            "--dataset-uri",
+            "{{config.train_data_uri}}",
+            "--variants-uri",
+            "{{config.augment_variants_uri}}",
+            "--evaluation-report-uri",
+            "{{config.augment_evaluation_report_uri}}",
+            "--generation-manifest-uri",
+            "{{config.augment_generation_manifest_uri}}",
+            "--output-uri",
+            "{{config.train_data_uri}}",
+            "--manifest-uri",
+            "{{config.augment_materialization_uri}}",
+        ],
+    ),
     "workbench.groot.baseline_eval": ToolEntry(
         name="workbench.groot.baseline_eval",
         access_capabilities=("groot",),

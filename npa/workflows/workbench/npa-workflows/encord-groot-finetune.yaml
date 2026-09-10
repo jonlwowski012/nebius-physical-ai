@@ -79,6 +79,60 @@ config:
   encord_source: collection
   encord_source_id: "{{config.encord_collection}}"
 
+  # --- Augmenting the train split with Cosmos (optional) --------------------
+  # Empty by default: the pipeline is byte-for-byte the plain fine-tune above
+  # unless you set this. "cosmos3" is the only backend implemented so far.
+  # Cosmos emits a fixed-length clip regardless of an episode's real length,
+  # so `augment` slides a window of `cosmos3_num_frames` across each episode
+  # with `augment_overlap_frames` of overlap and stitches the results back
+  # into one full-length synthetic episode per (episode, camera, variant).
+  augment_backend: ""
+  augment_cameras: ""
+  # Defaults to every train episode when left empty; set explicitly to
+  # augment a subset (cheaper first runs, or a held-back validation set).
+  augment_episode_indices: ""
+  augmentation_count: "1"
+  cosmos3_checkpoint: Cosmos3-Nano
+  cosmos3_mode: video2video
+  cosmos3_num_frames: "61"
+  cosmos3_steps: "24"
+  cosmos3_guidance: "5.0"
+  augment_overlap_frames: "8"
+  prompt: >-
+    Preserve the robot motion and camera geometry while creating a physically
+    plausible visual variant.
+  # A separate GPU pool from training's gpu_type/gpu_count; defaults to the
+  # same one.
+  augment_gpu_type: "{{config.gpu_type}}"
+  augment_gpu_count: "{{config.gpu_count}}"
+  augment_variants_uri: "s3://{{config.bucket}}/encord-groot-finetune/{{run.id}}/augment/variants/"
+  augment_generation_manifest_uri: "s3://{{config.bucket}}/encord-groot-finetune/{{run.id}}/reports/augmentation-generation.json"
+  augment_evaluation_report_uri: "s3://{{config.bucket}}/encord-groot-finetune/{{run.id}}/reports/augmentation-report.json"
+  augment_materialization_uri: "s3://{{config.bucket}}/encord-groot-finetune/{{run.id}}/reports/augmentation-materialization.json"
+  # Cosmos Evaluator gate thresholds (hallucination / temporal / appearance);
+  # advisory mode records a score without failing the run on it. Values below
+  # match the proven defaults in paidf-cosmos3.yaml, the other spec that
+  # drives this same toolRef in production.
+  augment_grade_threshold: "0.5"
+  augment_temporal_threshold: "0.6"
+  augment_temporal_mode: advisory
+  augment_appearance_threshold: "0.6"
+  augment_appearance_mode: advisory
+  augment_evaluator_input_uri: ""
+  augment_evaluator_configs_uri: ""
+  augment_temporal_regions_json: ""
+  augment_temporal_noise_floor: "0.25"
+  augment_temporal_blur_ksize: "7"
+  augment_appearance_regions_json: ""
+  augment_appearance_luminance_tolerance: "18.0"
+  augment_appearance_global_chroma_tolerance: "8.0"
+  augment_appearance_local_chroma_tolerance: "6.0"
+  augment_appearance_chroma_instability_tolerance: "4.0"
+  augment_appearance_blur_ksize: "7"
+  augment_appearance_max_dimension: "256"
+  augment_caption_model: "Qwen/Qwen2.5-VL-72B-Instruct"
+  augment_attribute_sample_policy: ranking
+
   # --- Training ------------------------------------------------------------
   gpu_type: H100
   gpu_count: "1"
@@ -171,6 +225,14 @@ resources:
     accelerators: "{{config.gpu_type}}:{{config.gpu_count}}"
     cpus: 12
     memory: 64Gi
+  augment_gpu:
+    # A separate pool from training's `gpu` profile, because Cosmos generation
+    # and GR00T fine-tuning have different accelerator needs and a customer may
+    # want them on different node types. Defaults to the same pool as training.
+    cloud: kubernetes
+    accelerators: "{{config.augment_gpu_type}}:{{config.augment_gpu_count}}"
+    cpus: 12
+    memory: 64Gi
 
 initial: prepare-dataset
 
@@ -255,6 +317,79 @@ states:
       - {uri: "{{config.train_data_uri}}", schema: nvidia.groot.lerobot.v2.train-split}
       - {uri: "{{config.heldout_data_uri}}", schema: nvidia.groot.lerobot.v2.heldout-split}
       - {uri: "{{config.split_manifest_uri}}", schema: npa.groot.episode_split.v1}
+    transitions:
+      # Empty by default, so a customer who never touches augment_backend gets
+      # exactly the plain pipeline below -- this branch is never planned, so
+      # its Cosmos images and GPU pool are never required. Split runs first:
+      # only train-cohort episodes are ever augmented, so the leakage the
+      # held-out and final cohorts must stay free of is structural, not an
+      # assertion the augmentation code has to remember to make.
+      - if: config.augment_backend
+        goto: augment
+      - goto: preflight
+
+  augment:
+    description: >
+      Generate full-length Cosmos-augmented variants of every train episode
+      and camera. Cosmos emits a fixed-length clip regardless of an episode's
+      real length, so this slides a window across each episode and stitches
+      the results back together rather than truncating every episode to one
+      short clip.
+    toolRef: workbench.groot_augment.generate
+    resources: augment_gpu
+    inputs: [{uri: "{{config.train_data_uri}}", schema: nvidia.groot.lerobot.v2.train-split}]
+    outputs:
+      - {uri: "{{config.augment_variants_uri}}", schema: npa.groot_augment.variants.v1}
+      - {uri: "{{config.augment_generation_manifest_uri}}", schema: npa.groot_augment.generation.v1}
+    next: evaluate-augmented
+
+  evaluate-augmented:
+    description: >
+      Grade every generated variant with the real Cosmos Evaluator
+      (hallucination + attribute verification) plus temporal-consistency and
+      appearance-fidelity checks; a variant that fails is excluded, not
+      silently kept.
+    toolRef: workbench.cosmos_evaluator.evaluate
+    resources: cpu
+    params:
+      rollouts_uri: "{{config.augment_variants_uri}}"
+      scores_uri: "{{config.augment_evaluation_report_uri}}"
+      input_uri: "{{config.augment_evaluator_input_uri}}"
+      configs_uri: "{{config.augment_evaluator_configs_uri}}"
+      grade_threshold: "{{config.augment_grade_threshold}}"
+      temporal_consistency_threshold: "{{config.augment_temporal_threshold}}"
+      temporal_regions_json: "{{config.augment_temporal_regions_json}}"
+      temporal_consistency_mode: "{{config.augment_temporal_mode}}"
+      temporal_noise_floor: "{{config.augment_temporal_noise_floor}}"
+      temporal_blur_ksize: "{{config.augment_temporal_blur_ksize}}"
+      appearance_fidelity_threshold: "{{config.augment_appearance_threshold}}"
+      appearance_regions_json: "{{config.augment_appearance_regions_json}}"
+      appearance_fidelity_mode: "{{config.augment_appearance_mode}}"
+      appearance_luminance_tolerance: "{{config.augment_appearance_luminance_tolerance}}"
+      appearance_global_chroma_tolerance: "{{config.augment_appearance_global_chroma_tolerance}}"
+      appearance_local_chroma_tolerance: "{{config.augment_appearance_local_chroma_tolerance}}"
+      appearance_chroma_instability_tolerance: "{{config.augment_appearance_chroma_instability_tolerance}}"
+      appearance_blur_ksize: "{{config.augment_appearance_blur_ksize}}"
+      appearance_max_dimension: "{{config.augment_appearance_max_dimension}}"
+      caption_model: "{{config.augment_caption_model}}"
+      attribute_sample_policy: "{{config.augment_attribute_sample_policy}}"
+    inputs: [{uri: "{{config.augment_variants_uri}}", schema: npa.groot_augment.variants.v1}]
+    outputs: [{uri: "{{config.augment_evaluation_report_uri}}", schema: npa.cosmos_evaluator.report.v1}]
+    next: materialize-augmented
+
+  materialize-augmented:
+    description: >
+      Merge only gate-passing variants into the train split, in place, as
+      synthetic episodes that copy their source episode's action rows
+      verbatim -- Cosmos changes pixels, never actions.
+    toolRef: workflow.groot_augment.materialize
+    resources: cpu
+    inputs:
+      - {uri: "{{config.augment_evaluation_report_uri}}", schema: npa.cosmos_evaluator.report.v1}
+      - {uri: "{{config.augment_generation_manifest_uri}}", schema: npa.groot_augment.generation.v1}
+    outputs:
+      - {uri: "{{config.train_data_uri}}", schema: nvidia.groot.lerobot.v2.train-split}
+      - {uri: "{{config.augment_materialization_uri}}", schema: npa.groot_augment.materialization.v1}
     next: preflight
 
   preflight:

@@ -40,6 +40,11 @@ TOOL_REF_IMAGE_TOOL: dict[str, str] = {
     "workbench.cosmos3.generate_variants": "cosmos3",
     "workbench.cosmos3.prepare_video_input": "cosmos3",
     "workbench.cosmos3.checkpoint_eval": "cosmos3",
+    # Deliberately named outside workbench.groot: it calls Cosmos3 generation
+    # directly and needs that runtime image, so a customer's routine
+    # `--image-override workbench.groot=...` (for the GR00T stages) must not
+    # sweep it in by prefix match.
+    "workbench.groot_augment.generate": "cosmos3",
     # The image's command-forwarding entrypoint runs only the CPU/S3 client for
     # this toolRef; it does not start or reload the resident service model.
     "workbench.cosmos3.ray_batch": "cosmos3-ray-serve",

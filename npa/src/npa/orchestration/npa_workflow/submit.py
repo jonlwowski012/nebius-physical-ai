@@ -86,7 +86,14 @@ def _resolve_assume_decision(spec: NpaWorkflowSpec, assume_decision: str) -> str
 
 
 def _spec_needs_assume_decision(spec: NpaWorkflowSpec) -> bool:
-    return any(state.transitions for state in spec.states.values())
+    # A transition gated only by `if:` (config_truthy) is fully resolved from
+    # --var overrides already merged into `spec` above, at render time -- no
+    # runtime decision is involved. Only a `when:` predicate depends on a
+    # decide-state's actual output, which --runtime cannot know ahead of a
+    # real run and --assume-decision exists to stand in for.
+    return any(
+        tr.when for state in spec.states.values() for tr in state.transitions
+    )
 
 
 def prepare_npa_workflow_for_submit(

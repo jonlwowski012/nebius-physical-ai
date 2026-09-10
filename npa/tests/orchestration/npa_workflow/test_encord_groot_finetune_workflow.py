@@ -26,6 +26,12 @@ SPEC_PATH = (
     REPO_ROOT / "npa/workflows/workbench/npa-workflows/encord-groot-finetune.yaml"
 )
 
+# Every state the YAML declares, in source order. Three of them (augment,
+# evaluate-augmented, materialize-augmented) are conditionally *planned* --
+# only when augment_backend is set -- but they are unconditionally *declared*,
+# so this is the dict-order a plain `load_spec` sees.
+AUGMENT_ONLY_STATES = {"augment", "evaluate-augmented", "materialize-augmented"}
+
 STATES = [
     "prepare-dataset",
     "push",
@@ -33,6 +39,9 @@ STATES = [
     "pull",
     "verify",
     "prepare-split",
+    "augment",
+    "evaluate-augmented",
+    "materialize-augmented",
     "preflight",
     "baseline-validation",
     "baseline-final",
@@ -45,6 +54,11 @@ STATES = [
     "emit-mcap",
     "publish",
 ]
+
+# What actually gets planned and rendered with augment_backend left at its
+# empty default -- the byte-for-byte plain pipeline every other test in this
+# file renders against.
+PLANNED_STATES_DEFAULT = [name for name in STATES if name not in AUGMENT_ONLY_STATES]
 
 
 def _rendered(run_id: str, monkeypatch: pytest.MonkeyPatch) -> dict[str, dict]:
@@ -66,7 +80,7 @@ def _rendered(run_id: str, monkeypatch: pytest.MonkeyPatch) -> dict[str, dict]:
             for doc in yaml.safe_load_all(prepared.skypilot_yaml_path.read_text())
             if doc
         ]
-        assert len(documents) == len(STATES) + 1
+        assert len(documents) == len(PLANNED_STATES_DEFAULT) + 1
         return {stage["name"]: stage for stage in documents[1:]}
     finally:
         prepared.temp_dir.cleanup()
@@ -145,6 +159,63 @@ def test_training_is_curated_and_tracked(monkeypatch: pytest.MonkeyPatch) -> Non
     assert "/reports/selected-checkpoint.json" in resolve
 
 
+def test_augment_branch_is_skipped_by_default(monkeypatch: pytest.MonkeyPatch) -> None:
+    """augment_backend empty renders byte-for-byte the plain 17-stage pipeline.
+
+    The augment/evaluate-augmented/materialize-augmented states are declared
+    in the YAML unconditionally, but prepare-split's `if: config.augment_backend`
+    transition means they are never *planned* -- and never rendered -- unless a
+    customer sets augment_backend, so no Cosmos image is ever required by
+    default.
+    """
+    by_name = _rendered("encord-groot-no-augment", monkeypatch)
+    assert set(by_name) == set(PLANNED_STATES_DEFAULT)
+    assert AUGMENT_ONLY_STATES.isdisjoint(by_name)
+
+
+def test_augment_branch_renders_between_split_and_preflight(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Setting augment_backend inserts the augmentation branch, still gated."""
+    registry = "cr.ci.invalid/workbench"
+    monkeypatch.setenv("NPA_REGISTRY", registry)
+    monkeypatch.setenv("NPA_PUBLIC_REGISTRY", "ghcr.io/nebius/nebius-physical-ai")
+    monkeypatch.setenv("NPA_SRC_S3_URI", "s3://example-bucket/source/npa")
+    prepared = prepare_npa_workflow_for_submit(
+        SPEC_PATH,
+        run_id="encord-groot-with-augment",
+        assume_decision="promote_checkpoint",
+        config_overrides={"bucket": "test-bucket", "augment_backend": "cosmos3"},
+        render_options=SkypilotRenderOptions(
+            registry=registry, materialize_registry_secrets=False
+        ),
+    )
+    try:
+        documents = [
+            doc
+            for doc in yaml.safe_load_all(prepared.skypilot_yaml_path.read_text())
+            if doc
+        ]
+        by_name = {stage["name"]: stage for stage in documents[1:]}
+    finally:
+        prepared.temp_dir.cleanup()
+    assert set(by_name) == set(STATES)
+    order = [stage["name"] for stage in documents[1:]]
+    split_index = order.index("prepare-split")
+    preflight_index = order.index("preflight")
+    assert order[split_index + 1 : preflight_index] == [
+        "augment",
+        "evaluate-augmented",
+        "materialize-augmented",
+    ]
+    # The generation stage needs the Cosmos3 runtime, not the GR00T image, and
+    # must resolve there even without a dedicated --image-override, because a
+    # customer's routine `workbench.groot=...` override for the training
+    # stages must not sweep it in by name-prefix match.
+    assert "cosmos3" in by_name["augment"]["resources"]["image_id"]
+    assert "H100:1" == by_name["augment"]["resources"].get("accelerators")
+
+
 def test_gpu_stages_are_the_expensive_ones_only(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
@@ -210,7 +281,7 @@ def test_spec_plans_across_gpu_counts(gpu_count: int) -> None:
     plan = build_plan(spec, run_id=run_id)
     scheduler = build_scheduler_plan(spec, plan.steps, run_id=run_id)
 
-    assert [task["name"] for task in scheduler["tasks"]] == STATES
+    assert [task["name"] for task in scheduler["tasks"]] == PLANNED_STATES_DEFAULT
     train = next(t for t in scheduler["tasks"] if t["name"] == "train")
     assert train["resources"]["accelerators"] == f"H100:{gpu_count}"
 
@@ -227,7 +298,7 @@ def test_manual_curation_variant_still_plans() -> None:
         spec, build_plan(spec, run_id=run_id).steps, run_id=run_id
     )
 
-    assert [task["name"] for task in scheduler["tasks"]] == STATES
+    assert [task["name"] for task in scheduler["tasks"]] == PLANNED_STATES_DEFAULT
 
 
 def test_spec_is_registered_for_live_submission() -> None:
