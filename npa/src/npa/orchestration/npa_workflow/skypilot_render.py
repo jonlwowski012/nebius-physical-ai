@@ -255,11 +255,24 @@ def render_vendor_interpreter_setup(candidates: Sequence[str]) -> str:
         install_block += (
             f"    if ! \"$npa_vendor_python\" -c 'import npa.workbench' >/dev/null 2>&1; then\n"
             f'      echo "installing npa into $npa_vendor_python {why}" >&2\n'
-            f'      "$npa_vendor_python" -m pip install -q {flags}-e "$npa_vendor_src" \\\n'
-            f'        || "$npa_vendor_python" -m pip install -q {flags}-e "$npa_vendor_src" '
+            # uv-created vendor environments deliberately need not contain pip (the
+            # same reason npa_pip_install has this fallback for the default
+            # interpreter) -- GR00T's Isaac-GR00T venv is one. Without it, every
+            # `pip install` attempt below fails with "No module named pip", the
+            # loop swallows it with `|| true`, and the stage silently keeps
+            # running whatever npa a vendor image happened to bake in at build
+            # time -- `import npa.workbench` can pass against that stale copy
+            # while a newer submodule the stage actually needs (live: baseline-eval
+            # needing npa.workflows.groot_learning) is missing from it.
+            f'      if "$npa_vendor_python" -m pip --version >/dev/null 2>&1; then\n'
+            f'        "$npa_vendor_python" -m pip install -q {flags}-e "$npa_vendor_src" \\\n'
+            f'          || "$npa_vendor_python" -m pip install -q {flags}-e "$npa_vendor_src" '
             "--break-system-packages \\\n"
-            f'        || "$npa_vendor_python" -m pip install -q {flags}-e "$npa_vendor_src" '
+            f'          || "$npa_vendor_python" -m pip install -q {flags}-e "$npa_vendor_src" '
             "--user || true\n"
+            '      elif command -v uv >/dev/null 2>&1; then\n'
+            f'        uv pip install -q --python "$npa_vendor_python" {flags}-e "$npa_vendor_src" || true\n'
+            "      fi\n"
             "    fi\n"
         )
     return (
@@ -1649,6 +1662,18 @@ def render_setup_for_tool(
             "  exit 1\n"
             "fi\n"
         )
+    if tool_ref.startswith("workbench.vlm_eval"):
+        # Video rollouts (e.g. the GR00T offline held-out comparison MP4) are
+        # sampled with ffmpeg (npa.workbench.vlm_eval._frames_from_videos), and
+        # the api/stub backends run on SkyPilot's default image, which ships none.
+        parts.append(
+            "if ! command -v ffmpeg >/dev/null 2>&1; then\n"
+            "  export DEBIAN_FRONTEND=noninteractive\n"
+            "  (apt-get update -qq && apt-get install -y -qq --no-install-recommends ffmpeg) "
+            "|| (sudo -n apt-get update -qq && sudo -n apt-get install -y -qq "
+            "--no-install-recommends ffmpeg) || true\n"
+            "fi\n"
+        )
     if tool_ref.startswith("workbench.nurec"):
         # These stages run inside NVIDIA's NRE container -- a VENDOR image, so it
         # carries none of the tool's runtime dependencies: no Hugging Face CLI
@@ -2074,6 +2099,16 @@ def build_skypilot_task_doc(
         ):
             envs["NPA_SRC_OVERLAY"] = "1"
             doc["envs"] = envs
+    # The GR00T image starts the dependency-minimal workbench CLI
+    # (NPA_SKIP_EAGER_IMPORTS=1), which only registers the ``groot`` group when
+    # NPA_LIGHT_WORKBENCH_TOOL=groot. Images built before the Dockerfile pinned
+    # that variable (e.g. npa-groot:0.1.0-k8s-prereqs) otherwise fall back to the
+    # historical Cosmos2 surface and fail with "No such command 'groot'" (live
+    # job 153). The renderer knows the step's tool, so pin it here; an operator
+    # value already in the task envs wins.
+    if tool_image_key(str(scheduler_task.get("tool_ref") or "")) == "groot":
+        envs.setdefault("NPA_LIGHT_WORKBENCH_TOOL", "groot")
+        doc["envs"] = envs
     _inject_operator_registry_docker_secrets(
         doc,
         materialize=options.materialize_registry_secrets,

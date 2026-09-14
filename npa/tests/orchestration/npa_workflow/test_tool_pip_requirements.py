@@ -250,6 +250,36 @@ def test_vendor_setup_installs_npa_there_and_records_it() -> None:
     assert "${" not in setup
 
 
+def test_vendor_interpreter_install_falls_back_to_uv_without_pip() -> None:
+    """A uv-created vendor venv can genuinely lack pip -- GR00T's is one.
+
+    Without this fallback every `pip install` attempt fails with "No module
+    named pip", the failure is swallowed by `|| true`, and the stage silently
+    runs whatever npa a vendor image happened to bake in at build time: the
+    probe's `import npa.workbench` can pass against that stale copy while a
+    submodule the stage actually needs (baseline-eval's own
+    npa.workflows.groot_learning) is missing from it. Mirrors the fallback
+    npa_pip_install already has for the default interpreter.
+    """
+
+    from npa.orchestration.npa_workflow.skypilot_render import (
+        render_vendor_interpreter_setup,
+        tool_vendor_interpreters,
+    )
+
+    setup = render_vendor_interpreter_setup(
+        tool_vendor_interpreters("workbench.groot.baseline_eval")
+    )
+
+    assert 'if "$npa_vendor_python" -m pip --version >/dev/null 2>&1; then' in setup
+    assert setup.count('elif command -v uv >/dev/null 2>&1; then') == 2
+    uv_no_deps = setup.index('uv pip install -q --python "$npa_vendor_python" --no-deps -e')
+    uv_with_deps = setup.index('uv pip install -q --python "$npa_vendor_python" -e')
+    assert uv_no_deps < uv_with_deps
+    # The pip attempts are still tried first -- uv is a fallback, not a replacement.
+    assert setup.index('-m pip install -q --no-deps -e') < uv_no_deps
+
+
 def test_default_setup_records_thin_image_source_for_vendor_interpreter() -> None:
     """A baked CLI must not hide the source needed by the fetched Isaac interpreter."""
 
