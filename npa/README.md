@@ -302,6 +302,13 @@ while superseded commits of the same PR still cancel their old checks.
 Full-suite PRs run smoke coverage inside the existing shards, guardrails run in
 parallel, and unsuccessful or cancelled shards no longer queue a coverage job.
 
+Application and CI dependency scans reject known vulnerabilities even when the
+same pin is already on `main`. Keep the AnyIO security floor at 4.14.2 or newer;
+update `npa/requirements-lock.txt` and regenerate CI pins when changing package
+requirements. `.github/dependabot.yml` schedules daily update proposals for
+Python, browser-test npm, and GitHub Actions dependencies. Reproduce the scan
+with the [security gate instructions](../docs/security/merge-security-gate.md#reproduce-locally).
+
 The required [security check](../docs/security/merge-security-gate.md) is the
 single automatic candidate workflow. It runs secrets, confidentiality, source,
 runtime, lint, guardrail, and test gates, and calls an always-reporting image
