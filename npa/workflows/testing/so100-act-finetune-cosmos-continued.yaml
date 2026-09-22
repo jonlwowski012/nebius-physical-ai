@@ -1,0 +1,112 @@
+apiVersion: npa.workflow/v0.0.1
+kind: Workflow
+
+metadata:
+  name: so100-act-finetune-cosmos-continued
+  description: >
+    Sequential curriculum: fine-tune ACT on the real SO-100 dataset, then
+    continue training the same checkpoint on the Cosmos-augmented dataset
+    produced by so100-cosmos-augment.yaml. Submit only after
+    so100-act-finetune.yaml has shown the real-data fine-tune works --
+    that check is a human judgment call, not automated in this spec.
+
+config:
+  bucket: example-bucket
+  prefix: "runs/{{run.id}}/so100-act-finetune-cosmos-continued"
+  lerobot_dataset: lerobot/svla_so100_pickplace
+  # workbench.lerobot.policy_train's own default revision is a commit SHA
+  # frozen for a different dataset; this repo's history has since moved past
+  # it, so pin to the live default branch instead.
+  dataset_revision: main
+  policy_type: act
+  train_steps: "20000"
+  # lerobot-train zero-pads its checkpoint dir name to 6 digits from the
+  # exact step count train-on-real ran to; keep this in lockstep with
+  # train_steps above if that ever changes.
+  real_checkpoint_step: "020000"
+  # lerobot-train's resume loop is `for _ in range(step, cfg.steps)`, where
+  # `step` is the loaded checkpoint's own counter (20000 here) -- so this must
+  # be the ABSOLUTE target step count (train_steps + the desired additional
+  # steps), not a delta, or the loop immediately no-ops.
+  continued_steps: "28000"
+  train_batch_size: "8"
+  policy_device: cuda
+  lerobot_output_dir: /tmp/npa-lerobot-output
+  # so100-cosmos-augment.yaml's own `augmented_dataset_uri` output from its
+  # real, fully-succeeded run (job 149, run-id smoke-so100-cosmos-augment-22).
+  augmented_dataset_uri: "s3://npa-bucket-3b4a70d0/runs/smoke-so100-cosmos-augment-22/so100-cosmos-augment/augmented/dataset/"
+  artifacts_uri: "s3://{{config.bucket}}/{{config.prefix}}/artifacts/real/"
+  continued_artifacts_uri: "s3://{{config.bucket}}/{{config.prefix}}/artifacts/continued/"
+
+resources:
+  gpu:
+    cloud: kubernetes
+    accelerators: H100:1
+    cpus: 12
+    memory: 80Gi
+    # The published npa-lerobot image lacks sudo/rsync/netcat, so SkyPilot's
+    # Kubernetes ray-cluster bootstrap fails with "container not found
+    # (ray-node)" for any task using it. This is the k8s-prereqs-repaired
+    # derived tag built via scripts/build-workbench-image-in-cluster.sh.
+    image: "cr.eu-north1.nebius.cloud/e00x444s08amhatzy6/npa-lerobot:cuda13-b300-0.5.1-sm80-sm90-sm100-sm103-sm120-20260803T034152Z-sky1-pip-vpath"
+
+initial: train-on-real
+states:
+  train-on-real:
+    description: Fine-tune ACT from scratch on the real SO-100 HF dataset.
+    toolRef: workbench.lerobot.policy_train
+    resources: gpu
+    outputs:
+      - uri: "{{config.artifacts_uri}}"
+        schema: npa.lerobot.policy_train.artifacts.v1
+    next: continue-on-augmented
+  continue-on-augmented:
+    description: >
+      Sync the real-data run's whole artifact tree (checkpoint + configs)
+      into a fresh pod's local output dir, then resume training on the
+      Cosmos-augmented dataset. workbench.lerobot.policy_train's fixed argv
+      has no slot for --resume/--dataset-source, so this state calls the
+      same underlying module directly via run.shell instead of the toolRef.
+    resources: gpu
+    run:
+      shell: |
+        set -euo pipefail &&
+        mkdir -p /tmp/npa-lerobot-output &&
+        SRC_URI="{{config.artifacts_uri}}" DEST_DIR=/tmp/npa-lerobot-output python3 -c "
+        import boto3, os, pathlib
+        from urllib.parse import urlparse
+        # No aws-cli in this image (only boto3), so sync by hand: list every
+        # object under the prefix and download it to the matching local path.
+        uri = os.environ['SRC_URI']
+        parsed = urlparse(uri)
+        prefix = parsed.path.lstrip('/')
+        dest = pathlib.Path(os.environ['DEST_DIR'])
+        s3 = boto3.client('s3', endpoint_url=os.environ.get('AWS_ENDPOINT_URL') or os.environ.get('NEBIUS_S3_ENDPOINT') or None)
+        paginator = s3.get_paginator('list_objects_v2')
+        for page in paginator.paginate(Bucket=parsed.netloc, Prefix=prefix):
+            for obj in page.get('Contents', ()):
+                key = obj['Key']
+                if key.endswith('/'):
+                    continue
+                rel = key[len(prefix):].lstrip('/')
+                out = dest / rel
+                out.parent.mkdir(parents=True, exist_ok=True)
+                s3.download_file(parsed.netloc, key, str(out))
+        print('npa_sync_down_done', uri, '->', dest)
+        " &&
+        python3 -m npa.workbench.lerobot.policy_container train \
+        --dataset-repo-id {{config.lerobot_dataset}} \
+        --dataset-source {{config.augmented_dataset_uri}} \
+        --output-dir /tmp/npa-lerobot-output \
+        --resume \
+        --override config_path=/tmp/npa-lerobot-output/checkpoints/{{config.real_checkpoint_step}}/pretrained_model/train_config.json \
+        --steps {{config.continued_steps}} \
+        --policy-type {{config.policy_type}} \
+        --batch-size {{config.train_batch_size}} \
+        --device {{config.policy_device}} \
+        --checkpoint-s3-uri {{config.continued_artifacts_uri}} \
+        --artifacts-s3-uri {{config.continued_artifacts_uri}}
+    outputs:
+      - uri: "{{config.continued_artifacts_uri}}"
+        schema: npa.lerobot.policy_train.artifacts.v1
+    terminal: true

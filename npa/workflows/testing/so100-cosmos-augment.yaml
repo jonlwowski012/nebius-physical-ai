@@ -1,0 +1,280 @@
+apiVersion: npa.workflow/v0.0.1
+kind: Workflow
+
+metadata:
+  name: so100-cosmos-augment
+  description: >
+    Read the same real-world SO-100 pick-place dataset used by
+    so100-act-finetune.yaml and augment it with real Cosmos Transfer 2.5
+    inference, growing it with visually-diverse episode copies (a "more
+    thorough" dataset, not a replacement of the original episodes). Runs
+    independently of so100-act-finetune.yaml -- submit both to run in parallel.
+
+config:
+  bucket: example-bucket
+  prefix: "runs/{{run.id}}/so100-cosmos-augment"
+  lerobot_dataset: lerobot/svla_so100_pickplace
+  # Number of Cosmos-augmented episode variants to add to the dataset.
+  num_variants: "5"
+  # Operator-owned Cosmos Transfer style/appearance config bundle; see
+  # `npa workbench cosmos2 transfer --help` for its expected shape.
+  configs_uri: "s3://{{config.bucket}}/{{config.prefix}}/cosmos_configs/"
+  dataset_root_uri: "s3://{{config.bucket}}/{{config.prefix}}/dataset/source/"
+  clip_uri: "s3://{{config.bucket}}/{{config.prefix}}/input/so100_clip.mp4"
+  augment_uri: "s3://{{config.bucket}}/{{config.prefix}}/augmented/"
+  augmented_dataset_uri: "s3://{{config.bucket}}/{{config.prefix}}/augmented/dataset/"
+
+resources:
+  # cpu reuses the lerobot vendor image (rather than SkyPilot's bare default)
+  # because prepare-clip/compose-augmented-dataset need huggingface_hub,
+  # lerobot, pandas, torchvision, and boto3, all already present there -- a
+  # generic default image only has whatever `npa` itself pulls in, which is
+  # none of those. Pinned to the k8s-prereqs-repaired derived tag (built via
+  # scripts/build-workbench-image-in-cluster.sh): the published npa-lerobot
+  # image lacks sudo/rsync/netcat, so SkyPilot's Kubernetes ray-cluster
+  # bootstrap fails with "container not found (ray-node)" without it.
+  cpu:
+    cloud: kubernetes
+    cpus: 8
+    memory: 32Gi
+    image: "cr.eu-north1.nebius.cloud/e00x444s08amhatzy6/npa-lerobot:cuda13-b300-0.5.1-sm80-sm90-sm100-sm103-sm120-20260803T034152Z-sky1-pip-vpath"
+  gpu:
+    cloud: kubernetes
+    accelerators: H100:1
+    cpus: 12
+    memory: 80Gi
+
+initial: prepare-clip
+states:
+  prepare-clip:
+    description: >
+      Fetch the HF dataset locally, stage an unmodified copy to S3 (the
+      "source" the augmented copies get added to), and extract episode 0's
+      real camera clip for Cosmos Transfer to condition on.
+    resources: cpu
+    run:
+      shell: |
+        set -euo pipefail &&
+        python3 -m pip install -q -U huggingface_hub &&
+        hf download {{config.lerobot_dataset}} --type dataset --local-dir /tmp/so100 &&
+        CLIP_URI="{{config.clip_uri}}" python3 -c "
+        import boto3, os, pathlib
+        import pandas as pd
+        import torchvision
+        from urllib.parse import urlparse
+        # SO-100 is real hardware: its dataset already ships real camera footage,
+        # so Cosmos conditions on that real footage directly rather than a
+        # synthetic render (npa convert lerobot-to-mp4 assumes a Unitree G1
+        # humanoid state vector and does not apply to a 6-DOF arm). LeRobot v3
+        # datasets store one consolidated video per camera (all episodes
+        # concatenated), not one file per episode, so just take the first
+        # camera's video file found and trim it down to episode 0's own
+        # from/to timestamp range using the episode metadata -- otherwise
+        # Cosmos ends up conditioning on the whole multi-episode video. Uses
+        # torchvision (already needed to decode video elsewhere in this
+        # pipeline) instead of shelling out to an ffmpeg binary, which isn't
+        # on PATH in this image.
+        source_video = sorted(pathlib.Path('/tmp/so100/videos').rglob('*.mp4'))[0]
+        camera_key = source_video.parent.parent.name  # e.g. observation.images.top
+        episodes_meta = pd.concat(
+            [pd.read_parquet(p) for p in sorted(pathlib.Path('/tmp/so100/meta/episodes').rglob('*.parquet'))],
+            ignore_index=True,
+        )
+        ep0 = episodes_meta[episodes_meta['episode_index'] == 0].iloc[0]
+        from_ts = float(ep0[f'videos/{camera_key}/from_timestamp'])
+        to_ts = float(ep0[f'videos/{camera_key}/to_timestamp'])
+        frames, _audio, info = torchvision.io.read_video(str(source_video), start_pts=from_ts, end_pts=to_ts, pts_unit='sec')
+        trimmed = pathlib.Path('/tmp/so100_episode0_clip.mp4')
+        torchvision.io.write_video(str(trimmed), frames, fps=info['video_fps'])
+        uri = os.environ['CLIP_URI']
+        parsed = urlparse(uri)
+        s3 = boto3.client('s3', endpoint_url=os.environ.get('AWS_ENDPOINT_URL') or os.environ.get('NEBIUS_S3_ENDPOINT') or None)
+        s3.upload_file(str(trimmed), parsed.netloc, parsed.path.lstrip('/'))
+        print('npa_clip_upload_done', trimmed, from_ts, to_ts)
+        " &&
+        DATASET_ROOT_URI="{{config.dataset_root_uri}}" python3 -c "
+        import boto3, os, pathlib
+        from urllib.parse import urlparse
+        uri = os.environ['DATASET_ROOT_URI']
+        parsed = urlparse(uri)
+        prefix = parsed.path.strip('/')
+        prefix = prefix + '/' if prefix else ''
+        s3 = boto3.client('s3', endpoint_url=os.environ.get('AWS_ENDPOINT_URL') or os.environ.get('NEBIUS_S3_ENDPOINT') or None)
+        base = pathlib.Path('/tmp/so100')
+        for f in base.rglob('*'):
+            if f.is_file():
+                s3.upload_file(str(f), parsed.netloc, prefix + str(f.relative_to(base)))
+        print('npa_dataset_upload_done')
+        "
+    outputs:
+      - uri: "{{config.clip_uri}}"
+        schema: npa.lerobot.episode_clip.v1
+      - uri: "{{config.dataset_root_uri}}"
+        schema: npa.lerobot.dataset.v1
+    next: augment
+  augment:
+    description: >
+      Run real Cosmos Transfer 2.5 inference N times against the same
+      conditioning clip to produce N stylistically-varied augmented copies.
+    loop:
+      max: "{{config.num_variants}}"
+    resources: gpu
+    toolRef: workbench.cosmos2.transfer_execute
+    params:
+      trigger_uri: "{{config.clip_uri}}"
+      augment_uri: "{{config.augment_uri}}variant-{{loop.augment}}/"
+      configs_uri: "{{config.configs_uri}}"
+    outputs:
+      - uri: "{{config.augment_uri}}variant-{{loop.augment}}/"
+        schema: npa.cosmos2.transfer.v1
+    next: compose-augmented-dataset
+  compose-augmented-dataset:
+    description: >
+      Append each Cosmos-augmented variant to a copy of the source dataset as
+      a new episode via LeRobot's own dataset writer (LeRobotDataset.resume +
+      add_frame + save_episode), reusing episode 0's original action/state
+      values per frame (Cosmos Transfer only changes pixels, not the
+      trajectory) and swapping in the augmented video frames for the
+      conditioned camera. Using the real writer API -- instead of hand-rolling
+      LeRobot v3's consolidated per-camera video/parquet chunk format -- avoids
+      re-implementing that file layout by hand.
+    resources: cpu
+    run:
+      shell: |
+        set -euo pipefail &&
+        mkdir -p /tmp/so100-augmented /tmp/cosmos-variants &&
+        SRC_URI="{{config.dataset_root_uri}}" DEST_DIR=/tmp/so100-augmented python3 -c "
+        import boto3, os, pathlib
+        from urllib.parse import urlparse
+        # No aws-cli in this image (only boto3), so sync by hand: list every
+        # object under the prefix and download it to the matching local path.
+        uri = os.environ['SRC_URI']
+        parsed = urlparse(uri)
+        prefix = parsed.path.lstrip('/')
+        dest = pathlib.Path(os.environ['DEST_DIR'])
+        s3 = boto3.client('s3', endpoint_url=os.environ.get('AWS_ENDPOINT_URL') or os.environ.get('NEBIUS_S3_ENDPOINT') or None)
+        paginator = s3.get_paginator('list_objects_v2')
+        for page in paginator.paginate(Bucket=parsed.netloc, Prefix=prefix):
+            for obj in page.get('Contents', ()):
+                key = obj['Key']
+                if key.endswith('/'):
+                    continue
+                rel = key[len(prefix):].lstrip('/')
+                out = dest / rel
+                out.parent.mkdir(parents=True, exist_ok=True)
+                s3.download_file(parsed.netloc, key, str(out))
+        print('npa_sync_down_done', uri, '->', dest)
+        " &&
+        SRC_URI="{{config.augment_uri}}" DEST_DIR=/tmp/cosmos-variants python3 -c "
+        import boto3, os, pathlib
+        from urllib.parse import urlparse
+        uri = os.environ['SRC_URI']
+        parsed = urlparse(uri)
+        prefix = parsed.path.lstrip('/')
+        dest = pathlib.Path(os.environ['DEST_DIR'])
+        s3 = boto3.client('s3', endpoint_url=os.environ.get('AWS_ENDPOINT_URL') or os.environ.get('NEBIUS_S3_ENDPOINT') or None)
+        paginator = s3.get_paginator('list_objects_v2')
+        for page in paginator.paginate(Bucket=parsed.netloc, Prefix=prefix):
+            for obj in page.get('Contents', ()):
+                key = obj['Key']
+                if key.endswith('/'):
+                    continue
+                rel = key[len(prefix):].lstrip('/')
+                out = dest / rel
+                out.parent.mkdir(parents=True, exist_ok=True)
+                s3.download_file(parsed.netloc, key, str(out))
+        print('npa_sync_down_done', uri, '->', dest)
+        " &&
+        LEROBOT_DATASET="{{config.lerobot_dataset}}" python3 -c "
+        import pathlib
+        import torch
+        import torchvision
+        from lerobot.datasets.lerobot_dataset import LeRobotDataset
+
+        repo_id = __import__('os').environ['LEROBOT_DATASET']
+        root = pathlib.Path('/tmp/so100-augmented')
+        variants_root = pathlib.Path('/tmp/cosmos-variants')
+        source_episode = 0  # the episode prepare-clip conditioned Cosmos on
+
+        source_ds = LeRobotDataset(repo_id, root=root, episodes=[source_episode])
+        video_keys = sorted(source_ds.meta.video_keys)
+        camera_key = video_keys[0]  # matches prepare-clip's own selection
+        reserved = {'timestamp', 'frame_index', 'episode_index', 'index', 'task_index'}
+
+        writer_ds = LeRobotDataset.resume(repo_id, root=root)
+
+        for variant_dir in sorted(variants_root.glob('variant-*')):
+            augmented_video = next(variant_dir.rglob('*.mp4'))
+            aug_frames, _audio, _info = torchvision.io.read_video(str(augmented_video), pts_unit='sec')
+            # aug_frames: (T, H, W, C) uint8 -- already HWC, matching add_frame's expected layout.
+
+            for i in range(len(source_ds)):
+                row = source_ds[i]
+                frame = {k: v for k, v in row.items() if k not in reserved}
+
+                # row[video_key] is (C, H, W) float32 in [0, 1] (LeRobot's
+                # training-read convention); add_frame's writer expects (H, W, C).
+                for key in video_keys:
+                    if key == camera_key:
+                        continue
+                    frame[key] = frame[key].permute(1, 2, 0)
+
+                orig_img = row[camera_key]
+                aug_idx = min(i, aug_frames.shape[0] - 1)
+                img = aug_frames[aug_idx]  # (H, W, C) uint8
+                orig_hw = orig_img.shape[-2:]
+                if img.shape[:2] != orig_hw:
+                    img = torch.nn.functional.interpolate(
+                        img.permute(2, 0, 1).unsqueeze(0).float(), size=orig_hw, mode='bilinear', align_corners=False
+                    ).squeeze(0).round().clamp(0, 255).to(torch.uint8).permute(1, 2, 0)
+                frame[camera_key] = img
+
+                writer_ds.add_frame(frame)
+            writer_ds.save_episode()
+
+        writer_ds.finalize()
+        print('npa_compose_done total_episodes=', writer_ds.meta.total_episodes)
+        " &&
+        python3 -c "
+        import pathlib
+        import pyarrow.parquet as pq
+        # The installed LeRobot's own writer (used above for the augmented
+        # episodes) computes more stats (quantiles) at a different float
+        # precision than the originally-published dataset's episodes chunk,
+        # so a downstream reader that loads every chunk with one strict
+        # merged schema fails with 'column names don't match'. Reconcile
+        # every chunk to the FIRST chunk's schema (the schema this dataset
+        # repo already publishes) before upload: drop extra columns, cast
+        # dtypes, and fix column order.
+        episodes_dir = pathlib.Path('/tmp/so100-augmented/meta/episodes')
+        files = sorted(episodes_dir.rglob('*.parquet'))
+        if len(files) > 1:
+            target_schema = pq.read_schema(files[0])
+            target_names = target_schema.names
+            for f in files:
+                table = pq.read_table(f)
+                table = table.select([name for name in target_names if name in table.column_names])
+                table = table.cast(target_schema)
+                pq.write_table(table, f)
+                print('npa_schema_reconciled', f)
+        else:
+            print('npa_schema_reconcile_skipped only one episodes chunk')
+        " &&
+        SRC_DIR=/tmp/so100-augmented DEST_URI="{{config.augmented_dataset_uri}}" python3 -c "
+        import boto3, os, pathlib
+        from urllib.parse import urlparse
+        base = pathlib.Path(os.environ['SRC_DIR'])
+        uri = os.environ['DEST_URI']
+        parsed = urlparse(uri)
+        prefix = parsed.path.strip('/')
+        prefix = prefix + '/' if prefix else ''
+        s3 = boto3.client('s3', endpoint_url=os.environ.get('AWS_ENDPOINT_URL') or os.environ.get('NEBIUS_S3_ENDPOINT') or None)
+        for f in base.rglob('*'):
+            if f.is_file():
+                s3.upload_file(str(f), parsed.netloc, prefix + str(f.relative_to(base)))
+        print('npa_sync_up_done', base, '->', uri)
+        "
+    outputs:
+      - uri: "{{config.augmented_dataset_uri}}"
+        schema: npa.lerobot.dataset.v1
+    terminal: true

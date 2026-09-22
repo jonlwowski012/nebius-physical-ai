@@ -835,7 +835,13 @@ def _submission_global_config(runtime, controller_backend, infra):
         # The selected workload and controller share this exact context; other
         # operator settings, including pod configuration, retain their values.
         kubernetes["allowed_contexts"] = [context]
-        config["allowed_clouds"] = ["kubernetes"]
+        # Canonical SkyPilot cloud name ("Kubernetes", matching sky.clouds.Kubernetes
+        # and the server's own cloud registry casing). Lowercase "kubernetes" round
+        # -trips into a client/server value mismatch that SkyPilot warns about on
+        # stdout for every `sky status --output json` call, breaking JSON parsing
+        # in the controller health check (SkyPilotSubmitError: "returned non-json
+        # output").
+        config["allowed_clouds"] = ["Kubernetes"]
     return config
 
 

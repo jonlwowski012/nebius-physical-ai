@@ -2869,6 +2869,13 @@ TOOL_CATALOG: dict[str, ToolEntry] = {
             "train",
             "--dataset-repo-id",
             "{{config.lerobot_dataset}}",
+            # DEFAULT_PUBLIC_LEROBOT_REVISION (the CLI's own default) is a commit SHA
+            # frozen for one specific dataset; it 404s against any other repo whose
+            # history has since been rewritten upstream (live: lerobot/svla_so100_pickplace).
+            # Exposing it as a config default (below) lets a spec's dataset choice carry
+            # its own valid revision instead of inheriting an unrelated pin.
+            "--dataset-revision",
+            "{{config.dataset_revision}}",
             "--output-dir",
             "{{config.lerobot_output_dir}}",
             "--steps",
@@ -2887,6 +2894,7 @@ TOOL_CATALOG: dict[str, ToolEntry] = {
             "--artifacts-s3-uri",
             "{{config.artifacts_uri}}",
         ],
+        config_defaults={"dataset_revision": "main"},
     ),
     "workbench.token_factory.triage": ToolEntry(
         name="workbench.token_factory.triage",

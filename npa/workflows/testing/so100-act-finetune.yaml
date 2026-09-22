@@ -1,0 +1,48 @@
+apiVersion: npa.workflow/v0.0.1
+kind: Workflow
+
+metadata:
+  name: so100-act-finetune
+  description: >
+    Read the real-world SO-100 pick-place LeRobot dataset directly from
+    Hugging Face and fine-tune a LeRobot ACT policy on it.
+
+config:
+  bucket: example-bucket
+  prefix: "runs/{{run.id}}/so100-act-finetune"
+  lerobot_dataset: lerobot/svla_so100_pickplace
+  # workbench.lerobot.policy_train's own default revision is a commit SHA
+  # frozen for a different dataset; this repo's history has since moved past
+  # it, so pin to the live default branch instead.
+  dataset_revision: main
+  policy_type: act
+  train_steps: "20000"
+  train_batch_size: "8"
+  policy_device: cuda
+  lerobot_output_dir: /tmp/npa-lerobot-output
+  artifacts_uri: "s3://{{config.bucket}}/{{config.prefix}}/artifacts/"
+
+resources:
+  gpu:
+    cloud: kubernetes
+    accelerators: H100:1
+    cpus: 12
+    memory: 80Gi
+    # The published npa-lerobot image lacks sudo/rsync/netcat, so SkyPilot's
+    # Kubernetes ray-cluster bootstrap fails with "container not found
+    # (ray-node)" for any task using it. This is the k8s-prereqs-repaired
+    # derived tag built via scripts/build-workbench-image-in-cluster.sh.
+    image: "cr.eu-north1.nebius.cloud/e00x444s08amhatzy6/npa-lerobot:cuda13-b300-0.5.1-sm80-sm90-sm100-sm103-sm120-20260803T034152Z-sky1-pip-vpath"
+
+initial: train
+states:
+  train:
+    description: >
+      Fine-tune ACT directly against the real SO-100 HF dataset repo; LeRobot
+      pulls the dataset itself, so no separate ingest/staging stage is needed.
+    toolRef: workbench.lerobot.policy_train
+    resources: gpu
+    outputs:
+      - uri: "{{config.artifacts_uri}}"
+        schema: npa.lerobot.policy_train.artifacts.v1
+    terminal: true

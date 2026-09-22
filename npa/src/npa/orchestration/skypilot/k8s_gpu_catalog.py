@@ -268,7 +268,9 @@ def kubernetes_sky_environment(
     if not isinstance(kubernetes, dict):
         raise RuntimeError("SkyPilot Kubernetes configuration must be a mapping")
     kubernetes["allowed_contexts"] = [context]
-    config["allowed_clouds"] = ["kubernetes"]
+    # Canonical SkyPilot cloud name ("Kubernetes"); see the matching fix and
+    # comment in workflow.py::_submission_global_config.
+    config["allowed_clouds"] = ["Kubernetes"]
     config_bytes = yaml.safe_dump(config, sort_keys=True).encode()
     config_path = scope / "client-config.yaml"
     write_config = False

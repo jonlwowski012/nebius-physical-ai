@@ -31,3 +31,27 @@ def test_rejects_ambiguous_preamble_value() -> None:
 
 def test_rejects_trailing_json_start_outside_ansi() -> None:
     assert parse_single_json_document('[{"a": 1}]\n[') is None
+
+
+def test_tolerates_json_looking_fragment_quoted_in_a_warning() -> None:
+    # `sky status --output json` can print this exact warning to stdout ahead of
+    # the real payload when the client/server allowed_clouds config disagrees.
+    # Its parenthesized aside `(["allowed_clouds"])` parses as a valid one-item
+    # JSON array, but it is prose, not a second document.
+    output = (
+        'The following keys (["allowed_clouds"]) have different values in the '
+        "client SkyPilot config with the server and will be ignored. Remove "
+        "these keys to disable this warning. If you want to specify it, please "
+        "modify it on server side or contact your administrator.\n"
+        '[\n  {"name": "sky-jobs-controller-dd17c189", "status": "UP"}\n]\n'
+    )
+    assert parse_single_json_document(output) == [
+        {"name": "sky-jobs-controller-dd17c189", "status": "UP"}
+    ]
+
+
+def test_still_rejects_ambiguous_value_flanked_by_whitespace() -> None:
+    # Unlike a fragment embedded in punctuation, a JSON-looking value that is
+    # itself whitespace-flanked is a real competing document and must still
+    # reject via the existing trailing-content check.
+    assert parse_single_json_document("junk [1, 2] trailing {") is None
