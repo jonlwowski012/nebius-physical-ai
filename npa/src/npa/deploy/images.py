@@ -10,6 +10,8 @@ from pathlib import Path
 import re
 from typing import Any
 
+from npa.workbench.gpu_classes import DATACENTER_HEADLESS, classify_gpu_target
+
 # Official NPA images use one public GHCR namespace. Immutable
 # ``dev-<full-git-sha>`` tags and supported release tags share each image package;
 # guarded promotion applies the release tag only to an already validated dev digest.
@@ -33,7 +35,9 @@ CONTENT_AGENTS_IMAGE_MANIFEST_RESOURCE = "content_agents_image_manifest.json"
 PUBLIC_RELEASE_MANIFEST_RESOURCE = "public_release_manifest.json"
 
 CONTAINER_IMAGE_NAMES = {
+    "openpi": "npa-openpi",
     "lerobot": "npa-lerobot",
+    "sim2real-control": "npa-sim2real-control",
     "lerobot-policy": "npa-lerobot-policy",
     "genesis": "npa-genesis",
     "isaac-lab": "npa-isaac-lab",
@@ -43,6 +47,8 @@ CONTAINER_IMAGE_NAMES = {
     "cosmos3": "npa-cosmos3",
     "cosmos3-ray-serve": "npa-cosmos3-ray-serve",
     "cosmos3-serving": "npa-cosmos3-serving",
+    "cosmos3-super-benchmark": "npa-cosmos3-super-benchmark",
+    "cosmos3-nano-video": "npa-cosmos3-nano-video",
     "cosmos3-reason": "npa-cosmos3-reason",
     "cosmos-curate": "npa-cosmos-curate",
     "cosmos-evaluator": "npa-cosmos-evaluator",
@@ -64,6 +70,7 @@ CONTAINER_IMAGE_NAMES = {
     "wan2-2": "npa-wan2-2",
     "ltx2": "npa-ltx2",
     "alpamayo2-super": "npa-alpamayo2-super",
+    "curobo": "npa-curobo",
     "content-agents": "npa-content-agents",
 }
 
@@ -77,6 +84,7 @@ SKYPILOT_BOOTSTRAP_ATTESTED_TOOLS: frozenset[str] = frozenset(
         "cosmos2-transfer",
         "cosmos3",
         "cosmos3-reason",
+        "cosmos3-super-benchmark",
         "cosmos-curate",
         "cosmos-evaluator",
         "content-agents",
@@ -84,6 +92,8 @@ SKYPILOT_BOOTSTRAP_ATTESTED_TOOLS: frozenset[str] = frozenset(
         "groot",
         "isaac-lab",
         "rerun-viewer",
+        "sim2real-control",
+        "envgen",
     }
 )
 
@@ -108,10 +118,12 @@ def requires_skypilot_bootstrap_runtime_probe(image: str) -> bool:
 
 
 # General public-registry refusal inventories. They intentionally describe the
-# redistribution decision, not a particular vendor payload. Both are empty now:
-# Cosmos3 serving is a zero-payload runtime bootstrap on a public Python base,
-# and sonic-mujoco is rebuilt independently without its quarantined parent.
-RESTRICTED_PUBLICATION_TOOLS: frozenset[str] = frozenset()
+# redistribution decision, not a particular vendor payload. The Cosmos3-Super
+# benchmark wrapper inherits the exact upstream vLLM-Omni runtime and therefore
+# remains build-your-own in an operator-controlled registry.
+RESTRICTED_PUBLICATION_TOOLS: frozenset[str] = frozenset(
+    {"cosmos3-super-benchmark", "cosmos3-nano-video"}
+)
 RESTRICTED_DERIVED_IMAGES: frozenset[str] = frozenset()
 
 # Compatibility exports for installed callers. New code uses the general names.
@@ -130,7 +142,7 @@ OMNIVERSE_RESTRICTED_DERIVED_IMAGES = RESTRICTED_DERIVED_IMAGES
 #
 # Remove a tool from this set in the same change that records its accepted image
 # digest and its payload-scan/GPU evidence — not before.
-UNVALIDATED_PUBLICATION_TOOLS: frozenset[str] = frozenset()
+UNVALIDATED_PUBLICATION_TOOLS: frozenset[str] = frozenset({"openpi", "curobo"})
 VALIDATION_CANDIDATE_TOOLS: frozenset[str] = frozenset({"robocasa"})
 # Compatibility view used by publication callers and public imports. Derive it
 # from the two canonical validation-state inventories; never maintain it
@@ -143,9 +155,13 @@ PUBLICATION_QUARANTINE_TOOLS: frozenset[str] = (
 # anonymous channel. Public execution stays on the last accepted release while
 # an explicit custom registry resolves the newer supported-tool pin.
 PUBLIC_RELEASE_TAG_OVERRIDES: dict[str, str] = {
-    "cosmos2-transfer": "2.5.1-skypilot-ready-20260801T053000Z",
     "fiftyone": "1.15.0.post1",
-    "rerun-viewer": "0.31.4",
+    # 0.31.4 (plain) predates the bootstrap contract and cannot host a SkyPilot
+    # task: the container exits immediately, the provisioner's exec finds no
+    # ray-node container, and the stage retries forever. The 20260903 build is
+    # attested (org.nebius.npa.skypilot-bootstrap-contract=skypilot-0.12.2-v1)
+    # and anonymously pullable from GHCR.
+    "rerun-viewer": "0.31.4-sim2real-coherent-20260904",
 }
 
 # Release promotion for the rebuilt surfaces is bound to the exact manifests
@@ -163,6 +179,10 @@ GPU_ACCEPTED_PUBLIC_IMAGE_SOURCES: dict[str, dict[str, str]] = {
     "sonic-mujoco": {
         "development_sha": "5b5b5e69e9e686f8d5f305fd735a02f402f6da4b",
         "oci_digest": "sha256:2388d9e97269afaa414966e83a27f676a3f44d4271e9828c57bc13fbdce80f57",
+    },
+    "detection-training": {
+        "development_sha": "408700158b2e9cc9e9f6aad499e9d9c810bebeb1",
+        "oci_digest": "sha256:a09126491bd660f314b8f412df7238746dc2b063e5d5b7ca87bba7596dafcb0d",
     },
 }
 GPU_ACCEPTED_PUBLIC_IMAGE_DIGESTS: dict[str, str] = {
@@ -186,21 +206,25 @@ PUBLIC_REGISTRY_HOSTS = frozenset(
 )
 
 SUPPORTED_TOOL_VERSIONS = {
+    "openpi": "pi05-full-droid-rlds-cu128-unbuilt",
     # Default LeRobot image release. Selectable package versions and their
     # image tags live in lerobot_version_manifest.json.
     "lerobot": "cuda13-b300-0.5.1-sm80-sm90-sm100-sm103-sm120-20260803T034152Z",
+    "sim2real-control": "0.1.2-sim2real-coherent-20260904",
     "lerobot-policy": "0.1.1",
     "genesis": "cuda13-b300-0.4.6-sm80-sm90-sm100-sm103-sm120-20260803T034152Z",
-    "isaac-lab": "3.0.0b2.post1",
+    "isaac-lab": "3.0.0b2.post1-sim2real-coherent-20260904",
     "leisaac": "0.4.0-20260817T231825Z",
     "cosmos": "cu128-torch27-sm100-1.0.9-20260803T002017Z",
-    "cosmos2-transfer": "2.5.1-sam2-multigpu-20260817-r2",
+    "cosmos2-transfer": "2.5.1-sim2real-coherent-20260904",
     # Additive r2 release of cosmos-framework 1.2.2 (pinned commit 5e67049c) +
     # torch cu130. The immutable predecessor remains rollback provenance.
     # No weights baked; gated Cosmos3 checkpoints download at runtime.
     "cosmos3": "1.2.2-cu130-r6",
     "cosmos3-ray-serve": "ray1-cu130",
     "cosmos3-serving": "0.2.0-oss",
+    "cosmos3-super-benchmark": "0.1.0",
+    "cosmos3-nano-video": "0.1.0",
     "cosmos3-reason": "cuda13-b300-3.0.1-sm80-sm90-sm100-sm103-sm120-20260803T034152Z",
     "cosmos-curate": "0.1.2-skypilot-v1-20260813T164700Z",
     "cosmos-evaluator": "0.1.2-skypilot-v1-20260813T164700Z-r2",
@@ -209,24 +233,25 @@ SUPPORTED_TOOL_VERSIONS = {
     "sonic": "cuda13-b300-0.1.2-k8s-runtime-sm80-sm90-sm100-sm103-sm120-20260803T034152Z",
     "sonic-mujoco": "0.2.0-runtime",
     "retargeting": "0.1.1",
+    "envgen": "0.1.2-sim2real-coherent-20260904",
     "robocasa": "0.1.0",
-    "envgen": "cuda13-b300-0.1.2-sm80-sm90-sm100-sm103-sm120-20260803T034152Z",
     "reference-policy": "cuda13-b300-0.1.2-sm80-sm90-sm100-sm103-sm120-20260803T034152Z",
     "lerobot-vlm-rl": "cuda13-b300-0.1.1-sm80-sm90-sm100-sm103-sm120-20260803T034152Z",
     "loop-eval": "cuda13-b300-0.1.3-sm80-sm90-sm100-sm103-sm120-20260803T034152Z",
-    "rerun-viewer": "0.31.4-skypilot-v1-20260815-review5-r2",
+    "rerun-viewer": "0.31.4-sim2real-coherent-20260904",
     # Tracks the pinned @foxglove/embed SDK release (npa.workbench.foxglove).
     "foxglove-embed": "0.58.0",
     # Lichtblick (MPL-2.0): OSS, Foxglove-compatible static web viewer bundle.
     "lichtblick": "1.26.0",
     "lancedb": "cuda13-b300-0.30.3-sm80-sm90-sm100-sm103-sm120-20260803T031514Z",
-    "detection-training": "bdd100k-golden-eval-smoke-20260614T210000Z",
+    "detection-training": "runtime-v1-20260905",
     # Public-eligible Wan source/CPU base; CUDA torch is operator-gated runtime fetch.
     "wan2-2": "2.2-ti2v5b-rtfetch-cu130-20260817",
     # LTX source and weights remain operator-entitled runtime fetches. This tag
     # resolves only to the zero-payload digest recorded in ltx2_image_manifest.json.
     "ltx2": "2.5-rtfetch-20260817",
     "alpamayo2-super": "0.1.0-cu128",
+    "curobo": "0.8.0-cuda13-b300-unbuilt",
     "content-agents": "0.5.2-npa2",
     "nebius-cli": "0.12.254",
     "terraform": "~> 0.5.201",
@@ -417,25 +442,87 @@ def resolve_lerobot_image_tag(version: str | None = None) -> str:
     return str(entry.get("image_tag") or entry["version"])
 
 
-def sonic_image_variant_for_gpu(gpu_target: str | None = None) -> str:
-    """Return an active SONIC variant or reject unsupported GPU/runtime pairs."""
+def sonic_variant_workloads(variant: str) -> tuple[str, ...]:
+    """Return the SONIC pipeline stages a variant is published to serve."""
+
+    entry = sonic_image_variants().get(variant, {})
+    declared = entry.get("workloads")
+    if not isinstance(declared, list) or not declared:
+        raise ValueError(
+            f"SONIC image variant {variant!r} declares no 'workloads' in "
+            "sonic_image_manifest.json. Declare the stages it can serve so GPU "
+            "resolution cannot hand a caller a variant with the wrong capability."
+        )
+    return tuple(str(item) for item in declared)
+
+
+def sonic_image_variant_for_gpu(
+    gpu_target: str | None = None,
+    *,
+    workload: str | None = None,
+) -> str:
+    """Return an active SONIC variant or reject unsupported GPU/runtime pairs.
+
+    ``gpu_target`` alone is not enough to pick an image. The variants differ in
+    capability, not just in driver provisioning: the only variant that matches a
+    datacenter-Blackwell target serves MuJoCo evaluation and cannot fine-tune. So
+    when the caller states its ``workload`` (a
+    :mod:`npa.workbench.sonic.routing` identifier), the GPU-matched variant must
+    also be published for that workload, and a mismatch fails loud instead of
+    substituting a different capability.
+    """
 
     manifest = sonic_image_manifest()
     default = str(manifest.get("default_variant", "sonic-k8s-host-mounted"))
     normalized = _normalize_gpu_target(gpu_target)
+    requested = (workload or "").strip().lower()
     if not normalized:
+        if requested and requested not in sonic_variant_workloads(default):
+            raise ValueError(
+                f"The default SONIC variant {default!r} does not serve workload "
+                f"{workload!r}; it serves "
+                f"{', '.join(sonic_variant_workloads(default))}. Select a variant "
+                "explicitly with --image-variant or pass a separately validated "
+                "image with --image."
+            )
         return default
     for rule in manifest.get("gpu_selection", []):
         if not isinstance(rule, dict):
             continue
         variant = str(rule.get("variant", ""))
         for match in rule.get("matches", []):
-            if str(match).lower() in normalized:
-                return variant
+            token = _normalize_gpu_target(str(match))
+            # The family name also occurs in datacenter GPU labels. Those must
+            # reach their model-specific rule, never the workstation default.
+            if token == "blackwell" and classify_gpu_target(normalized) == DATACENTER_HEADLESS:
+                continue
+            if token in normalized:
+                if not requested:
+                    return variant
+                served = sonic_variant_workloads(variant)
+                if requested in served:
+                    return variant
+                capable = sorted(
+                    other
+                    for other, entry in sonic_image_variants().items()
+                    if entry.get("status", "active") == "active"
+                    and requested in sonic_variant_workloads(other)
+                )
+                raise ValueError(
+                    f"No published SONIC image serves workload {workload!r} on GPU "
+                    f"target {gpu_target!r}. That target selects variant "
+                    f"{variant!r}, which is published for "
+                    f"{', '.join(served)} only. Variants that do serve "
+                    f"{workload!r}: {', '.join(capable) or 'none'}. Choose a GPU "
+                    "target those variants support, or pass a separately validated "
+                    "runtime with --image; npa will not substitute a variant with a "
+                    "different capability."
+                )
     raise ValueError(
-        f"Unsupported SONIC GPU target {gpu_target!r}. The only published active "
-        "variant is sonic-k8s-host-mounted on RTX PRO 6000 Blackwell Kubernetes "
-        "nodes with NVIDIA GPU Operator driver mounts. L40S/H100/H200 compute-only "
+        f"Unsupported SONIC GPU target {gpu_target!r}. Published selection supports "
+        "sonic-k8s-host-mounted on RTX PRO 6000 Blackwell Kubernetes nodes with "
+        "NVIDIA GPU Operator driver mounts, and sonic-mujoco-runtime-fetch for "
+        "B200 MuJoCo evaluation. L40S/H100/H200 compute-only "
         "variants are retired and quarantined; supply a separately validated custom "
         "image explicitly or choose gpu-rtx6000 on Kubernetes."
     )
@@ -445,14 +532,31 @@ def sonic_image_entry(
     *,
     gpu_target: str | None = None,
     image_variant: str | None = None,
+    workload: str | None = None,
 ) -> dict[str, Any]:
-    """Return the SONIC manifest entry selected by variant or GPU target."""
+    """Return the SONIC manifest entry selected by variant or GPU target.
+
+    Pass ``workload`` whenever the caller knows which pipeline stage it is
+    resolving an image for, so a GPU target cannot select a variant published for
+    a different capability. An explicit ``image_variant`` is still honored, but is
+    checked against the workload for the same reason.
+    """
 
     variants = sonic_image_variants()
     if image_variant:
         resolved = _normalize_sonic_variant(image_variant, variants)
+        requested = (workload or "").strip().lower()
+        if requested and resolved in variants:
+            served = sonic_variant_workloads(resolved)
+            if requested not in served:
+                raise ValueError(
+                    f"SONIC image variant {resolved!r} is published for "
+                    f"{', '.join(served)} and cannot serve workload {workload!r}. "
+                    "Pass a separately validated runtime with --image if that is "
+                    "what you intend."
+                )
     else:
-        resolved = sonic_image_variant_for_gpu(gpu_target)
+        resolved = sonic_image_variant_for_gpu(gpu_target, workload=workload)
     try:
         entry = variants[resolved]
     except KeyError as exc:
@@ -478,6 +582,7 @@ def container_image_for_tool(
     tag: str | None = None,
     gpu_target: str | None = None,
     image_variant: str | None = None,
+    workload: str | None = None,
 ) -> str:
     """Return a Workbench image, defaulting repository releases to public GHCR.
 
@@ -488,13 +593,22 @@ def container_image_for_tool(
     """
     resolved_registry = registry or DEFAULT_CONTAINER_REGISTRY
     if tool == "sonic":
-        entry = sonic_image_entry(gpu_target=gpu_target, image_variant=image_variant)
+        entry = sonic_image_entry(
+            gpu_target=gpu_target,
+            image_variant=image_variant,
+            workload=workload,
+        )
         image_name = str(entry["name"])
         resolved_tag = tag or str(entry["tag"])
     else:
         if image_variant:
             raise ValueError(
                 f"Image variants are only defined for SONIC, got tool={tool!r}"
+            )
+        if workload:
+            raise ValueError(
+                f"Workload-specific image selection is only defined for SONIC, "
+                f"got tool={tool!r}"
             )
         image_name = CONTAINER_IMAGE_NAMES[tool]
         resolved_tag = tag or (
@@ -550,6 +664,8 @@ def build_and_push_command(image: str) -> str:
     registry = ref.rsplit("/", 1)[0]
     tag = supported_tool_version(tool)
     return (
+        "npa/.venv/bin/python npa/src/npa/workflow_build.py "
+        "--stage-catalog --package-root npa && "
         f"docker buildx build --push -f {dockerfile} "
         f"-t {registry}/{image_name}:{tag} npa"
     )

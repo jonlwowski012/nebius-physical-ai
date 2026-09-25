@@ -11,7 +11,7 @@ from npa.orchestration.npa_workflow.catalog import TOOL_CATALOG
 
 
 ROOT = Path(__file__).resolve().parents[4]
-SPEC = ROOT / "npa" / "workflows" / "workbench" / "npa-workflows" / "paidf-cosmos3.yaml"
+SPEC = ROOT / "workflows" / "main" / "paidf-cosmos3.yaml"
 runner = CliRunner()
 
 
@@ -89,6 +89,8 @@ def test_configuration_surface_and_privacy_defaults() -> None:
     ):
         assert key in config
     assert config["cosmos3_mode"] == "video2video"
+    assert float(config["source_motion_weight"]) == 0.0
+    assert float(config["grade_threshold"]) == 0.75
     assert config["augmentation_seed"] == ""
     assert (
         doc["states"]["generate-configs"]["run"]["argv"][-1]

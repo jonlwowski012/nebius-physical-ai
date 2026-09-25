@@ -1,4 +1,18 @@
 # Contributing Workbench Tools
+
+## Contribution quality
+
+Use the [contributions skill](skills/atomic/contributions/SKILL.md) when writing
+or reviewing changes. It defines the required readability, exported-symbol
+documentation, module headers, README updates, and anti-pattern rules for new
+and changed code. Existing violations outside the task's scope do not require
+unrelated rewrites.
+
+Coding agents discover this skill through `AGENTS.md` and `skills/index.yaml`.
+The workbench agent's existing repository corpus also includes the root
+`skills/` tree; refresh that corpus after updating a deployed checkout to make
+new guidance available through retrieval.
+
 ## Scope
 This document covers adding a new Workbench tool to Nebius Physical AI.
 
@@ -185,6 +199,9 @@ existing Dockerfiles as the reference set, especially
 `npa/docker/workbench/lancedb/Dockerfile`, and
 `npa/docker/workbench/detection-training/Dockerfile`.
 
+Before a Docker build with `npa/` as its context, stage the top-level workflow
+catalog as described in [Build and tag](docs/workbench/container-packaging.md#build-and-tag).
+
 Base image and tag conventions are backed by:
 
 - `npa/docker/workbench/tags.yaml`
@@ -305,7 +322,7 @@ Use these references:
 - `npa/src/npa/clients/storage.py`
 - `npa/src/npa/serverless_common/output.py`
 - `docs/workbench-yaml-guide.md`
-- `npa/workflows/workbench/npa-workflows/bdd100k-pipeline.yaml`
+- `workflows/testing/bdd100k-pipeline.yaml`
 
 The public handoff flags are:
 
@@ -339,11 +356,13 @@ or `NEBIUS_S3_ENDPOINT`. See `docs/workbench/getting-started.md`,
 
 Backing services are encapsulated. A pipeline stage should receive an S3 URI,
 call a tool endpoint, and write the next S3 URI. The BDD100K pipeline in
-`npa/workflows/workbench/npa-workflows/bdd100k-pipeline.yaml` is the worked example.
+`workflows/testing/bdd100k-pipeline.yaml` is the worked example.
 ## Workflow YAML Conventions
 The supported, customer-facing workflow catalog is the declarative
-`npa.workflow` spec set under `npa/workflows/workbench/npa-workflows/`; author
-new customer-facing workflows there. Do not add raw SkyPilot task templates to
+`npa.workflow` spec set under `workflows/`. Keep `workflows/main/` limited to
+`sim2real.yaml` and `paidf-cosmos3.yaml`; author all other catalog workflows in
+`workflows/testing/`. Keep catalog documentation in `workflows/README.md`.
+Do not add raw SkyPilot task templates to
 the package as a workflow catalog; the old catalog path is guardrail-retired.
 Raw SkyPilot YAML is still accepted by the submit wrapper for customer-owned
 files, test fixtures, and guarded tool-specific examples such as burst or NuRec
@@ -352,9 +371,9 @@ single-pod execution. Do not add Argo workflows.
 References:
 
 - `docs/workbench-yaml-guide.md`
-- `npa/workflows/workbench/npa-workflows/bdd100k-pipeline.yaml`
+- `workflows/testing/bdd100k-pipeline.yaml`
 - `npa/src/npa/workflows/byof/profiles/isaac-lab-rl-train.yaml`
-- `npa/workflows/workbench/npa-workflows/isaac-lab-rl-sweep.yaml`
+- `workflows/testing/isaac-lab-rl-sweep.yaml`
 - `npa/scripts/run_bdd100k_pipeline.py`
 - `npa/scripts/run_isaac_lab_rl.py`
 
@@ -384,7 +403,7 @@ Current verified routing:
 
 - H100 is the default choice for general training, CLIP embedding, and
   detection-training workflow stages. The BDD100K workflow requests H100 in
-  `npa/workflows/workbench/npa-workflows/bdd100k-pipeline.yaml`.
+  `workflows/testing/bdd100k-pipeline.yaml`.
 - H200 is used by several serving or training defaults, including LeRobot and
   Cosmos serverless paths in their CLI files.
 - L40S or RTX Pro 6000 is required for Isaac Lab simulation paths that need RT
@@ -659,6 +678,11 @@ after adding one.
 
 Update `AGENTS.md` only if the skill list or root index changes.
 ## Commit And PR Conventions
+Every proposed merge runs the [security regression gate](docs/security/merge-security-gate.md).
+Run its real scanner regression checks and base comparison before changing the
+security policy. Fix new findings and scanner errors before requesting review;
+the guide describes coverage, local commands, and required-check enforcement.
+
 Keep commits small and logical.
 
 Commit messages use an imperative subject, subject length <=72 characters, and
@@ -714,7 +738,7 @@ For the clean HTTP service, CLI, and SDK pattern, read
 `npa/src/npa/sdk/workbench/detection_training.py`.
 
 For workflow composition, read `docs/workbench-yaml-guide.md`,
-`npa/workflows/workbench/npa-workflows/bdd100k-pipeline.yaml`,
+`workflows/testing/bdd100k-pipeline.yaml`,
 `npa/src/npa/workflows/byof/profiles/isaac-lab-rl-train.yaml`,
 `npa/tests/workflows/test_bdd100k_pipeline.py`, and
 `npa/tests/workflows/test_isaac_lab_rl.py`. For deeper rationale, read

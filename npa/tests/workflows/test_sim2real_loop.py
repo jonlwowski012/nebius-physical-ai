@@ -53,12 +53,12 @@ SIM2REAL_ENVGEN_SPLIT = (
 # The raw cosmos2-transfer template is retired; its spec is the surface, and unlike the
 # template it runs the real model (EVIDENCE.md §R38).
 COSMOS2_TRANSFER = (
-    ROOT / "npa" / "workflows" / "workbench" / "npa-workflows" / "cosmos2-transfer.yaml"
+    ROOT / "workflows" / "testing" / "cosmos2-transfer.yaml"
 )
 # The raw cosmos3-reason template is retired; its npa.workflow spec is the surface
 # (both run the same manifest builder — EVIDENCE §R2).
 COSMOS3_REASON = (
-    ROOT / "npa" / "workflows" / "workbench" / "npa-workflows" / "cosmos3-reason.yaml"
+    ROOT / "workflows" / "testing" / "cosmos3-reason.yaml"
 )
 
 
@@ -221,7 +221,7 @@ def test_full_loop_writes_stage_artifacts_and_candidate(tmp_path: Path) -> None:
     assert (
         augment.get("image")
         == "ghcr.io/nebius/nebius-physical-ai/npa-cosmos2-transfer:"
-        "2.5.1-skypilot-ready-20260801T053000Z"
+        "2.5.1-sim2real-coherent-20260904"
     )
     assert (
         trigger["trigger_dataset_uri"] == "s3://bucket/sim2real-triggers/lerobot-pusht/"
@@ -1270,7 +1270,7 @@ def test_default_augment_image_uses_cosmos2_transfer_contract(monkeypatch) -> No
     assert (
         default_augment_image()
         == "ghcr.io/nebius/nebius-physical-ai/npa-cosmos2-transfer:"
-        "2.5.1-skypilot-ready-20260801T053000Z"
+        "2.5.1-sim2real-coherent-20260904"
     )
 
     config = build_config_from_env(run_id="sim2real-images")
@@ -1278,7 +1278,7 @@ def test_default_augment_image_uses_cosmos2_transfer_contract(monkeypatch) -> No
     assert (
         config.augment_image
         == "ghcr.io/nebius/nebius-physical-ai/npa-cosmos2-transfer:"
-        "2.5.1-skypilot-ready-20260801T053000Z"
+        "2.5.1-sim2real-coherent-20260904"
     )
     assert config.vlm_image == (
         "ghcr.io/nebius/nebius-physical-ai/npa-cosmos3-reason:"
@@ -1297,7 +1297,7 @@ def test_default_images_ignore_generic_build_registry(monkeypatch) -> None:
     assert (
         config.augment_image
         == "ghcr.io/nebius/nebius-physical-ai/npa-cosmos2-transfer:"
-        "2.5.1-skypilot-ready-20260801T053000Z"
+        "2.5.1-sim2real-coherent-20260904"
     )
     assert (
         config.vlm_image
@@ -2505,11 +2505,7 @@ def test_action_conditioning_is_a_stage_of_the_envgen_spec_and_is_cpu() -> None:
 
     spec = load_spec(
         ROOT
-        / "npa"
-        / "workflows"
-        / "workbench"
-        / "npa-workflows"
-        / "sim2real-envgen-shards.yaml"
+        / "workflows" / "testing" / "sim2real-envgen-shards.yaml"
     )
     plan = build_plan(spec, run_id="envgen-actions-test")
 
@@ -2541,11 +2537,7 @@ def test_envgen_shard_fan_out_is_cpu_and_declares_its_shards() -> None:
 
     spec = load_spec(
         ROOT
-        / "npa"
-        / "workflows"
-        / "workbench"
-        / "npa-workflows"
-        / "sim2real-envgen-shards.yaml"
+        / "workflows" / "testing" / "sim2real-envgen-shards.yaml"
     )
     plan = build_plan(spec, run_id="envgen-shards-test")
 

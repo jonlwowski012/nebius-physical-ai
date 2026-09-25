@@ -32,7 +32,7 @@ import tempfile
 from pathlib import Path
 from typing import Any
 
-from npa.clients.storage import StorageClient
+from npa.clients.storage import StorageClient, safe_s3_download_target
 from npa.workflows.sim2real.camera_views import camera_metadata, camera_views_json
 from npa.workflows.sim2real.capture import capture_settings
 from npa.workflows.sim2real.isaac_job_payload import (
@@ -720,6 +720,18 @@ try:
                 )
                 xyz = pts.detach().cpu().numpy().reshape(-1, 3).astype(np.float32)
                 col = cols.detach().cpu().numpy().reshape(-1, 3)
+                # Some rendered views legitimately contain no finite depth samples
+                # for a frame.  Treat that as an absent cloud before inspecting the
+                # color range: NumPy's max() is undefined for an empty array.  This
+                # keeps the other synchronized views usable without reporting a
+                # misleading capture exception.
+                if xyz.shape[0] != col.shape[0]:
+                    raise ValueError(
+                        f"point-cloud/color row mismatch for {name}: "
+                        f"{xyz.shape[0]} != {col.shape[0]}"
+                    )
+                if xyz.shape[0] == 0:
+                    continue
                 if col.dtype != np.uint8:
                     col = (np.clip(col, 0.0, 1.0) * 255).astype(np.uint8) if col.max() <= 1.0 else col.astype(np.uint8)
                 good = np.isfinite(xyz).all(axis=1)
@@ -1507,7 +1519,8 @@ def run_isaac_eval_job(
                 for view_names in (ep.get("camera_views") or {}).values():
                     names.extend(view_names or [])
                 for name in dict.fromkeys(names):
-                    dst = Path(_RENDERS_LOCAL_DIR) / eid / name
+                    episode_dir = safe_s3_download_target(_RENDERS_LOCAL_DIR, eid, "")
+                    dst = safe_s3_download_target(episode_dir, name, "")
                     dst.parent.mkdir(parents=True, exist_ok=True)
                     s3.download_file(u.netloc, f"{base}/{eid}/{name}", str(dst))
             pointcloud_count = 0
@@ -1520,8 +1533,7 @@ def run_isaac_eval_job(
                         pointcloud_prefix
                     ):
                         continue
-                    relative = key[len(base) + 1 :]
-                    dst = Path(_RENDERS_LOCAL_DIR) / relative
+                    dst = safe_s3_download_target(_RENDERS_LOCAL_DIR, key, base + "/")
                     dst.parent.mkdir(parents=True, exist_ok=True)
                     s3.download_file(u.netloc, key, str(dst))
                     pointcloud_count += 1

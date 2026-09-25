@@ -22,10 +22,12 @@ from npa.orchestration.npa_workflow import build_plan, load_spec
 from npa.orchestration.npa_workflow.errors import NpaWorkflowError
 from npa.orchestration.npa_workflow.run_state import RunStateStore, RuntimeRunState
 from npa.orchestration.npa_workflow.runtime import (
+    MAX_TERMINAL_PLAN_MIGRATIONS,
     RuntimeLedger,
     RuntimeOptions,
     SkyPilotWaveExecutor,
     WaveAttempt,
+    plan_fingerprint,
     run_workflow_runtime,
     s3_trigger_waiter,
     wave_key,
@@ -571,9 +573,10 @@ def test_default_skypilot_calls_preserve_explicit_runtime_isolation(
         "controller_backend": "kubernetes",
         "infra": "k8s/test-context",
         "secret_envs": [],
-        "extra_env": {},
+        "extra_env": {"NPA_S3_BUCKET": "example-bucket", "NPA_S3_PREFIX": "trigger/rt-isolated"},
         "timeout": 1800,
         "logical_launch_id": "",
+        "project": "default",
     }
     status.assert_called_once_with("1", **expected)
     timeline.assert_called_once_with("1", **expected)
@@ -1439,7 +1442,7 @@ def test_parallel_job_name_fingerprints_exact_batch_membership(tmp_path: Path) -
 def _canonical_sim2real_1x1():
     root = Path(__file__).resolve().parents[4]
     spec = load_spec(
-        root / "npa" / "workflows" / "workbench" / "npa-workflows" / "sim2real.yaml"
+        root / "workflows" / "main" / "sim2real.yaml"
     )
     image = "cr.example/npa/runtime@sha256:" + "b" * 64
     spec.config.update(
@@ -2792,11 +2795,7 @@ def test_corrupt_decision_artifact_fails_the_run(tmp_path: Path) -> None:
 def test_paidf_cosmos3_runtime_rejection_visualizes_and_skips_downstream() -> None:
     spec_path = (
         Path(__file__).resolve().parents[4]
-        / "npa"
-        / "workflows"
-        / "workbench"
-        / "npa-workflows"
-        / "paidf-cosmos3.yaml"
+        / "workflows" / "main" / "paidf-cosmos3.yaml"
     )
     spec = load_spec(spec_path)
     submitter = FakeSubmitter()
@@ -3036,6 +3035,285 @@ def test_resume_accepts_an_unchanged_plan(tmp_path: Path) -> None:
     )
     assert report.status == "succeeded"
     assert not submitter.calls, "an unchanged plan must replay, not resubmit"
+
+
+def test_explicit_terminal_plan_migration_preserves_failed_attempts(
+    tmp_path: Path,
+) -> None:
+    from npa.orchestration.skypilot.workflow import ManagedJobEvidence
+
+    spec = load_spec(_write_spec(tmp_path, FANOUT_SPEC))
+    store = MemoryStore()
+    prior = RuntimeRunState(
+        workflow=spec.name,
+        run_id="rt-plan-migrate",
+        api_version=spec.api_version,
+        status="failed",
+        plan_fingerprint="0" * 64,
+        waves=[
+            {
+                "key": "001|parallel|fanout",
+                "states": ["shard-a", "shard-b", "shard-c"],
+                "attempt": 1,
+                "status": "failed",
+                "sky_status": "FAILED",
+                "job_id": "prior-1",
+                "outputs": [],
+            }
+        ],
+    )
+    store.write_runtime_state(prior)
+    options = RuntimeOptions(
+        poll_seconds=0,
+        max_wait_seconds=60,
+        retries=1,
+        resume=True,
+        allow_terminal_plan_migration=True,
+        plan_migration_reason="add-staged-reviewable-rrd",
+    )
+    executor = _executor(
+        spec,
+        run_id="rt-plan-migrate",
+        options=options,
+        store=store,
+        reconcile_fn=lambda *_args, **_kwargs: ManagedJobEvidence("absent"),
+    )
+
+    report = run_workflow_runtime(
+        spec, run_id="rt-plan-migrate", executor=executor, options=options
+    )
+
+    assert report.status == "succeeded"
+    recorded = store.read_runtime_state()
+    assert recorded is not None
+    assert len(recorded.plan_migrations) == 1
+    migration = recorded.plan_migrations[0]
+    assert migration["migration_index"] == 1
+    assert migration["old_plan_fingerprint"] == "0" * 64
+    assert migration["new_plan_fingerprint"] == recorded.plan_fingerprint
+    assert migration["reason"] == "add-staged-reviewable-rrd"
+    assert recorded.waves[0] == prior.waves[0]
+    assert len(recorded.waves) > 1
+    assert recorded.waves[-1]["status"] == "succeeded"
+
+
+def test_terminal_plan_migration_appends_a_contiguous_second_repair(
+    tmp_path: Path,
+) -> None:
+    from npa.orchestration.skypilot.workflow import ManagedJobEvidence
+
+    spec = load_spec(_write_spec(tmp_path, FANOUT_SPEC))
+    store = MemoryStore()
+    previous = "0" * 64
+    store.write_runtime_state(
+        RuntimeRunState(
+            workflow=spec.name,
+            run_id="rt-plan-migrate-twice",
+            api_version=spec.api_version,
+            status="failed",
+            plan_fingerprint=previous,
+            plan_migrations=[
+                {
+                    "migration_index": 1,
+                    "old_plan_fingerprint": "1" * 64,
+                    "new_plan_fingerprint": previous,
+                    "reason": "add-staged-reviewable-rrd",
+                }
+            ],
+            waves=[
+                {
+                    "key": "001|parallel|fanout",
+                    "attempt": 1,
+                    "status": "failed",
+                    "sky_status": "FAILED",
+                    "job_id": "prior-1",
+                    "outputs": [],
+                }
+            ],
+        )
+    )
+    options = RuntimeOptions(
+        poll_seconds=0,
+        max_wait_seconds=60,
+        resume=True,
+        allow_terminal_plan_migration=True,
+        plan_migration_reason="adopt-reviewed-runtime-image",
+    )
+    executor = _executor(
+        spec,
+        run_id="rt-plan-migrate-twice",
+        options=options,
+        store=store,
+        reconcile_fn=lambda *_args, **_kwargs: ManagedJobEvidence("absent"),
+    )
+
+    report = run_workflow_runtime(
+        spec,
+        run_id="rt-plan-migrate-twice",
+        executor=executor,
+        options=options,
+    )
+
+    assert report.status == "succeeded"
+    recorded = store.read_runtime_state()
+    assert recorded is not None
+    assert len(recorded.plan_migrations) == 2
+    second = recorded.plan_migrations[1]
+    assert second["migration_index"] == 2
+    assert second["old_plan_fingerprint"] == previous
+    assert second["new_plan_fingerprint"] == recorded.plan_fingerprint
+
+
+def test_terminal_plan_migration_rejects_a_fingerprint_cycle(tmp_path: Path) -> None:
+    spec = load_spec(_write_spec(tmp_path, FANOUT_SPEC))
+    run_id = "rt-plan-migrate-cycle"
+    target = plan_fingerprint(spec, run_id=run_id)
+    store = MemoryStore()
+    store.write_runtime_state(
+        RuntimeRunState(
+            workflow=spec.name,
+            run_id=run_id,
+            api_version=spec.api_version,
+            status="failed",
+            plan_fingerprint="0" * 64,
+            plan_migrations=[
+                {
+                    "migration_index": 1,
+                    "old_plan_fingerprint": target,
+                    "new_plan_fingerprint": "0" * 64,
+                    "reason": "first-repair",
+                }
+            ],
+            waves=[
+                {
+                    "key": "001|parallel|fanout",
+                    "attempt": 1,
+                    "status": "failed",
+                    "sky_status": "FAILED",
+                    "job_id": "prior-1",
+                    "outputs": [],
+                }
+            ],
+        )
+    )
+    options = RuntimeOptions(
+        poll_seconds=0,
+        max_wait_seconds=60,
+        resume=True,
+        allow_terminal_plan_migration=True,
+        plan_migration_reason="cycle",
+    )
+
+    with pytest.raises(NpaWorkflowError, match="revisit a prior fingerprint"):
+        run_workflow_runtime(
+            spec,
+            run_id=run_id,
+            executor=_executor(spec, run_id=run_id, options=options, store=store),
+            options=options,
+        )
+
+
+def test_terminal_plan_migration_chain_is_bounded(tmp_path: Path) -> None:
+    spec = load_spec(_write_spec(tmp_path, FANOUT_SPEC))
+    store = MemoryStore()
+    migrations = [
+        {
+            "migration_index": index,
+            "old_plan_fingerprint": str(index - 1) * 64,
+            "new_plan_fingerprint": str(index) * 64,
+            "reason": f"repair-{index}",
+        }
+        for index in range(1, MAX_TERMINAL_PLAN_MIGRATIONS + 1)
+    ]
+    store.write_runtime_state(
+        RuntimeRunState(
+            workflow=spec.name,
+            run_id="rt-plan-migrate-bounded",
+            api_version=spec.api_version,
+            status="failed",
+            plan_fingerprint=str(MAX_TERMINAL_PLAN_MIGRATIONS) * 64,
+            plan_migrations=migrations,
+            waves=[
+                {
+                    "key": "001|parallel|fanout",
+                    "attempt": 1,
+                    "status": "failed",
+                    "sky_status": "FAILED",
+                    "job_id": "prior-1",
+                    "outputs": [],
+                }
+            ],
+        )
+    )
+    options = RuntimeOptions(
+        poll_seconds=0,
+        max_wait_seconds=60,
+        resume=True,
+        allow_terminal_plan_migration=True,
+        plan_migration_reason="one-too-many",
+    )
+
+    with pytest.raises(NpaWorkflowError, match="migration limit reached"):
+        run_workflow_runtime(
+            spec,
+            run_id="rt-plan-migrate-bounded",
+            executor=_executor(
+                spec,
+                run_id="rt-plan-migrate-bounded",
+                options=options,
+                store=store,
+            ),
+            options=options,
+        )
+
+
+@pytest.mark.parametrize(
+    ("wave", "message"),
+    [
+        (
+            {"status": "running", "sky_status": "RUNNING", "outputs": []},
+            "every prior attempt",
+        ),
+        (
+            {"status": "succeeded", "sky_status": "SUCCEEDED", "outputs": []},
+            "every prior attempt",
+        ),
+    ],
+)
+def test_terminal_plan_migration_rejects_nonfailed_prior_attempt(
+    tmp_path: Path, wave: dict[str, Any], message: str
+) -> None:
+    spec = load_spec(_write_spec(tmp_path, FANOUT_SPEC))
+    store = MemoryStore()
+    wave = {"key": "001|parallel|fanout", "attempt": 1, **wave}
+    store.write_runtime_state(
+        RuntimeRunState(
+            workflow=spec.name,
+            run_id="rt-plan-migrate-blocked",
+            api_version=spec.api_version,
+            status="failed",
+            plan_fingerprint="0" * 64,
+            waves=[wave],
+        )
+    )
+    options = RuntimeOptions(
+        poll_seconds=0,
+        max_wait_seconds=60,
+        resume=True,
+        allow_terminal_plan_migration=True,
+        plan_migration_reason="safe-reason",
+    )
+    executor = _executor(
+        spec, run_id="rt-plan-migrate-blocked", options=options, store=store
+    )
+
+    with pytest.raises(NpaWorkflowError, match=message):
+        run_workflow_runtime(
+            spec,
+            run_id="rt-plan-migrate-blocked",
+            executor=executor,
+            options=options,
+        )
 
 
 def _supervisor_preflight() -> dict[str, str]:

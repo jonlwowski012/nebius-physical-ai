@@ -30,7 +30,7 @@ from npa.guardrails.three_tier import (
 
 
 REPO_ROOT = Path(__file__).resolve().parents[3]
-SPECS = Path("npa/workflows/workbench/npa-workflows")
+SPECS = Path("workflows/testing")
 SIM2REAL_DEMO = Path("npa/tests/fixtures/npa-workflows/sim2real-vlm-rl-demo.yaml")
 
 
@@ -61,6 +61,9 @@ def _p(
 #               the ones worth closing, tool by tool, with a live run each.
 #
 SPEC_GAP_REASONS: dict[str, dict[str, str]] = {
+    "cosmos3/super-benchmark": {
+        "dry_run": "boolean",
+    },
     "cosmos3/ray-batch": {
         "dry_run": "boolean",
     },
@@ -126,7 +129,6 @@ SPEC_GAP_REASONS: dict[str, dict[str, str]] = {
     },
     "vlm-eval/run": {
         "task": "knob",
-        "model": "knob",
         "endpoint_url": "knob",
         "frame_selection": "knob",
         "max_frames": "knob",
@@ -151,6 +153,20 @@ VALID_GAP_CATEGORIES = frozenset({"boolean", "infra", "knob"})
 
 
 CONTRACTS: tuple[CapabilityContract, ...] = (
+    CapabilityContract(
+        name="curobo/benchmark",
+        cli_module="npa.cli.workbench.curobo",
+        cli_callback="benchmark_cmd",
+        sdk_module="npa.sdk.workbench.curobo",
+        sdk_attr="benchmark",
+        spec_path=SPECS / "curobo-benchmark.yaml",
+        tool_ref="workbench.curobo.benchmark",
+        params=(
+            _p("input_path", "input_path", "--input-path"),
+            _p("output_path", "output_path", "--output-path"),
+            _p("run_id", "run_id", "--run-id"),
+        ),
+    ),
     CapabilityContract(
         name="alpamayo2-super/infer",
         cli_module="npa.cli.workbench.alpamayo2_super",
@@ -286,7 +302,6 @@ CONTRACTS: tuple[CapabilityContract, ...] = (
         tool_ref="workbench.vlm_eval.run",
         spec_gap=(
             "task",
-            "model",
             "endpoint_url",
             "frame_selection",
             "max_frames",
@@ -355,6 +370,24 @@ CONTRACTS: tuple[CapabilityContract, ...] = (
             _p("endpoint", "endpoint", "--endpoint"),
             _p("token_env", "token_env", "--token-env"),
             _p("timeout", "timeout", "--timeout"),
+            _p("run_id", "run_id", "--run-id"),
+            _p("dry_run", "dry_run", "--dry-run"),
+        ),
+    ),
+    CapabilityContract(
+        name="cosmos3/super-benchmark",
+        cli_module="npa.cli.workbench.cosmos3",
+        cli_callback="super_benchmark_cmd",
+        sdk_module="npa.sdk.workbench.cosmos3",
+        sdk_attr="super_benchmark",
+        spec_path=SPECS / "cosmos3-super-b200-benchmark.yaml",
+        tool_ref="workbench.cosmos3.super_benchmark",
+        spec_gap=("dry_run",),
+        params=(
+            _p("output_path", "output_path", "--output-path"),
+            _p("topologies", "topologies", "--topologies"),
+            _p("attempts", "attempts", "--attempts"),
+            _p("base_port", "base_port", "--base-port"),
             _p("run_id", "run_id", "--run-id"),
             _p("dry_run", "dry_run", "--dry-run"),
         ),
