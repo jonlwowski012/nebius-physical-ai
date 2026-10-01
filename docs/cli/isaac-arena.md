@@ -8,8 +8,6 @@ Usage: npa workbench isaac-arena [OPTIONS] COMMAND [ARGS]...
 Isaac Lab-Arena policy evaluation with durable results.
 
 Options
---install-completion  Install completion for the current shell.
---show-completion  Show completion for the current shell, to copy it or customize the installation.
 --help  Show this message and exit.
 Commands
 capabilities  Print the pinned upstream surface and NPA support status as JSON.
@@ -21,8 +19,6 @@ terms  Describe source and runtime redistribution boundaries.
 
 | Option | Description |
 | --- | --- |
-| `--install-completion` | Install completion for the current shell. |
-| `--show-completion` | Show completion for the current shell, to copy it or customize the installation. |
 | `--help` | Show this message and exit. |
 
 ## Subcommands

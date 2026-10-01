@@ -284,10 +284,10 @@ local report panel into an official leaderboard score.
 
 ```bash
 for arm in teacher replay; do
-  candidate=$(case $arm in
-    teacher) echo stage_teacher_action_only_3600 ;;
-    replay) echo stage_parent_replay_action_only_3600 ;;
-  esac)
+  case "$arm" in
+    teacher) candidate=stage_teacher_action_only_3600 ;;
+    replay) candidate=stage_parent_replay_action_only_3600 ;;
+  esac
   checkpoint_root=$RUNTIME/output/$arm/checkpoints/pi_behavior_b1k_fast/$candidate
 
   $RUNTIME/openpi/.venv/bin/python $IMPL/evaluate_holdout.py \

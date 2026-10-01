@@ -189,7 +189,9 @@ document_group_recursive() {
   for child in $children; do
     prefetch_paths+=("${command_path[*]} $child")
   done
-  prefetch_help "${prefetch_paths[@]}"
+  if [ -n "$children" ]; then
+    prefetch_help "${prefetch_paths[@]}"
+  fi
   prefetch_paths=()
   for child in $children; do
     if is_group "${command_path[@]}" "$child"; then
