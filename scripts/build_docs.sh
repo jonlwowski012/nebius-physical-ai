@@ -189,6 +189,7 @@ document_group_recursive() {
   for child in $children; do
     prefetch_paths+=("${command_path[*]} $child")
   done
+  # Bash 3 treats expansion of an empty array as unbound under set -u.
   if [ -n "$children" ]; then
     prefetch_help "${prefetch_paths[@]}"
   fi

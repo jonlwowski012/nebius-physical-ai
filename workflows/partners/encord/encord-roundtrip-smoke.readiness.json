@@ -1,6 +1,6 @@
 {
   "schema_version": "workflow-readiness/v1",
-  "workflow_sha256": "bdd72d7a8f366cdcd2f002ff5ffdc7e30c7f33d6fa91b368f3131d3931ec9c39",
+  "workflow_sha256": "4a02a4c7b32dfcf463edf5b29c603388bb7c60c351617abc7086add73fe29e10",
   "planning": {
     "validation": {
       "status": "verified",
@@ -16,7 +16,8 @@
       "evidence": [
         "README.md",
         "../../../npa/tests/workflows/test_encord_workflow.py",
-        "encord-roundtrip-smoke.live-validation.md"
+        "../../../npa/tests/e2e/test_encord_roundtrip_live.py",
+        "Private operator run artifacts (retained outside Git)"
       ]
     }
   },
@@ -24,17 +25,17 @@
     "output_storage": {
       "status": "verified",
       "reason": "The live local run wrote and read final push, curation, pull, and verification artifacts in S3.",
-      "evidence": ["encord-roundtrip-smoke.live-validation.md"]
+      "evidence": ["Private operator run artifacts (retained outside Git)"]
     },
     "worker_input": {
       "status": "verified",
       "reason": "The live local run ingested a 1x1 PNG and a 32x32 MP4, then selected the MP4 as a strict subset.",
-      "evidence": ["encord-roundtrip-smoke.live-validation.md"]
+      "evidence": ["Private operator run artifacts (retained outside Git)"]
     },
     "credentials": {
       "status": "verified",
       "reason": "Read-only Encord and S3 probes passed, followed by the completed local live roundtrip.",
-      "evidence": ["encord-roundtrip-smoke.live-validation.md"]
+      "evidence": ["Private operator run artifacts (retained outside Git)"]
     },
     "source_image": {
       "status": "unverified",
@@ -44,7 +45,7 @@
     "target_runtime": {
       "status": "unverified",
       "reason": "The four-stage graph passed locally against real Encord and S3 services; Kubernetes pod execution has not been tested.",
-      "evidence": ["encord-roundtrip-smoke.live-validation.md"]
+      "evidence": ["Private operator run artifacts (retained outside Git)"]
     }
   }
 }

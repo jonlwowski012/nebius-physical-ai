@@ -59,7 +59,7 @@ states:
     next: pull
 
   pull:
-    description: Materialize the dataset created by push.
+    description: Materialize the Collection selected by curate.
     needs: [curate]
     toolRef: workbench.encord.pull
     resources: cpu

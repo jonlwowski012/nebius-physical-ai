@@ -18,8 +18,9 @@ The roundtrip demo uses the intrinsic Encord width filter by default. Set
 `encord_curate_filters` to a comma-separated filter list for a different rule.
 For brightness, sharpness, or file-size filters, first compute quality metrics
 for the folder in Encord.
-The [live validation note](encord-roundtrip-smoke.live-validation.md) records the
-completed local Encord/S3 roundtrip and its remaining runtime limits.
+The opt-in live test has completed push, curate, pull, and verification against
+Encord and S3. Its run artifacts are retained privately. Kubernetes pod
+execution remains untested.
 
 Imported prelabels are real object annotations that still need human review.
 

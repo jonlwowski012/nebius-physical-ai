@@ -1,11 +1,16 @@
 <!-- register: operator guide | reader: Encord integration operators | consumed: task-time reference -->
-# Encord media transport and curation
+# Encord transport keeps S3 as the dataset of record
 
 Encord is remote SaaS. NPA runs a stateless CPU API and transfer client locally
 or in the default workflow pod. This integration does not deploy an Encord
 service or container.
 
-## Choose how Encord receives media
+The integration originated in Jonathan Lwowski's
+[PR #339](https://github.com/nebius/nebius-physical-ai/pull/339).
+Stew Tong authored the fail-closed transport, CLI, SDK, and workflows in
+[PR #363](https://github.com/nebius/nebius-physical-ai/pull/363).
+
+## Choose the transfer contract explicitly
 
 `register` is the default. Encord receives object URLs and exact NPA identity
 metadata while the bytes remain in S3. This retains S3 as the governed dataset
